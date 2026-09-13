@@ -178,6 +178,12 @@ def test_pairing_dialog_non_blocking():
     assert not dlg._thread.is_alive()
 
 
+def test_actions_module():
+    import actions
+    assert hasattr(actions, "action_show_pairing")
+    assert hasattr(actions, "action_update_ytdlp")
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_persistence()
@@ -188,4 +194,5 @@ if __name__ == "__main__":
     test_youtube_music_session()
     test_dial_and_ssdp_discovery()
     test_pairing_dialog_non_blocking()
+    test_actions_module()
     print("All unit tests passed successfully.")

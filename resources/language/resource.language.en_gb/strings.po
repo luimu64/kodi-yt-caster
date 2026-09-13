@@ -129,3 +129,19 @@ msgstr "Advanced"
 msgctxt "#30021"
 msgid "Persisted session tokens (JSON)"
 msgstr "Persisted session tokens (JSON)"
+
+msgctxt "#30034"
+msgid "Link with TV code now (Show pairing code)"
+msgstr "Link with TV code now (Show pairing code)"
+
+msgctxt "#30035"
+msgid "Display the 12-digit TV pairing code to link the YouTube mobile app"
+msgstr "Display the 12-digit TV pairing code to link the YouTube mobile app"
+
+msgctxt "#30036"
+msgid "Reset & re-link with a fresh TV code"
+msgstr "Reset & re-link with a fresh TV code"
+
+msgctxt "#30037"
+msgid "Clear existing device registrations and generate a brand-new pairing code"
+msgstr "Clear existing device registrations and generate a brand-new pairing code"
