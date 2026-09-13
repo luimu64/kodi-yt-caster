@@ -34,7 +34,7 @@ def addon_xml_from_zip(zpath: Path) -> str:
 
 
 def build_addons_xml(dist_dir: Path, base_url: str) -> str:
-    zips = sorted(dist_dir.glob("*.zip"))
+    zips = sorted(dist_dir.rglob("*.zip"))
     if not zips:
         print(f"no zips in {dist_dir}", file=sys.stderr)
         return ""
