@@ -87,6 +87,19 @@ def main() -> int:
     (dist / "addons.xml").write_text(xml, encoding="utf-8")
     md5 = hashlib.md5(xml.encode("utf-8")).hexdigest()
     (dist / "addons.xml.md5").write_text(md5 + "\n", encoding="ascii")
+    # simple browsable index page (zips, addons.xml linked)
+    items = "".join(
+        f'<li><a href="{zp.name}">{zp.name}</a>'
+        + ("<b> (install this in Kodi)</b>" if zp.name.startswith("repository.") else "")
+        + "</li>"
+        for zp in sorted(dist.glob("*.zip"))
+    )
+    (dist / "index.html").write_text(
+        '<!DOCTYPE html><html><head><meta charset="utf-8"><title>kodi-yt-caster</title></head>'
+        '<body style="font-family:sans-serif"><h1>luimu&#39;s Kodi Repository</h1>'
+        f"<ul>{items}<li><a href=\"addons.xml\">addons.xml</a></li></ul></body></html>",
+        encoding="utf-8",
+    )
     print(f"wrote {dist/'addons.xml'} ({md5})")
     return 0
 
