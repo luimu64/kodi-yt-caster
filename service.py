@@ -115,7 +115,9 @@ def run_service() -> None:
     screen_id_m = session_data.get("screen_id_m")
     lounge_token_m = session_data.get("lounge_token_m")
 
-    is_first_run = not (screen_id and lounge_token)
+    # Discovery (cast button / Wi-Fi linking) is the default pairing path;
+    # manual linking is the settings button. Never force a pairing dialog
+    # on first run — it hijacks the screen at install time.
 
     if not screen_id:
         try:
@@ -189,9 +191,10 @@ def run_service() -> None:
     )
     player.start_monitor()
 
-    # Show pairing code if needed
+    # Show pairing code only when the user opted in via settings (manual
+    # linking); discovery handles the default first-time link.
     pairing_dialog: Optional[PairingDialog] = None
-    if is_first_run or show_pairing_on_boot:
+    if show_pairing_on_boot:
         try:
             code = get_pairing_code(screen_id, lounge_token, screen_name)
             session_data["pairing_code"] = code

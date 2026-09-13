@@ -21,8 +21,8 @@
                     <data>RunScript(plugin.service.ytlounge-cast, reset_pairing)</data>
                     <control type="action" format="action"/>
                 </setting>
-                <setting id="show_pairing_on_boot" type="boolean" label="30003">
-                    <default>true</default>
+                <setting id="show_pairing_on_boot" type="boolean" label="30003" help="30038">
+                    <default>false</default>
                     <control type="toggle"/>
                 </setting>
                 <setting id="enable_discovery" type="boolean" label="30030" help="30031">

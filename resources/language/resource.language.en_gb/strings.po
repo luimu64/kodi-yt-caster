@@ -27,8 +27,12 @@ msgid "Screen Name (visible in YouTube app)"
 msgstr "Screen Name (visible in YouTube app)"
 
 msgctxt "#30003"
-msgid "Show pairing code on startup if unlinked"
-msgstr "Show pairing code on startup if unlinked"
+msgid "Show pairing code on startup"
+msgstr "Show pairing code on startup"
+
+msgctxt "#30038"
+msgid "Manual linking only. By default devices link via Wi-Fi discovery; use the 'Show pairing code' button to link manually"
+msgstr "Manual linking only. By default devices link via Wi-Fi discovery; use the 'Show pairing code' button to link manually"
 
 msgctxt "#30004"
 msgid "Enable debug logging"
