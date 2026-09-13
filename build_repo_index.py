@@ -42,6 +42,10 @@ def build_addons_xml(dist_dir: Path, base_url: str) -> str:
     out = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', "<addons>"]
     seen = set()
     for zp in zips:
+        # repo bootstrap zips (repository.*) are the install entry point,
+        # not a listed addon inside their own index — skip their index entry.
+        if zp.name.startswith("repository."):
+            continue
         xml_text = addon_xml_from_zip(zp)
         root = ET.fromstring(xml_text)
         aid = root.get("id") or root.get("point", "")

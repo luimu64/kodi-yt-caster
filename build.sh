@@ -42,4 +42,16 @@ cd build
 python3 -m zipfile -c "../${DIST_DIR}/${ZIP_NAME}" "${ADDON_ID}"
 cd ..
 
+# Build the repository bootstrap zip (install-from-zip entry point)
+# Directory structure: repository.kodi-yt-caster/addon.xml (matches repo zip convention)
+REPO_ID="repository.kodi-yt-caster"
+REPO_ZIP="${REPO_ID}-$(python3 -c "import xml.etree.ElementTree as ET; print(ET.parse('${REPO_ID}/addon.xml').getroot().attrib['version'])").zip"
+rm -rf "build/${REPO_ID}"
+mkdir -p "build/${REPO_ID}"
+cp "${REPO_ID}/addon.xml" icon.png fanart.jpg "build/${REPO_ID}/"
+cd build
+python3 -m zipfile -c "../${DIST_DIR}/${REPO_ZIP}" "${REPO_ID}"
+cd ..
+echo "==> Repository bootstrap package created at ${DIST_DIR}/${REPO_ZIP}"
+
 echo "==> Addon package created at ${DIST_DIR}/${ZIP_NAME}"

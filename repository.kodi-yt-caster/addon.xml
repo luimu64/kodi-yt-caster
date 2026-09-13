@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="repository.kodi-yt-caster"
+       name="luimu's Kodi Repository"
+       version="1.0.1"
+       provider-name="luimu">
+    <requires>
+        <import addon="xbmc.addon" version="12.0.0"/>
+    </requires>
+    <extension point="xbmc.addon.repository" name="luimu's Kodi Repository">
+        <info compressed="false">https://luimu64.github.io/kodi-yt-caster/addons.xml</info>
+        <checksum>https://luimu64.github.io/kodi-yt-caster/addons.xml.md5</checksum>
+        <datadir zip="true">https://luimu64.github.io/kodi-yt-caster/</datadir>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_GB">luimu's YouTube Lounge Cast receiver and other add-ons</summary>
+        <description lang="en_GB">Collection of add-ons maintained by luimu, including the YouTube Lounge Cast Receiver.</description>
+        <platform>all</platform>
+        <license>MIT</license>
+        <assets>
+            <icon>icon.png</icon>
+            <fanart>fanart.jpg</fanart>
+        </assets>
+    </extension>
+</addon>
