@@ -90,6 +90,8 @@ def run_service() -> None:
     show_pairing_on_boot = get_setting_bool("show_pairing_on_boot", True)
     custom_ytdlp = get_setting("ytdlp_path", "")
     custom_cookies = get_setting("custom_cookies_file", "")
+    stream_selection = get_setting("stream_selection", "manual-osd")
+    max_resolution = get_setting("max_resolution", "auto")
 
     # Ensure valid screen_id and lounge_token
     screen_id = session_data.get("screen_id")
@@ -131,7 +133,12 @@ def run_service() -> None:
     ytdlp_bin = find_ytdlp_binary(custom_ytdlp)
     bridge = YtDlpBridge(binary_path=ytdlp_bin, cookies_path=custom_cookies or None)
     resolver = VideoResolver(bridge=bridge)
-    player = KodiPlayerBridge(session=session, resolver=resolver)
+    player = KodiPlayerBridge(
+        session=session,
+        resolver=resolver,
+        stream_selection_type=stream_selection,
+        max_resolution=max_resolution,
+    )
     player.start_monitor()
 
     # Show pairing code if needed

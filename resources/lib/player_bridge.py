@@ -28,9 +28,17 @@ class PlayerState:
 
 
 class KodiPlayerBridge:
-    def __init__(self, session: LoungeSession, resolver: Optional[VideoResolver] = None):
+    def __init__(
+        self,
+        session: LoungeSession,
+        resolver: Optional[VideoResolver] = None,
+        stream_selection_type: str = "manual-osd",
+        max_resolution: str = "auto",
+    ):
         self.session = session
         self.resolver = resolver or VideoResolver()
+        self.stream_selection_type = stream_selection_type
+        self.max_resolution = max_resolution
         self.playlist: List[str] = []
         self.current_index: int = 0
         self.current_video_id: Optional[str] = None
@@ -155,14 +163,22 @@ class KodiPlayerBridge:
                 list_item.setArt({"thumb": info["thumbnail"], "icon": info["thumbnail"]})
 
             stream_type = info.get("stream_type")
-            if stream_type == "hls":
+            if stream_type in ("hls", "hls_master"):
                 list_item.setMimeType("application/x-mpegURL")
                 list_item.setProperty("inputstream", "inputstream.adaptive")
                 list_item.setProperty("inputstream.adaptive.manifest_type", "hls")
+                if self.stream_selection_type:
+                    list_item.setProperty("inputstream.adaptive.stream_selection_type", self.stream_selection_type)
+                if self.max_resolution and self.max_resolution != "auto":
+                    list_item.setProperty("inputstream.adaptive.chooser_resolution_max", self.max_resolution)
             elif stream_type == "dash":
                 list_item.setMimeType("application/dash+xml")
                 list_item.setProperty("inputstream", "inputstream.adaptive")
                 list_item.setProperty("inputstream.adaptive.manifest_type", "mpd")
+                if self.stream_selection_type:
+                    list_item.setProperty("inputstream.adaptive.stream_selection_type", self.stream_selection_type)
+                if self.max_resolution and self.max_resolution != "auto":
+                    list_item.setProperty("inputstream.adaptive.chooser_resolution_max", self.max_resolution)
 
             self._kodi_player.play(playable_url, list_item)
         else:

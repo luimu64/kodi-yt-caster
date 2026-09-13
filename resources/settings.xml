@@ -23,6 +23,31 @@
         </category>
         <category id="playback" label="30010">
             <group id="1">
+                <setting id="stream_selection" type="string" label="30015" help="30016">
+                    <default>manual-osd</default>
+                    <constraints>
+                        <options>
+                            <option label="30017">manual-osd</option>
+                            <option label="30018">adaptive</option>
+                            <option label="30019">ask-quality</option>
+                        </options>
+                    </constraints>
+                    <control type="spinner" format="string"/>
+                </setting>
+                <setting id="max_resolution" type="string" label="30022" help="30023">
+                    <default>auto</default>
+                    <constraints>
+                        <options>
+                            <option label="30024">auto</option>
+                            <option label="30025">4K</option>
+                            <option label="30026">1440p</option>
+                            <option label="30027">1080p</option>
+                            <option label="30028">720p</option>
+                            <option label="30029">480p</option>
+                        </options>
+                    </constraints>
+                    <control type="spinner" format="string"/>
+                </setting>
                 <setting id="update_ytdlp_btn" type="action" label="30013" help="30014">
                     <level>0</level>
                     <data>RunScript(plugin.service.ytlounge-cast, update_ytdlp)</data>

@@ -87,10 +87,30 @@ def test_ytdlp_downloader_metadata():
     assert dest.endswith(fn)
 
 
+def test_hls_master_generation():
+    from resources.lib.ytdlp_bridge import build_hls_master_manifest
+    mock_formats = [
+        {"format_id": "234", "url": "https://example.com/audio.m3u8", "vcodec": "none", "acodec": "mp4a", "format_note": "Audio High"},
+        {"format_id": "312", "url": "https://example.com/1080p.m3u8", "vcodec": "avc1.640028", "height": 1080, "width": 1920, "fps": 60, "tbr": 4500},
+        {"format_id": "230", "url": "https://example.com/360p.m3u8", "vcodec": "avc1.4D401E", "height": 360, "width": 640, "fps": 30, "tbr": 600},
+    ]
+    manifest_path = build_hls_master_manifest(mock_formats, "test_vid")
+    assert manifest_path is not None
+    assert os.path.exists(manifest_path)
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "#EXT-X-STREAM-INF" in content
+    assert "RESOLUTION=1920x1080" in content
+    assert "RESOLUTION=640x360" in content
+    assert "#EXT-X-MEDIA:TYPE=AUDIO" in content
+    os.remove(manifest_path)
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_persistence()
     test_resolver_cache()
     test_player_bridge_queue()
     test_ytdlp_downloader_metadata()
+    test_hls_master_generation()
     print("All unit tests passed successfully.")

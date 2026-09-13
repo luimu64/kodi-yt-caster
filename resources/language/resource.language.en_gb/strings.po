@@ -38,6 +38,58 @@ msgctxt "#30010"
 msgid "Playback"
 msgstr "Playback"
 
+msgctxt "#30015"
+msgid "Stream Selection Mode"
+msgstr "Stream Selection Mode"
+
+msgctxt "#30016"
+msgid "Controls whether Kodi allows manual stream/resolution picking in the OSD menu or auto-adapts"
+msgstr "Controls whether Kodi allows manual stream/resolution picking in the OSD menu or auto-adapts"
+
+msgctxt "#30017"
+msgid "Manual OSD (choose resolution in player menu)"
+msgstr "Manual OSD (choose resolution in player menu)"
+
+msgctxt "#30018"
+msgid "Adaptive (auto bitrate / bandwidth)"
+msgstr "Adaptive (auto bitrate / bandwidth)"
+
+msgctxt "#30019"
+msgid "Ask quality on playback start"
+msgstr "Ask quality on playback start"
+
+msgctxt "#30022"
+msgid "Maximum Resolution Limit"
+msgstr "Maximum Resolution Limit"
+
+msgctxt "#30023"
+msgid "Capped maximum resolution exposed to Kodi player"
+msgstr "Capped maximum resolution exposed to Kodi player"
+
+msgctxt "#30024"
+msgid "Auto / Unlimited"
+msgstr "Auto / Unlimited"
+
+msgctxt "#30025"
+msgid "4K (2160p)"
+msgstr "4K (2160p)"
+
+msgctxt "#30026"
+msgid "2K (1440p)"
+msgstr "2K (1440p)"
+
+msgctxt "#30027"
+msgid "1080p Full HD"
+msgstr "1080p Full HD"
+
+msgctxt "#30028"
+msgid "720p HD"
+msgstr "720p HD"
+
+msgctxt "#30029"
+msgid "480p SD"
+msgstr "480p SD"
+
 msgctxt "#30013"
 msgid "Update yt-dlp binary now"
 msgstr "Update yt-dlp binary now"
