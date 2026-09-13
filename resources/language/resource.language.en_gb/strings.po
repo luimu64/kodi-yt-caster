@@ -1,0 +1,55 @@
+# Kodi Media Center language file
+# Addon Name: YouTube Lounge Cast Receiver
+# Addon id: plugin.service.ytlounge-cast
+msgid ""
+msgstr ""
+"Project-Id-Version: YouTube Lounge Cast Receiver\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2025-01-01 00:00+0000\n"
+"PO-Revision-Date: 2025-01-01 00:00+0000\n"
+"Last-Translator: luimu\n"
+"Language-Team: English\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: en_GB\n"
+
+msgctxt "#30000"
+msgid "General"
+msgstr "General"
+
+msgctxt "#30001"
+msgid "Enable YouTube Lounge Cast Receiver"
+msgstr "Enable YouTube Lounge Cast Receiver"
+
+msgctxt "#30002"
+msgid "Screen Name (visible in YouTube app)"
+msgstr "Screen Name (visible in YouTube app)"
+
+msgctxt "#30003"
+msgid "Show pairing code on startup if unlinked"
+msgstr "Show pairing code on startup if unlinked"
+
+msgctxt "#30004"
+msgid "Enable debug logging"
+msgstr "Enable debug logging"
+
+msgctxt "#30010"
+msgid "Playback"
+msgstr "Playback"
+
+msgctxt "#30011"
+msgid "Custom yt-dlp binary path (leave empty for auto)"
+msgstr "Custom yt-dlp binary path (leave empty for auto)"
+
+msgctxt "#30012"
+msgid "Cookies file path (optional)"
+msgstr "Cookies file path (optional)"
+
+msgctxt "#30020"
+msgid "Advanced"
+msgstr "Advanced"
+
+msgctxt "#30021"
+msgid "Persisted session tokens (JSON)"
+msgstr "Persisted session tokens (JSON)"

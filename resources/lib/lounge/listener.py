@@ -1,0 +1,165 @@
+"""Lounge session listener thread and command dispatcher."""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Callable, Dict, Optional, Tuple
+from .client import BASE_URL, DEFAULT_HEADERS, LoungeError, LoungeTokenExpiredError
+from .session import LoungeSession, parse_frames
+
+logger = logging.getLogger("ytlounge.listener")
+
+
+class CommandDispatcher:
+    """Dispatches Lounge commands to application / Kodi player handlers."""
+
+    def __init__(self) -> None:
+        self.on_remote_connected: Optional[Callable[[Dict[str, Any]], None]] = None
+        self.on_remote_disconnected: Optional[Callable[[Dict[str, Any]], None]] = None
+        self.on_set_playlist: Optional[Callable[[Dict[str, Any]], None]] = None
+        self.on_update_playlist: Optional[Callable[[Dict[str, Any]], None]] = None
+        self.on_play: Optional[Callable[[], None]] = None
+        self.on_pause: Optional[Callable[[], None]] = None
+        self.on_stop: Optional[Callable[[], None]] = None
+        self.on_seek: Optional[Callable[[float], None]] = None
+        self.on_set_volume: Optional[Callable[[int], None]] = None
+        self.on_get_volume: Optional[Callable[[], int]] = None
+        self.on_get_now_playing: Optional[Callable[[], None]] = None
+
+
+class LoungeListener(threading.Thread):
+    def __init__(
+        self,
+        session: LoungeSession,
+        dispatcher: CommandDispatcher,
+        on_token_expired: Optional[Callable[[], None]] = None,
+    ) -> None:
+        super().__init__(name="LoungeListener", daemon=True)
+        self.session = session
+        self.dispatcher = dispatcher
+        self.on_token_expired = on_token_expired
+        self._stop_event = threading.Event()
+        self.consecutive_failures = 0
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    def run(self) -> None:
+        logger.info("LoungeListener thread started")
+        backoff = 2.0
+
+        while not self.is_stopped():
+            try:
+                if not self.session.sid:
+                    logger.info("Performing handshake...")
+                    self.session.handshake()
+                    logger.info("Handshake OK: SID=%s", self.session.sid)
+
+                self._listen_stream()
+                self.consecutive_failures = 0
+                backoff = 2.0
+            except LoungeTokenExpiredError:
+                logger.error("Lounge token rejected by server")
+                if self.on_token_expired:
+                    self.on_token_expired()
+                break
+            except Exception as e:
+                self.consecutive_failures += 1
+                logger.warning("Listener error (%s consecutive): %s", self.consecutive_failures, e)
+                if self.consecutive_failures >= 8:
+                    logger.error("Consecutive failures exceeded threshold, invalidating session")
+                    self.session.sid = None
+                    if self.on_token_expired:
+                        self.on_token_expired()
+                    break
+
+                # Exponential backoff (2, 4, 8, 16, 32, max 60s)
+                sleep_time = min(backoff, 60.0)
+                backoff = min(backoff * 2.0, 60.0)
+                for _ in range(int(sleep_time * 10)):
+                    if self.is_stopped():
+                        return
+                    time.sleep(0.1)
+
+        logger.info("LoungeListener thread finished")
+
+    def _listen_stream(self) -> None:
+        self.session.ofs += 1
+        params = self.session._base_params()
+        params.update({
+            "RID": "rpc",
+            "AID": "3",
+            "CI": "0",
+            "TYPE": "xmlhttp",
+            "SID": self.session.sid,
+            "zx": self.session._random_zx(),
+        })
+        if self.session.gsessionid:
+            params["gsessionid"] = self.session.gsessionid
+
+        url = f"{BASE_URL}/bc/bind?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
+
+        # 120-second timeout for streaming long-poll
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            buf = ""
+            while not self.is_stopped():
+                chunk = resp.read(512)
+                if not chunk:
+                    break
+                buf += chunk.decode("utf-8", errors="replace")
+                commands = parse_frames(buf)
+                if commands:
+                    for code, name, data in commands:
+                        if code > self.session.last_code:
+                            self.session.last_code = code
+                            self._handle_command(name, data)
+                    buf = ""
+
+    def _handle_command(self, name: str, data: Any) -> None:
+        logger.debug("Received command: %s (data: %s)", name, data)
+        try:
+            if name == "remoteConnected":
+                if self.dispatcher.on_remote_connected and isinstance(data, dict):
+                    self.dispatcher.on_remote_connected(data)
+            elif name == "remoteDisconnected":
+                if self.dispatcher.on_remote_disconnected and isinstance(data, dict):
+                    self.dispatcher.on_remote_disconnected(data)
+            elif name == "setPlaylist":
+                if self.dispatcher.on_set_playlist and isinstance(data, dict):
+                    self.dispatcher.on_set_playlist(data)
+            elif name == "updatePlaylist":
+                if self.dispatcher.on_update_playlist and isinstance(data, dict):
+                    self.dispatcher.on_update_playlist(data)
+            elif name in ("play", "playVideo"):
+                if self.dispatcher.on_play:
+                    self.dispatcher.on_play()
+            elif name == "pause":
+                if self.dispatcher.on_pause:
+                    self.dispatcher.on_pause()
+            elif name == "stopVideo":
+                if self.dispatcher.on_stop:
+                    self.dispatcher.on_stop()
+            elif name == "seekTo":
+                if self.dispatcher.on_seek and isinstance(data, dict) and "newTime" in data:
+                    self.dispatcher.on_seek(float(data["newTime"]))
+            elif name == "setVolume":
+                if self.dispatcher.on_set_volume and isinstance(data, dict) and "volume" in data:
+                    self.dispatcher.on_set_volume(int(data["volume"]))
+            elif name == "getVolume":
+                if self.dispatcher.on_get_volume:
+                    vol = self.dispatcher.on_get_volume()
+                    self.session.report_volume(vol)
+            elif name == "getNowPlaying":
+                if self.dispatcher.on_get_now_playing:
+                    self.dispatcher.on_get_now_playing()
+        except Exception as e:
+            logger.exception("Error handling command %s: %s", name, e)
