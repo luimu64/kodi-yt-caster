@@ -182,12 +182,14 @@ def run_service() -> None:
     player.start_monitor()
 
     # Show pairing code if needed
+    pairing_dialog: Optional[PairingDialog] = None
     if is_first_run or show_pairing_on_boot:
         try:
             code = get_pairing_code(screen_id, lounge_token, screen_name)
             session_data["pairing_code"] = code
             store.save(session_data)
-            PairingDialog(pairing_code=code, screen_name=screen_name).show()
+            pairing_dialog = PairingDialog(pairing_code=code, screen_name=screen_name)
+            pairing_dialog.show()
         except Exception as e:
             import traceback
             log_kodi("Could not retrieve pairing code: " + traceback.format_exc(), 2)
@@ -196,8 +198,12 @@ def run_service() -> None:
     dispatcher = CommandDispatcher()
 
     def on_connected(data: dict) -> None:
+        nonlocal pairing_dialog
         client_name = data.get("name", "Phone")
         log_kodi(f"Device connected: {client_name}", 1)
+        if pairing_dialog:
+            pairing_dialog.dismiss()
+            pairing_dialog = None
         PairingDialog("", screen_name).show_notification("YouTube Cast", f"Connected to {client_name}")
 
     def on_disconnected(data: dict) -> None:
@@ -221,6 +227,7 @@ def run_service() -> None:
     ]
 
     def on_token_expired() -> None:
+        nonlocal pairing_dialog
         log_kodi("Token expired or revoked, refreshing registration...", 1)
         store.clear()
         try:
@@ -231,7 +238,10 @@ def run_service() -> None:
             session_cl.sid = None
             store.save({"device_id": device_id, "screen_id": new_sid, "lounge_token": new_tok, "expiration": exp})
             new_code = get_pairing_code(new_sid, new_tok, screen_name)
-            PairingDialog(new_code, screen_name).show()
+            if pairing_dialog:
+                pairing_dialog.dismiss()
+            pairing_dialog = PairingDialog(new_code, screen_name)
+            pairing_dialog.show()
         except Exception as ex:
             log_kodi(f"Failed to refresh registration: {ex}", 2)
 
@@ -248,11 +258,15 @@ def run_service() -> None:
     ssdp_responder = None
     if enable_discovery:
         def on_dial_pairing(code: str) -> None:
+            nonlocal pairing_dialog
             log_kodi(f"Registering DIAL pairing code: {code}", 1)
             try:
                 register_pairing_code(screen_id, code, screen_name, device_id)
                 if screen_id_m:
                     register_pairing_code(screen_id_m, code, screen_name, device_id)
+                if pairing_dialog:
+                    pairing_dialog.dismiss()
+                    pairing_dialog = None
                 PairingDialog(code, screen_name).show_notification("YouTube Cast", "Linked device via Wi-Fi")
             except Exception as err:
                 log_kodi(f"Error registering DIAL pairing code: {err}", 2)
@@ -287,6 +301,8 @@ def run_service() -> None:
         log_kodi("Shutting down service...", 1)
     finally:
         log_kodi("Stopping listeners, discovery, and player threads...", 1)
+        if pairing_dialog:
+            pairing_dialog.dismiss()
         if dial_service:
             dial_service.stop()
         if ssdp_responder:

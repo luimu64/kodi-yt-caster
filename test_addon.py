@@ -163,6 +163,21 @@ def test_dial_and_ssdp_discovery():
         server.server_close()
 
 
+def test_pairing_dialog_non_blocking():
+    from resources.lib.ui.pairing_dialog import PairingDialog
+    import time
+    dlg = PairingDialog("123-456-789-000", "Kodi Test")
+    t0 = time.time()
+    dlg.show()
+    elapsed = time.time() - t0
+    # show() must return immediately (< 0.1s) without blocking
+    assert elapsed < 0.2
+    assert dlg._thread is not None
+    dlg.dismiss()
+    dlg._thread.join(timeout=2.0)
+    assert not dlg._thread.is_alive()
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_persistence()
@@ -172,4 +187,5 @@ if __name__ == "__main__":
     test_hls_master_generation()
     test_youtube_music_session()
     test_dial_and_ssdp_discovery()
+    test_pairing_dialog_non_blocking()
     print("All unit tests passed successfully.")
