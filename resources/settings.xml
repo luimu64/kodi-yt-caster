@@ -15,6 +15,14 @@
                     <default>true</default>
                     <control type="toggle"/>
                 </setting>
+                <setting id="enable_discovery" type="boolean" label="30030" help="30031">
+                    <default>true</default>
+                    <control type="toggle"/>
+                </setting>
+                <setting id="dial_port" type="integer" label="30032" help="30033">
+                    <default>8008</default>
+                    <control type="edit" format="integer"/>
+                </setting>
                 <setting id="debug_logging" type="boolean" label="30004">
                     <default>false</default>
                     <control type="toggle"/>

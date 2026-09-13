@@ -67,11 +67,19 @@ def parse_frames(body: str) -> List[Tuple[int, str, Any]]:
 
 
 class LoungeSession:
-    def __init__(self, screen_id: str, lounge_token: str, device_id: str, screen_name: str = "Kodi"):
+    def __init__(
+        self,
+        screen_id: str,
+        lounge_token: str,
+        device_id: str,
+        screen_name: str = "Kodi",
+        theme: str = "cl",
+    ):
         self.screen_id = screen_id
         self.lounge_token = lounge_token
         self.device_id = device_id
         self.screen_name = screen_name
+        self.theme = theme
         self.sid: Optional[str] = None
         self.gsessionid: Optional[str] = None
         self.ofs = 0
@@ -86,8 +94,8 @@ class LoungeSession:
             "id": self.device_id,
             "name": self.screen_name,
             "app": "kodi-ytcast",
-            "theme": "cl",
-            "capabilities": "",
+            "theme": self.theme,
+            "capabilities": "dsp,mic,dpa,ntb,que,mus",
             "mdx-version": "2",
             "loungeIdToken": self.lounge_token,
             "VER": "8",

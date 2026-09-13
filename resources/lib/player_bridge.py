@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from .resolver import VideoResolver
 from .lounge.session import LoungeSession
 
@@ -30,12 +30,16 @@ class PlayerState:
 class KodiPlayerBridge:
     def __init__(
         self,
-        session: LoungeSession,
+        session: Union[LoungeSession, List[LoungeSession]],
         resolver: Optional[VideoResolver] = None,
         stream_selection_type: str = "manual-osd",
         max_resolution: str = "auto",
     ):
-        self.session = session
+        if isinstance(session, list):
+            self.sessions = session
+        else:
+            self.sessions = [session]
+        self.session = self.sessions[0]
         self.resolver = resolver or VideoResolver()
         self.stream_selection_type = stream_selection_type
         self.max_resolution = max_resolution
@@ -88,12 +92,16 @@ class KodiPlayerBridge:
             time.sleep(2.0)
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
-                self.session.report_now_playing(
-                    video_id=self.current_video_id,
-                    current_time=int(cur_time),
-                    duration=self.current_duration,
-                    state=self.state,
-                )
+                for s in self.sessions:
+                    try:
+                        s.report_now_playing(
+                            video_id=self.current_video_id,
+                            current_time=int(cur_time),
+                            duration=self.current_duration,
+                            state=self.state,
+                        )
+                    except Exception:
+                        pass
 
     def set_playlist(self, data: Dict[str, Any]) -> None:
         """Handle setPlaylist command from YouTube mobile app."""
@@ -183,15 +191,23 @@ class KodiPlayerBridge:
             self._kodi_player.play(playable_url, list_item)
         else:
             self.state = PlayerState.PLAYING
-            self.session.report_state_change(self.state, 0, self.current_duration)
-            self.session.report_now_playing(self.current_video_id, 0, self.current_duration, self.state)
+            for s in self.sessions:
+                try:
+                    s.report_state_change(self.state, 0, self.current_duration)
+                    s.report_now_playing(self.current_video_id, 0, self.current_duration, self.state)
+                except Exception:
+                    pass
 
     def pause(self) -> None:
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             self._kodi_player.pause()
         else:
             self.state = PlayerState.PAUSED
-            self.session.report_state_change(self.state, self.get_time(), self.current_duration)
+            for s in self.sessions:
+                try:
+                    s.report_state_change(self.state, self.get_time(), self.current_duration)
+                except Exception:
+                    pass
 
     def resume(self) -> None:
         if KODI_AVAILABLE and self._kodi_player:
@@ -199,21 +215,33 @@ class KodiPlayerBridge:
                 self._kodi_player.pause()  # In Kodi, pause() toggles pause/resume
         else:
             self.state = PlayerState.PLAYING
-            self.session.report_state_change(self.state, self.get_time(), self.current_duration)
+            for s in self.sessions:
+                try:
+                    s.report_state_change(self.state, self.get_time(), self.current_duration)
+                except Exception:
+                    pass
 
     def stop(self) -> None:
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             self._kodi_player.stop()
         else:
             self.state = PlayerState.STOPPED
-            self.session.report_state_change(self.state, 0, 0)
+            for s in self.sessions:
+                try:
+                    s.report_state_change(self.state, 0, 0)
+                except Exception:
+                    pass
 
     def seek_to(self, seconds: float) -> None:
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             self._kodi_player.seekTime(seconds)
         else:
             self.pending_seek = seconds
-            self.session.report_state_change(self.state, int(seconds), self.current_duration)
+            for s in self.sessions:
+                try:
+                    s.report_state_change(self.state, int(seconds), self.current_duration)
+                except Exception:
+                    pass
 
     def get_time(self) -> int:
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
@@ -264,26 +292,46 @@ class KodiPlayerBridge:
             cur_time = int(seek_val)
 
         if self.current_video_id:
-            self.session.report_state_change(PlayerState.PLAYING, cur_time, self.current_duration)
-            self.session.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PLAYING)
+            for s in self.sessions:
+                try:
+                    s.report_state_change(PlayerState.PLAYING, cur_time, self.current_duration)
+                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PLAYING)
+                except Exception:
+                    pass
 
     def _on_playback_paused(self) -> None:
         self.state = PlayerState.PAUSED
         cur_time = self.get_time()
-        self.session.report_state_change(PlayerState.PAUSED, cur_time, self.current_duration)
+        for s in self.sessions:
+            try:
+                s.report_state_change(PlayerState.PAUSED, cur_time, self.current_duration)
+            except Exception:
+                pass
 
     def _on_playback_resumed(self) -> None:
         self.state = PlayerState.PLAYING
         cur_time = self.get_time()
-        self.session.report_state_change(PlayerState.PLAYING, cur_time, self.current_duration)
+        for s in self.sessions:
+            try:
+                s.report_state_change(PlayerState.PLAYING, cur_time, self.current_duration)
+            except Exception:
+                pass
 
     def _on_playback_stopped(self) -> None:
         self.state = PlayerState.STOPPED
-        self.session.report_state_change(PlayerState.STOPPED, 0, 0)
+        for s in self.sessions:
+            try:
+                s.report_state_change(PlayerState.STOPPED, 0, 0)
+            except Exception:
+                pass
 
     def _on_playback_ended(self) -> None:
         self.state = PlayerState.STOPPED
-        self.session.report_state_change(PlayerState.STOPPED, 0, 0)
+        for s in self.sessions:
+            try:
+                s.report_state_change(PlayerState.STOPPED, 0, 0)
+            except Exception:
+                pass
 
         # Advance playlist
         with self._lock:

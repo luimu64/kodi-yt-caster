@@ -34,6 +34,22 @@ msgctxt "#30004"
 msgid "Enable debug logging"
 msgstr "Enable debug logging"
 
+msgctxt "#30030"
+msgid "Enable Wi-Fi Network Discovery (SSDP/DIAL)"
+msgstr "Enable Wi-Fi Network Discovery (SSDP/DIAL)"
+
+msgctxt "#30031"
+msgid "Allows YouTube and YouTube Music to automatically find Kodi on the local Wi-Fi network"
+msgstr "Allows YouTube and YouTube Music to automatically find Kodi on the local Wi-Fi network"
+
+msgctxt "#30032"
+msgid "DIAL Discovery Port"
+msgstr "DIAL Discovery Port"
+
+msgctxt "#30033"
+msgid "HTTP port for DIAL device description and pairing (default: 8008)"
+msgstr "HTTP port for DIAL device description and pairing (default: 8008)"
+
 msgctxt "#30010"
 msgid "Playback"
 msgstr "Playback"

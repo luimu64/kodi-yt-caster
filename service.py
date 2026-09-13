@@ -26,7 +26,10 @@ from resources.lib.lounge.pairing import (
     generate_screen_id,
     get_lounge_token_batch,
     get_pairing_code,
+    register_pairing_code,
 )
+from resources.lib.discovery.ssdp import SSDPResponder
+from resources.lib.discovery.dial_server import DIALService
 from resources.lib.lounge.session import LoungeSession
 from resources.lib.lounge.listener import CommandDispatcher, LoungeListener
 from resources.lib.player_bridge import KodiPlayerBridge
@@ -92,11 +95,17 @@ def run_service() -> None:
     custom_cookies = get_setting("custom_cookies_file", "")
     stream_selection = get_setting("stream_selection", "manual-osd")
     max_resolution = get_setting("max_resolution", "auto")
+    enable_discovery = get_setting_bool("enable_discovery", True)
+    dial_port = int(get_setting("dial_port", "8008") or 8008)
 
-    # Ensure valid screen_id and lounge_token
+    # Ensure valid screen_id and lounge_token for YouTube video
     screen_id = session_data.get("screen_id")
     lounge_token = session_data.get("lounge_token")
     device_id = session_data.get("device_id")
+
+    # Ensure valid screen_id and lounge_token for YouTube Music
+    screen_id_m = session_data.get("screen_id_m")
+    lounge_token_m = session_data.get("lounge_token_m")
 
     is_first_run = not (screen_id and lounge_token)
 
@@ -121,20 +130,51 @@ def run_service() -> None:
             log_kodi(f"Failed to fetch lounge token: {e}", 2)
             return
 
-    # Create Lounge Session
-    session = LoungeSession(
+    if not screen_id_m:
+        try:
+            log_kodi("Requesting screen_id for YouTube Music...", 1)
+            screen_id_m = generate_screen_id()
+            session_data["screen_id_m"] = screen_id_m
+            store.save(session_data)
+        except Exception as e:
+            log_kodi(f"Failed to generate screen_id_m: {e}", 2)
+
+    if screen_id_m and not lounge_token_m:
+        try:
+            log_kodi(f"Fetching lounge token batch for YouTube Music screen {screen_id_m}...", 1)
+            lounge_token_m, exp_m = get_lounge_token_batch(screen_id_m)
+            session_data["lounge_token_m"] = lounge_token_m
+            session_data["expiration_m"] = exp_m
+            store.save(session_data)
+        except Exception as e:
+            log_kodi(f"Failed to fetch YouTube Music lounge token: {e}", 2)
+
+    # Create Lounge Sessions (cl for standard YouTube, m for YouTube Music)
+    session_cl = LoungeSession(
         screen_id=screen_id,
         lounge_token=lounge_token,
         device_id=device_id,
         screen_name=screen_name,
+        theme="cl",
     )
+    sessions = [session_cl]
+    session_m = None
+    if screen_id_m and lounge_token_m:
+        session_m = LoungeSession(
+            screen_id=screen_id_m,
+            lounge_token=lounge_token_m,
+            device_id=device_id,
+            screen_name=screen_name,
+            theme="m",
+        )
+        sessions.append(session_m)
 
     # Initialize resolver and player
     ytdlp_bin = find_ytdlp_binary(custom_ytdlp)
     bridge = YtDlpBridge(binary_path=ytdlp_bin, cookies_path=custom_cookies or None)
     resolver = VideoResolver(bridge=bridge)
     player = KodiPlayerBridge(
-        session=session,
+        session=sessions,
         resolver=resolver,
         stream_selection_type=stream_selection,
         max_resolution=max_resolution,
@@ -174,9 +214,10 @@ def run_service() -> None:
     dispatcher.on_seek = player.seek_to
     dispatcher.on_set_volume = player.set_volume
     dispatcher.on_get_volume = player.get_volume
-    dispatcher.on_get_now_playing = lambda: session.report_now_playing(
-        player.current_video_id or "", player.get_time(), player.current_duration, player.state
-    )
+    dispatcher.on_get_now_playing = lambda: [
+        s.report_now_playing(player.current_video_id or "", player.get_time(), player.current_duration, player.state)
+        for s in sessions
+    ]
 
     def on_token_expired() -> None:
         log_kodi("Token expired or revoked, refreshing registration...", 1)
@@ -184,19 +225,53 @@ def run_service() -> None:
         try:
             new_sid = generate_screen_id()
             new_tok, exp = get_lounge_token_batch(new_sid)
-            session.screen_id = new_sid
-            session.lounge_token = new_tok
-            session.sid = None
+            session_cl.screen_id = new_sid
+            session_cl.lounge_token = new_tok
+            session_cl.sid = None
             store.save({"device_id": device_id, "screen_id": new_sid, "lounge_token": new_tok, "expiration": exp})
             new_code = get_pairing_code(new_sid, new_tok, screen_name)
             PairingDialog(new_code, screen_name).show()
         except Exception as ex:
             log_kodi(f"Failed to refresh registration: {ex}", 2)
 
-    listener = LoungeListener(session=session, dispatcher=dispatcher, on_token_expired=on_token_expired)
-    listener.start()
+    listener_cl = LoungeListener(session=session_cl, dispatcher=dispatcher, on_token_expired=on_token_expired)
+    listener_cl.start()
 
-    log_kodi(f"YouTube Lounge receiver active for screen '{screen_name}'", 1)
+    listener_m = None
+    if session_m:
+        listener_m = LoungeListener(session=session_m, dispatcher=dispatcher, on_token_expired=on_token_expired)
+        listener_m.start()
+
+    # Start SSDP and DIAL discovery if enabled (enables YouTube Music and YouTube local casting)
+    dial_service = None
+    ssdp_responder = None
+    if enable_discovery:
+        def on_dial_pairing(code: str) -> None:
+            log_kodi(f"Registering DIAL pairing code: {code}", 1)
+            try:
+                register_pairing_code(screen_id, code, screen_name, device_id)
+                if screen_id_m:
+                    register_pairing_code(screen_id_m, code, screen_name, device_id)
+                PairingDialog(code, screen_name).show_notification("YouTube Cast", "Linked device via Wi-Fi")
+            except Exception as err:
+                log_kodi(f"Error registering DIAL pairing code: {err}", 2)
+
+        dial_service = DIALService(
+            port=dial_port,
+            device_uuid=device_id,
+            friendly_name=screen_name,
+            screen_id=screen_id,
+            on_pairing_code=on_dial_pairing,
+        )
+        dial_service.start()
+
+        ssdp_responder = SSDPResponder(
+            dial_port=dial_port,
+            device_uuid=device_id,
+        )
+        ssdp_responder.start()
+
+    log_kodi(f"YouTube and YouTube Music Cast receiver active for screen '{screen_name}'", 1)
 
     # Main wait loop
     try:
@@ -210,8 +285,14 @@ def run_service() -> None:
     except KeyboardInterrupt:
         log_kodi("Shutting down service...", 1)
     finally:
-        log_kodi("Stopping listener and player threads...", 1)
-        listener.stop()
+        log_kodi("Stopping listeners, discovery, and player threads...", 1)
+        if dial_service:
+            dial_service.stop()
+        if ssdp_responder:
+            ssdp_responder.stop()
+        listener_cl.stop()
+        if listener_m:
+            listener_m.stop()
         player.stop_monitor()
         log_kodi("Service shutdown complete.", 1)
 

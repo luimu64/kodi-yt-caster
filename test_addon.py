@@ -106,6 +106,63 @@ def test_hls_master_generation():
     os.remove(manifest_path)
 
 
+def test_youtube_music_session():
+    session_m = LoungeSession("s_music", "token_m", "dev_123", "Kodi Music", theme="m")
+    params = session_m._base_params()
+    assert params["theme"] == "m"
+    assert "mus" in params["capabilities"]
+    assert "que" in params["capabilities"]
+
+
+def test_dial_and_ssdp_discovery():
+    from resources.lib.discovery.ssdp import get_local_ip
+    from resources.lib.discovery.dial_server import DIALServer
+    import urllib.request
+
+    ip = get_local_ip()
+    assert ip and len(ip.split(".")) == 4
+
+    paired_codes = []
+    server = DIALServer(
+        port=0,  # bind ephemeral free port
+        device_uuid="test-uuid",
+        friendly_name="Kodi Test Discovery",
+        screen_id="screen_123",
+        on_pairing_code=lambda code: paired_codes.append(code),
+    )
+    port = server.server_address[1]
+
+    import threading
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    try:
+        # 1. Test /ssdp/device-desc.xml
+        desc_url = f"http://127.0.0.1:{port}/ssdp/device-desc.xml"
+        with urllib.request.urlopen(desc_url, timeout=5) as resp:
+            data = resp.read().decode("utf-8")
+            assert "Kodi Test Discovery" in data
+            assert "urn:dial-multiscreen-org:device:dial:1" in data
+
+        # 2. Test /apps/YouTube GET
+        app_url = f"http://127.0.0.1:{port}/apps/YouTube"
+        with urllib.request.urlopen(app_url, timeout=5) as resp:
+            app_data = resp.read().decode("utf-8")
+            assert "<screenId>screen_123</screenId>" in app_data
+
+        # 3. Test /apps/YouTube POST pairing code
+        post_data = urllib.parse.urlencode({"pairingCode": "123-456-789-000"}).encode("utf-8")
+        req = urllib.request.Request(app_url, data=post_data)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 201
+            loc = resp.headers.get("Location")
+            assert "/apps/YouTube/run" in loc
+            assert paired_codes == ["123-456-789-000"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_persistence()
@@ -113,4 +170,6 @@ if __name__ == "__main__":
     test_player_bridge_queue()
     test_ytdlp_downloader_metadata()
     test_hls_master_generation()
+    test_youtube_music_session()
+    test_dial_and_ssdp_discovery()
     print("All unit tests passed successfully.")
