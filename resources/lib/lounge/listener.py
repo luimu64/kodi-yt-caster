@@ -70,20 +70,33 @@ class LoungeListener(threading.Thread):
                 logger.error("Lounge token rejected by server")
                 if self.on_token_expired:
                     self.on_token_expired()
-                break
+                # Re-handshake with the (possibly refreshed) token instead of
+                # dying: the handler resets session.sid/gsessionid.
+                self.session.sid = None
+                self.session.gsessionid = None
+                self.session.last_code = -1
+                self.consecutive_failures = 0
+                backoff = 2.0
+                for _ in range(50):
+                    if self.is_stopped():
+                        return
+                    time.sleep(0.1)
             except Exception as e:
                 self.consecutive_failures += 1
                 logger.warning("Listener error (%s consecutive): %s", self.consecutive_failures, e)
                 if self.consecutive_failures >= 8:
-                    logger.error("Consecutive failures exceeded threshold, invalidating session")
+                    logger.error("Consecutive failures exceeded threshold, re-handshaking session")
                     self.session.sid = None
-                    if self.on_token_expired:
-                        self.on_token_expired()
-                    break
-
-                # Exponential backoff (2, 4, 8, 16, 32, max 60s)
+                    self.consecutive_failures = 0
+                    # Transient network trouble must NOT destroy the pairing:
+                    # only a server-side token rejection (LoungeTokenExpiredError)
+                    # triggers re-registration via on_token_expired.
+                    backoff = 5.0
+                else:
+                    # Exponential backoff (2, 4, 8, 16, 32, max 60s)
+                    sleep_time = min(backoff, 60.0)
+                    backoff = min(backoff * 2.0, 60.0)
                 sleep_time = min(backoff, 60.0)
-                backoff = min(backoff * 2.0, 60.0)
                 for _ in range(int(sleep_time * 10)):
                     if self.is_stopped():
                         return
@@ -116,13 +129,16 @@ class LoungeListener(threading.Thread):
                 if not chunk:
                     break
                 buf += chunk.decode("utf-8", errors="replace")
-                commands = parse_frames(buf)
+                commands, consumed = parse_frames(buf)
+                if consumed:
+                    # Keep any partial trailing frame buffered; its remainder
+                    # arrives in a later chunk.
+                    buf = buf[consumed:]
                 if commands:
                     for code, name, data in commands:
                         if code > self.session.last_code:
                             self.session.last_code = code
                             self._handle_command(name, data)
-                    buf = ""
 
     def _handle_command(self, name: str, data: Any) -> None:
         logger.debug("Received command: %s (data: %s)", name, data)

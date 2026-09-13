@@ -21,6 +21,8 @@ except ImportError:
     xbmcaddon = None  # type: ignore
     xbmcgui = None  # type: ignore
 
+from typing import Optional
+
 from resources.lib.persistence import SessionStore
 from resources.lib.lounge.pairing import (
     generate_screen_id,
@@ -96,7 +98,13 @@ def run_service() -> None:
     stream_selection = get_setting("stream_selection", "manual-osd")
     max_resolution = get_setting("max_resolution", "auto")
     enable_discovery = get_setting_bool("enable_discovery", True)
-    dial_port = int(get_setting("dial_port", "8008") or 8008)
+    try:
+        dial_port = int(get_setting("dial_port", "8008") or 8008)
+    except (TypeError, ValueError):
+        dial_port = 8008
+    if not (1 <= dial_port <= 65535):
+        log_kodi(f"Invalid dial_port {dial_port}, falling back to 8008", 2)
+        dial_port = 8008
 
     # Ensure valid screen_id and lounge_token for YouTube video
     screen_id = session_data.get("screen_id")
@@ -226,31 +234,53 @@ def run_service() -> None:
         for s in sessions
     ]
 
-    def on_token_expired() -> None:
-        nonlocal pairing_dialog
-        log_kodi("Token expired or revoked, refreshing registration...", 1)
-        store.clear()
-        try:
-            new_sid = generate_screen_id()
-            new_tok, exp = get_lounge_token_batch(new_sid)
-            session_cl.screen_id = new_sid
-            session_cl.lounge_token = new_tok
-            session_cl.sid = None
-            store.save({"device_id": device_id, "screen_id": new_sid, "lounge_token": new_tok, "expiration": exp})
-            new_code = get_pairing_code(new_sid, new_tok, screen_name)
-            if pairing_dialog:
-                pairing_dialog.dismiss()
-            pairing_dialog = PairingDialog(new_code, screen_name)
-            pairing_dialog.show()
-        except Exception as ex:
-            log_kodi(f"Failed to refresh registration: {ex}", 2)
+    store_lock = threading.Lock()
 
-    listener_cl = LoungeListener(session=session_cl, dispatcher=dispatcher, on_token_expired=on_token_expired)
+    def make_token_expired(sess: LoungeSession):
+        """Build a per-session token refresh handler.
+
+        Each session refreshes only its OWN registration; the other session's
+        pairing (and the rest of the store) is preserved via merge, and the
+        listener keeps running afterwards.
+        """
+        def _handler() -> None:
+            nonlocal pairing_dialog
+            log_kodi(f"Token expired for theme={sess.theme}, refreshing registration...", 1)
+            try:
+                new_sid = generate_screen_id()
+                new_tok, exp = get_lounge_token_batch(new_sid)
+                with store_lock:
+                    data = store.load()
+                    if sess.theme == "cl":
+                        data["screen_id"] = new_sid
+                        data["lounge_token"] = new_tok
+                        data["expiration"] = exp
+                    else:
+                        data["screen_id_m"] = new_sid
+                        data["lounge_token_m"] = new_tok
+                        data["expiration_m"] = exp
+                    store.save(data)
+                sess.screen_id = new_sid
+                sess.lounge_token = new_tok
+                sess.sid = None
+                sess.gsessionid = None
+                sess.last_code = -1
+                if sess.theme == "cl":
+                    new_code = get_pairing_code(new_sid, new_tok, screen_name)
+                    if pairing_dialog:
+                        pairing_dialog.dismiss()
+                    pairing_dialog = PairingDialog(new_code, screen_name)
+                    pairing_dialog.show()
+            except Exception as ex:
+                log_kodi(f"Failed to refresh registration: {ex}", 2)
+        return _handler
+
+    listener_cl = LoungeListener(session=session_cl, dispatcher=dispatcher, on_token_expired=make_token_expired(session_cl))
     listener_cl.start()
 
     listener_m = None
     if session_m:
-        listener_m = LoungeListener(session=session_m, dispatcher=dispatcher, on_token_expired=on_token_expired)
+        listener_m = LoungeListener(session=session_m, dispatcher=dispatcher, on_token_expired=make_token_expired(session_m))
         listener_m.start()
 
     # Start SSDP and DIAL discovery if enabled (enables YouTube Music and YouTube local casting)
@@ -288,15 +318,30 @@ def run_service() -> None:
 
     log_kodi(f"YouTube and YouTube Music Cast receiver active for screen '{screen_name}'", 1)
 
-    # Main wait loop
+    # Main wait loop; also watches for a pairing-reload request written by the
+    # settings actions (which run in a separate RunScript process).
+    reload_requested = False
     try:
         if KODI_AVAILABLE and xbmc:
             monitor = xbmc.Monitor()
             while not monitor.abortRequested():
-                monitor.waitForAbort(1)
+                if monitor.waitForAbort(5):
+                    break
+                if store.load().get("reload_requested"):
+                    reload_requested = True
+                    data = store.load()
+                    data["reload_requested"] = False
+                    store.save(data)
+                    break
         else:
             while True:
-                time.sleep(1)
+                time.sleep(5)
+                if store.load().get("reload_requested"):
+                    reload_requested = True
+                    data = store.load()
+                    data["reload_requested"] = False
+                    store.save(data)
+                    break
     except KeyboardInterrupt:
         log_kodi("Shutting down service...", 1)
     finally:
@@ -312,6 +357,10 @@ def run_service() -> None:
             listener_m.stop()
         player.stop_monitor()
         log_kodi("Service shutdown complete.", 1)
+
+    if reload_requested:
+        log_kodi("Pairing reload requested via settings action; restarting receiver...", 1)
+        return run_service()
 
 
 if __name__ == "__main__":

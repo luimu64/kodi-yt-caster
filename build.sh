@@ -31,6 +31,8 @@ if [ -n "${ARCH}" ]; then
         YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64"
     elif [ "${ARCH}" = "armv7l" ]; then
         YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_armv7l"
+    elif [ "${ARCH}" = "x86_64" ] || [ "${ARCH}" = "amd64" ]; then
+        YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
     fi
     echo "  Downloading yt-dlp for ${ARCH} from ${YTDLP_URL}..."
     curl -sL "${YTDLP_URL}" -o "${BUILD_DIR}/resources/bin/${BIN_NAME}"

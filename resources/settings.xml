@@ -31,6 +31,11 @@
                 </setting>
                 <setting id="dial_port" type="integer" label="30032" help="30033">
                     <default>8008</default>
+                    <constraints>
+                        <minimum>1024</minimum>
+                        <step>1</step>
+                        <maximum>65535</maximum>
+                    </constraints>
                     <control type="edit" format="integer"/>
                 </setting>
                 <setting id="debug_logging" type="boolean" label="30004">
@@ -83,6 +88,7 @@
             <group id="1">
                 <setting id="session_data" type="string" label="30021">
                     <default>{}</default>
+                    <visible>false</visible>
                     <control type="edit" format="string"/>
                 </setting>
             </group>

@@ -56,7 +56,12 @@ def find_ytdlp_binary(custom_path: Optional[str] = None) -> Optional[str]:
 
 
 def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> Optional[str]:
-    """Generate an HLS Master Playlist (m3u8) exposing all video resolutions and audio streams."""
+    """Generate an HLS Master Playlist (m3u8) exposing video resolutions and audio streams.
+
+    Codec filtering: one codec family per resolution (avc1 preferred, vp09 as
+    fallback) so the OSD picker never offers streams a device cannot decode, and
+    resolutions are not duplicated.
+    """
     hls_video: List[Dict[str, Any]] = []
     hls_audio: List[Dict[str, Any]] = []
 
@@ -75,12 +80,43 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
     if not hls_video:
         return None
 
+    # One codec family per resolution: prefer H.264 (universally decodable),
+    # fall back to VP9, then anything else.
+    by_res: Dict[tuple, Dict[str, Any]] = {}
+    for v in hls_video:
+        height = v.get("height") or 0
+        fps = int(round(float(v.get("fps") or 0)))
+        key = (height, fps)
+        cur = by_res.get(key)
+        if cur is None:
+            by_res[key] = v
+            continue
+        vcodec = str(v.get("vcodec") or "")
+        cur_codec = str(cur.get("vcodec") or "")
+        v_is_avc = vcodec.startswith("avc1")
+        cur_is_avc = cur_codec.startswith("avc1")
+        if (v_is_avc and not cur_is_avc) or (v_is_avc == cur_is_avc and (v.get("tbr") or 0) > (cur.get("tbr") or 0)):
+            by_res[key] = v
+    hls_video = list(by_res.values())
+
+    # Default audio = highest quality. HLS audio formats often lack abr/tbr,
+    # so fall back to the numeric format id (higher itag = better stream).
+    def _audio_quality(a: Dict[str, Any]) -> float:
+        for key in ("abr", "tbr"):
+            val = a.get(key)
+            if val:
+                return float(val)
+        fid = str(a.get("format_id") or "")
+        return float(fid) if fid.isdigit() else 0.0
+
+    hls_audio.sort(key=_audio_quality, reverse=True)
+
     lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
     has_audio = bool(hls_audio)
 
     for i, a in enumerate(hls_audio):
-        name = a.get("format_note") or f"Audio {i+1}"
-        is_default = "YES" if i == len(hls_audio) - 1 else "NO"
+        name = a.get("format_note") or f"Audio {i + 1}"
+        is_default = "YES" if i == 0 else "NO"
         lines.append(
             f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",DEFAULT={is_default},AUTOSELECT=YES,URI="{a["url"]}"'
         )
@@ -104,8 +140,10 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
         lines.append(f'#EXT-X-STREAM-INF:{",".join(attrs)}')
         lines.append(v["url"])
 
-    manifest_path = os.path.join(tempfile.gettempdir(), f"yt_{video_id}_master.m3u8")
-    with open(manifest_path, "w", encoding="utf-8") as f:
+    # Unique temp file: predictable shared names in the temp dir are symlink
+    # clobber targets and collide across concurrent resolves.
+    fd, manifest_path = tempfile.mkstemp(prefix=f"yt_{video_id}_", suffix=".m3u8")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
     return manifest_path
@@ -185,7 +223,7 @@ class YtDlpBridge:
                     stream_type = "progressive"
                     break
 
-        # 4. Fallback to top-level url
+        # 5. Fallback to top-level url
         if not playable_url:
             playable_url = data.get("url")
 

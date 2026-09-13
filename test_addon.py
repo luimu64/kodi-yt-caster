@@ -2,6 +2,7 @@
 """One runnable check for YouTube Lounge Cast Receiver."""
 
 import os
+import time
 import unittest
 from resources.lib.lounge.session import parse_frames, LoungeSession
 from resources.lib.lounge.client import BASE_URL
@@ -24,14 +25,43 @@ class MockYtDlpBridge:
 
 
 def test_frame_parsing():
-    raw_payload = (
-        "58\n"
-        "[[0,[\"c\",\"TEST_SID\",\"\",8]],[1,[\"S\",\"TEST_GSESSIONID\"]]]\n"
-    )
-    frames = parse_frames(raw_payload)
+    payload = '[[0,["c","TEST_SID","",8]],[1,["S","TEST_GSESSIONID"]]]'
+    raw_payload = f"{len(payload)}\n{payload}\n"
+    frames, consumed = parse_frames(raw_payload)
     assert len(frames) == 2
     assert frames[0] == (0, "c", "TEST_SID")
     assert frames[1] == (1, "S", "TEST_GSESSIONID")
+    assert consumed == len(raw_payload)
+
+
+def test_frame_parsing_chunked():
+    """A frame split across reads must not lose its tail (regression: the
+    listener used to discard partial trailing frames)."""
+    import json as _json
+    f1 = _json.dumps([[0, ["c", "SID"]]])
+    f2 = _json.dumps([[1, ["S", "GS"]]])
+    stream = f"{len(f1)}\n{f1}{len(f2)}\n{f2}"
+
+    # simulate listener reads: buffer grows, consume only what's safe
+    got = []
+    buf = ""
+    for i in range(len(stream)):
+        buf += stream[i]
+        commands, consumed = parse_frames(buf)
+        if consumed:
+            buf = buf[consumed:]
+        got.extend(commands)
+    assert got == [(0, "c", "SID"), (1, "S", "GS")], got
+
+
+def test_frame_parsing_incomplete_tail():
+    """A truncated trailing frame stays buffered, unconsumed."""
+    import json as _json
+    f1 = _json.dumps([[0, ["c", "SID"]]])
+    partial = f"{len(f1)}\n{f1}12\n[[1,["
+    commands, consumed = parse_frames(partial)
+    assert commands == [(0, "c", "SID")]
+    assert partial[consumed:] == "12\n[[1,[", partial[consumed:]
 
 
 def test_persistence():
@@ -76,6 +106,40 @@ def test_player_bridge_queue():
 
     player.update_playlist({"videoIds": "v1,v3"})
     assert player.playlist == ["v1", "v3"]
+
+
+def test_player_bridge_index_resync():
+    """Removing items before the current position must not desync the index
+    (regression: queue used to die early)."""
+    session = LoungeSession("s1", "t1", "d1")
+    resolver = VideoResolver(bridge=MockYtDlpBridge())
+    player = KodiPlayerBridge(session=session, resolver=resolver)
+
+    player.set_playlist({"videoId": "v4", "videoIds": "v1,v2,v3,v4", "currentTime": 0})
+    assert player.current_index == 3
+    with player._lock:
+        player.current_video_id = "v4"
+    # phone removes v1 and v2 from the queue while v4 plays
+    player.update_playlist({"videoIds": "v3,v4"})
+    player._resync_index()
+    assert player.current_index == 1  # v4 is now position 1 of [v3, v4]
+
+    # and after v4 ends, no advance past the end
+    player._on_playback_ended()
+    time.sleep(0.2)  # allow spawned play threads to settle
+
+
+def test_play_generation_supersedes():
+    """A stale resolve completing late must not overwrite a newer request."""
+    import threading
+    session = LoungeSession("s1", "t1", "d1")
+    resolver = VideoResolver(bridge=MockYtDlpBridge())
+    player = KodiPlayerBridge(session=session, resolver=resolver)
+
+    player.set_playlist({"videoId": "v1", "videoIds": "v1", "currentTime": 0})
+    player.set_playlist({"videoId": "v2", "videoIds": "v2", "currentTime": 0})
+    time.sleep(0.3)
+    assert player.current_video_id == "v2"
 
 
 def test_ytdlp_downloader_metadata():
@@ -186,9 +250,13 @@ def test_actions_module():
 
 if __name__ == "__main__":
     test_frame_parsing()
+    test_frame_parsing_chunked()
+    test_frame_parsing_incomplete_tail()
     test_persistence()
     test_resolver_cache()
     test_player_bridge_queue()
+    test_player_bridge_index_resync()
+    test_play_generation_supersedes()
     test_ytdlp_downloader_metadata()
     test_hls_master_generation()
     test_youtube_music_session()
