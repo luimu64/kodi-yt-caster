@@ -189,7 +189,8 @@ def run_service() -> None:
             store.save(session_data)
             PairingDialog(pairing_code=code, screen_name=screen_name).show()
         except Exception as e:
-            log_kodi(f"Could not retrieve pairing code: {e}", 2)
+            import traceback
+            log_kodi("Could not retrieve pairing code: " + traceback.format_exc(), 2)
 
     # Dispatcher setup
     dispatcher = CommandDispatcher()
