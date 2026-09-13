@@ -286,9 +286,21 @@ class KodiPlayerBridge:
                 except Exception:
                     pass
 
+    def _is_paused(self) -> bool:
+        # xbmc.Player.isPlaying() returns True WHILE PAUSED, so it cannot
+        # distinguish pause from play. Ask Kodi's GUI conditions instead.
+        if KODI_AVAILABLE and xbmc:
+            try:
+                return xbmc.getCondVisibility("Player.Paused")
+            except Exception:
+                pass
+        return self.state == PlayerState.PAUSED
+
     def pause(self) -> None:
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
-            self._kodi_player.pause()
+            # pause() TOGGLES: guard so pause-while-paused does not resume.
+            if not self._is_paused():
+                self._kodi_player.pause()
         else:
             self.state = PlayerState.PAUSED
             for s in self.sessions:
@@ -299,20 +311,16 @@ class KodiPlayerBridge:
 
     def resume(self) -> None:
         if KODI_AVAILABLE and self._kodi_player:
+            if self._is_paused():
+                # Kodi's pause() toggles pause/resume.
+                self._kodi_player.pause()
+                return
             if self._kodi_player.isPlaying():
-                # Already playing: nothing to do.
+                # Actively playing: nothing to do.
                 return
             if self.current_video_id:
-                try:
-                    total = self._kodi_player.getTotalTime()
-                except Exception:
-                    total = 0
-                if total > 0:
-                    # Paused: Kodi's pause() toggles pause/resume.
-                    self._kodi_player.pause()
-                else:
-                    # Stopped/idle: restart the current item where we left off.
-                    self.play_video_id(self.current_video_id, self.get_time())
+                # Stopped/idle: restart the current item where we left off.
+                self.play_video_id(self.current_video_id, self.get_time())
         else:
             self.state = PlayerState.PLAYING
             for s in self.sessions:
