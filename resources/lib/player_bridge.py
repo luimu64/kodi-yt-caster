@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List, Optional, Union
 from .resolver import VideoResolver
 from .lounge.session import LoungeSession
+from . import preloader
 
 logger = logging.getLogger("ytlounge.player")
 
@@ -197,7 +198,10 @@ class KodiPlayerBridge:
         def _run() -> None:
             try:
                 logger.info("Prefetching next video: %s", next_id)
-                self.resolver.resolve(next_id)
+                info = self.resolver.resolve(next_id)
+                # Preload the first ~60s of media itself: track change then
+                # starts from warm disk instead of a cold CDN round-trip.
+                preloader.preload(next_id, info)
             except Exception:
                 logger.debug("Prefetch of %s failed", next_id, exc_info=True)
 
@@ -223,6 +227,15 @@ class KodiPlayerBridge:
             logger.error("No playable URL found for %s", video_id)
             self._notify("YouTube Cast", "No playable stream found", error=True)
             return
+
+        # If the next-item preload already cached this stream's prefix, play
+        # through the local proxy: instant startup, seamless remote splice.
+        try:
+            proxied = preloader.proxy_url(video_id, info)
+        except Exception:
+            proxied = None
+        if proxied:
+            playable_url = proxied
 
         with self._lock:
             if gen != self._play_gen:

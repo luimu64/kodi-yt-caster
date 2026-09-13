@@ -26,6 +26,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         name = self.path.lstrip("/").split("?")[0]
+        if name.startswith("preload/"):
+            from . import preloader
+            preloader.handle_request(self, name[len("preload/"):])
+            return
         with _LOCK:
             body = _MANIFESTS.get(name)
         if body is None:
@@ -51,6 +55,17 @@ class ManifestServer:
 
     def url_for(self, name: str) -> str:
         return f"http://127.0.0.1:{self.port}/{name}"
+
+
+def server_url_for(name: str) -> str:
+    """Public helper: URL for a name without publishing manifest content."""
+    global _SERVER
+    if _SERVER is None:
+        publish("__warm__", "")  # boot the server
+        with _LOCK:
+            _MANIFESTS.pop("__warm__", None)
+    assert _SERVER is not None
+    return _SERVER.url_for(name)
 
 
 def publish(name: str, body: str) -> str:
