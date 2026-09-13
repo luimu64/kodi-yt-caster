@@ -213,11 +213,25 @@ def run_service() -> None:
             pairing_dialog.dismiss()
             pairing_dialog = None
         PairingDialog("", screen_name).show_notification("YouTube Cast", f"Connected to {client_name}")
+        # Announce our playback state right away: the phone will not push its initial
+        # video (hasInitialPlayback) until the receiver posts a nowPlaying update.
+        for s in sessions:
+            try:
+                s.report_now_playing(
+                    player.current_video_id or "",
+                    int(player.get_time()),
+                    player.current_duration,
+                    int(player.state),
+                )
+            except Exception:
+                logger.debug("nowPlaying announcement failed", exc_info=True)
 
     def on_disconnected(data: dict) -> None:
         client_name = data.get("name", "Phone")
         log_kodi(f"Device disconnected: {client_name}", 1)
         PairingDialog("", screen_name).show_notification("YouTube Cast", f"Disconnected from {client_name}")
+        # Cast session ended: drop playback immediately, like a Chromecast does when the sender leaves.
+        player.stop()
 
     dispatcher.on_remote_connected = on_connected
     dispatcher.on_remote_disconnected = on_disconnected

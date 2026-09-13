@@ -48,21 +48,46 @@ class SSDPResponder(threading.Thread):
 
     def run(self) -> None:
         logger.info("Starting SSDP responder on %s:%s (local IP: %s)", SSDP_ADDR, SSDP_PORT, self.local_ip)
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except Exception:
-                pass
 
-            self._sock.bind(("", SSDP_PORT))
-            mreq = struct.pack("4sl", socket.inet_aton(SSDP_ADDR), socket.INADDR_ANY)
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            self._sock.settimeout(1.0)
-        except Exception as e:
-            logger.warning("Could not bind SSDP multicast socket on port 1900: %s", e)
+        # Kodi starts services before the network is up on many devices (LibreELEC boot race):
+        # the multicast join fails with 'No such device' and discovery stays dead all session.
+        # Retry the bind until a real interface appears (max ~5 min), re-resolving the local IP.
+        for attempt in range(60):
+            try:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except Exception:
+                    pass
+
+                self._sock.bind(("", SSDP_PORT))
+                mreq = struct.pack("4sl", socket.inet_aton(SSDP_ADDR), socket.INADDR_ANY)
+                self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                self._sock.settimeout(1.0)
+                break
+            except OSError as e:
+                if self._sock is not None:
+                    try:
+                        self._sock.close()
+                    except Exception:
+                        pass
+                self._sock = None
+                if self._stop_event.is_set():
+                    return
+                if attempt == 0:
+                    logger.warning("SSDP bind failed (%s); network likely not up yet, retrying", e)
+                for _ in range(50):  # 5s between attempts, interruptible
+                    if self._stop_event.is_set():
+                        return
+                    time.sleep(0.1)
+        else:
+            logger.error("SSDP: giving up after 60 bind attempts")
             return
+        # Re-resolve now that the network is up: the advertised LOCATION must carry the real IP.
+        current_ip = get_local_ip()
+        if current_ip and not current_ip.startswith("127."):
+            self.local_ip = current_ip
 
         while not self._stop_event.is_set():
             try:

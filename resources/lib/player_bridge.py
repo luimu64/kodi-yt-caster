@@ -165,8 +165,19 @@ class KodiPlayerBridge:
         else:
             self.current_index = 0
 
+    def _notify(self, message: str, title: str = "YouTube Cast", error: bool = False) -> None:
+        """Show an on-screen notification; safe to call from any thread."""
+        if not (KODI_AVAILABLE and xbmcgui):
+            return
+        try:
+            icon = xbmcgui.NOTIFICATION_ERROR if error else xbmcgui.NOTIFICATION_INFO
+            xbmcgui.Dialog().notification(title, message, icon, 5000)
+        except Exception:
+            logger.debug("notification failed", exc_info=True)
+
     def _play_video(self, video_id: str, gen: int) -> None:
         logger.info("Resolving video %s for playback (gen=%s)", video_id, gen)
+        self._notify("YouTube Cast", "Loading video…")
         try:
             info = self.resolver.resolve(video_id)
         except Exception as e:
@@ -182,6 +193,7 @@ class KodiPlayerBridge:
         playable_url = info.get("playable_url")
         if not playable_url:
             logger.error("No playable URL found for %s", video_id)
+            self._notify("YouTube Cast", "No playable stream found", error=True)
             return
 
         with self._lock:
@@ -192,7 +204,9 @@ class KodiPlayerBridge:
             self.current_duration = int(info.get("duration", 0))
             self._active_gen = gen
 
-        logger.info("Playing: %s (%s)", info.get("title"), playable_url[:60])
+        title = info.get("title") or "YouTube Video"
+        logger.info("Playing: %s (%s)", title, playable_url[:60])
+        self._notify("YouTube Cast", f"Now playing: {title}")
 
         if KODI_AVAILABLE and self._kodi_player:
             list_item = xbmcgui.ListItem(info.get("title", "YouTube Video"))
@@ -204,17 +218,10 @@ class KodiPlayerBridge:
                 list_item.setArt({"thumb": info["thumbnail"], "icon": info["thumbnail"]})
 
             stream_type = info.get("stream_type")
-            # Multi-rendition masters carry detached EXT-X-MEDIA audio, which only inputstream.adaptive
-            # merges correctly; Kodi's native demuxer plays the video rendition alone (no sound).
-            if stream_type in ("hls", "hls_master"):
-                list_item.setMimeType("application/x-mpegURL")
-                list_item.setProperty("inputstream", "inputstream.adaptive")
-                list_item.setProperty("inputstream.adaptive.manifest_type", "hls")
-                if self.stream_selection_type:
-                    list_item.setProperty("inputstream.adaptive.stream_selection_type", self.stream_selection_type)
-                if self.max_resolution and self.max_resolution != "auto":
-                    list_item.setProperty("inputstream.adaptive.chooser_resolution_max", self.max_resolution)
-            elif stream_type == "dash":
+            # HLS: play natively over the localhost http manifest. Do NOT set inputstream.adaptive —
+            # IA stalls the audio stream on these VOD playlists (CVideoPlayerAudio 'stream stalled'),
+            # while Kodi's ffmpeg demuxer merges the detached audio group correctly.
+            if stream_type == "dash":
                 list_item.setMimeType("application/dash+xml")
                 list_item.setProperty("inputstream", "inputstream.adaptive")
                 list_item.setProperty("inputstream.adaptive.manifest_type", "mpd")

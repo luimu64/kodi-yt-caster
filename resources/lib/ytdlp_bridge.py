@@ -119,6 +119,28 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
     real_audio = [a for a in hls_audio if "dubbed-auto" not in str(a.get("format_note") or "").lower()]
     hls_audio = real_audio or hls_audio  # fall back to everything if filtering removed all
 
+    # Dedupe by track name, keeping the highest-itag variant: the same audio track arrives
+    # as a low (233-x) and high (234-x) rendition and offering both makes Kodi's default
+    # selection ambiguous — the low variant can be the one that plays silent.
+    def _itag_num(a: Dict[str, Any]) -> int:
+        fid = str(a.get("format_id") or "")
+        try:
+            return int(fid.split("-")[0])
+        except ValueError:
+            return 0
+
+    best_by_name: Dict[str, Dict[str, Any]] = {}
+    for a in hls_audio:
+        name = str(a.get("format_note") or "").split(" - ")[0] or str(a.get("language") or a.get("format_id"))
+        cur = best_by_name.get(name)
+        if cur is None or _itag_num(a) > _itag_num(cur):
+            best_by_name[name] = a
+    hls_audio = list(best_by_name.values())
+    # Original track first so the later DEFAULT assignment picks it deterministically.
+    def _is_original_marker(a: Dict[str, Any]) -> bool:
+        return "original" in str(a.get("format_note") or "").lower()
+    hls_audio.sort(key=lambda a: (not _is_original_marker(a), -_itag_num(a)))
+
     # Default audio = the ORIGINAL track when the video carries multiple audio renditions
     # (YouTube auto-dubs: 19 dubs + 1 original). Choosing by quality alone leaves all dub
     # tracks tied at 0 (format ids like "233-0" are not numeric), and list order then promotes
