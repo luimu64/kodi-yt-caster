@@ -97,6 +97,7 @@ def run_service() -> None:
     custom_cookies = get_setting("custom_cookies_file", "")
     stream_selection = get_setting("stream_selection", "manual-osd")
     max_resolution = get_setting("max_resolution", "auto")
+    music_visualizer = get_setting("music_visualizer", "auto")
     enable_discovery = get_setting_bool("enable_discovery", True)
     try:
         dial_port = int(get_setting("dial_port", "8008") or 8008)
@@ -188,6 +189,7 @@ def run_service() -> None:
         resolver=resolver,
         stream_selection_type=stream_selection,
         max_resolution=max_resolution,
+        music_visualizer=music_visualizer,
     )
     player.start_monitor()
 

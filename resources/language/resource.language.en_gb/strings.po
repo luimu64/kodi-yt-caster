@@ -149,3 +149,23 @@ msgstr "Reset & re-link with a fresh TV code"
 msgctxt "#30037"
 msgid "Clear existing device registrations and generate a brand-new pairing code"
 msgstr "Clear existing device registrations and generate a brand-new pairing code"
+
+msgctxt "#30039"
+msgid "Music visualizer (audio-only mode)"
+msgstr "Music visualizer (audio-only mode)"
+
+msgctxt "#30040"
+msgid "Play as audio-only so Kodi shows its music visualizer. Auto = only for songs with no real video (static album art)"
+msgstr "Play as audio-only so Kodi shows its music visualizer. Auto = only for songs with no real video (static album art)"
+
+msgctxt "#30041"
+msgid "Auto (static art songs only)"
+msgstr "Auto (static art songs only)"
+
+msgctxt "#30042"
+msgid "Always (all music)"
+msgstr "Always (all music)"
+
+msgctxt "#30043"
+msgid "Never"
+msgstr "Never"

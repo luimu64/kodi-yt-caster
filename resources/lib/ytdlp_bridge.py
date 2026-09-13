@@ -260,10 +260,31 @@ class YtDlpBridge:
         duration = int(data.get("duration", 0) or 0)
         thumbnail = data.get("thumbnail", "")
 
+        formats = data.get("formats", [])
+
         playable_url = None
         stream_type = "progressive"
 
-        formats = data.get("formats", [])
+        # 1b. Audio-only stream for music visualizer mode (Kodi shows its
+        #     audio visualizer only for audio-player playback).
+        audio_candidates = [
+            f for f in formats
+            if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")
+            and str(f.get("protocol") or "").startswith("http")
+            and ".m3u8" not in str(f.get("url") or "")
+        ]
+        best_audio = (
+            max(audio_candidates, key=lambda f: float(f.get("abr") or f.get("tbr") or 0))
+            if audio_candidates else None
+        )
+
+        # Static album-art video detection: art videos compress to a trickle.
+        heights = [f.get("height") or 0 for f in formats if f.get("vcodec") != "none"]
+        tbrs = [float(f.get("tbr") or 0) for f in formats if f.get("vcodec") != "none"]
+        max_video_tbr = max(tbrs) if tbrs else 0.0
+        is_static_art = bool(heights) and (
+            max(heights) <= 144 or (max_video_tbr > 0 and max_video_tbr < 300.0)
+        )
 
         # 1. Prefer a single progressive (muxed audio+video) stream: Kodi's native player plays it with
         #    audio and needs no local manifest. A split-rendition HLS master with detached EXT-X-MEDIA
@@ -333,4 +354,8 @@ class YtDlpBridge:
             "thumbnail": thumbnail,
             "playable_url": playable_url,
             "stream_type": stream_type,
+            "audio_url": best_audio.get("url") if best_audio else None,
+            "is_static_art": is_static_art,
+            "artist": data.get("artist") or data.get("uploader") or "",
+            "album": data.get("album") or "",
         }

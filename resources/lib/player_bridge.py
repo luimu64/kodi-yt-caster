@@ -35,6 +35,7 @@ class KodiPlayerBridge:
         resolver: Optional[VideoResolver] = None,
         stream_selection_type: str = "manual-osd",
         max_resolution: str = "auto",
+        music_visualizer: str = "auto",
     ):
         if isinstance(session, list):
             self.sessions = session
@@ -44,6 +45,7 @@ class KodiPlayerBridge:
         self.resolver = resolver or VideoResolver()
         self.stream_selection_type = stream_selection_type
         self.max_resolution = max_resolution
+        self.music_visualizer = music_visualizer
         self.playlist: List[str] = []
         self.current_index: int = 0
         self.current_video_id: Optional[str] = None
@@ -254,15 +256,35 @@ class KodiPlayerBridge:
         self._kick_prefetch()
 
         if KODI_AVAILABLE and self._kodi_player:
+            # Music visualizer mode: play audio-only so Kodi routes it to the
+            # audio player and shows its visualization instead of a static
+            # album-art video. "always" applies to every track, "auto" only to
+            # detected static-art songs.
+            audio_mode = (
+                info.get("audio_url")
+                and (self.music_visualizer == "always"
+                     or (self.music_visualizer != "never" and info.get("is_static_art")))
+            )
+            if audio_mode:
+                playable_url = info["audio_url"]
+
             list_item = xbmcgui.ListItem(info.get("title", "YouTube Video"))
-            list_item.setInfo("video", {
-                "title": info.get("title", ""),
-                "duration": self.current_duration,
-            })
+            if audio_mode:
+                list_item.setInfo("music", {
+                    "title": info.get("title", ""),
+                    "duration": self.current_duration,
+                    "artist": info.get("artist", ""),
+                    "album": info.get("album", ""),
+                })
+            else:
+                list_item.setInfo("video", {
+                    "title": info.get("title", ""),
+                    "duration": self.current_duration,
+                })
             if info.get("thumbnail"):
                 list_item.setArt({"thumb": info["thumbnail"], "icon": info["thumbnail"]})
 
-            stream_type = info.get("stream_type")
+            stream_type = "" if audio_mode else info.get("stream_type")
             # HLS: play natively over the localhost http manifest. Do NOT set inputstream.adaptive —
             # IA stalls the audio stream on these VOD playlists (CVideoPlayerAudio 'stream stalled'),
             # while Kodi's ffmpeg demuxer merges the detached audio group correctly.
