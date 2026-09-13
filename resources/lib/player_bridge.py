@@ -393,7 +393,21 @@ class KodiPlayerBridge:
             self.pending_seek = None
         if pending is not None and pending > 0:
             if KODI_AVAILABLE and self._kodi_player:
-                self._kodi_player.seekTime(pending)
+                # Adaptive streams (HLS/DASH) are often not seekable the instant
+                # onPlayBackStarted fires: the demuxer is still opening and the
+                # seek is silently dropped, so a cast that should resume at T
+                # starts from 0 (position desync vs the phone). Retry briefly.
+                for attempt in range(5):
+                    try:
+                        self._kodi_player.seekTime(pending)
+                    except Exception:
+                        pass
+                    time.sleep(0.4)
+                    try:
+                        if self._kodi_player.isPlaying() and abs(self._kodi_player.getTime() - pending) < 2.0:
+                            break
+                    except Exception:
+                        continue
             cur_time = int(pending)
 
         if self.current_video_id:

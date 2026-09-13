@@ -160,14 +160,16 @@ def test_hls_master_generation():
     ]
     manifest_path = build_hls_master_manifest(mock_formats, "test_vid")
     assert manifest_path is not None
-    assert os.path.exists(manifest_path)
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        content = f.read()
+    # Served over the localhost manifest server, not a file path.
+    assert manifest_path.startswith("http://127.0.0.1:")
+    import urllib.request
+    with urllib.request.urlopen(manifest_path, timeout=5) as resp:
+        content = resp.read().decode("utf-8")
     assert "#EXT-X-STREAM-INF" in content
     assert "RESOLUTION=1920x1080" in content
     assert "RESOLUTION=640x360" in content
     assert "#EXT-X-MEDIA:TYPE=AUDIO" in content
-    os.remove(manifest_path)
+
 
 
 def test_youtube_music_session():

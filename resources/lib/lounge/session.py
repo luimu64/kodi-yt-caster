@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import random
 import re
 import string
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -96,6 +98,18 @@ class LoungeSession:
         self.gsessionid: Optional[str] = None
         self.ofs = 0
         self.last_code = -1
+        # Async reporting: posts to /bc/bind open a fresh TLS connection each
+        # time and can take seconds. Doing them on the listener thread stalls
+        # command delivery (seek/pause lag by seconds); doing them on the
+        # position loop drifts its cadence. So report_* enqueue and a single
+        # worker thread posts, coalescing repeated reports (last wins per tag)
+        # so a slow network cannot build an unbounded backlog of stale states.
+        self._post_queue: "queue.Queue[Optional[Tuple[str, str, Dict[str, Any]]]]" = queue.Queue()
+        self._ofs_lock = threading.Lock()
+        self._post_worker = threading.Thread(
+            target=self._post_worker_loop, daemon=True, name=f"LoungePoster-{theme}"
+        )
+        self._post_worker.start()
 
     def _random_zx(self) -> str:
         return "".join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -149,15 +163,55 @@ class LoungeSession:
 
         return self.sid, self.gsessionid
 
+    def _post_worker_loop(self) -> None:
+        while True:
+            item = self._post_queue.get()
+            if item is None:
+                return
+            tag, sc, data = item
+            # Coalesce: if a newer report with the same tag is already queued,
+            # skip this stale one (only the latest position/state matters).
+            pending: list = []
+            newer = False
+            while True:
+                try:
+                    nxt = self._post_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    pending.append(None)
+                    break
+                if nxt[0] == tag:
+                    newer = True
+                    # drop older same-tag item(s) queued before this one
+                else:
+                    pending.append(nxt)
+            for p in pending:
+                self._post_queue.put(p)
+            if newer:
+                continue
+            try:
+                self._do_post(sc, data)
+            except Exception:
+                logger.debug("Async post %s failed", sc, exc_info=True)
+
     def post_action(self, sc: str, data: Dict[str, Any]) -> None:
-        """Report back player or device state to Lounge via /bc/bind."""
+        """Enqueue a player/device state report; posted asynchronously by the
+        session's worker so callers (listener thread, position loop) never block."""
+        if not self.sid:
+            return
+        self._post_queue.put((sc, sc, data))
+
+    def _do_post(self, sc: str, data: Dict[str, Any]) -> None:
         if not self.sid:
             return
 
-        self.ofs += 1
+        with self._ofs_lock:
+            self.ofs += 1
+            ofs = self.ofs
         post_data = {
             "count": "1",
-            "ofs": str(self.ofs),
+            "ofs": str(ofs),
             "req0__sc": sc,
         }
         for k, v in data.items():
