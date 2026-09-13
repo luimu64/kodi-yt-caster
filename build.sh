@@ -13,7 +13,7 @@ rm -rf build "${DIST_DIR}"
 mkdir -p "${BUILD_DIR}" "${DIST_DIR}"
 
 # Copy addon files
-cp addon.xml service.py icon.png fanart.jpg "${BUILD_DIR}/"
+cp addon.xml service.py update_ytdlp.py icon.png fanart.jpg "${BUILD_DIR}/"
 cp -r resources "${BUILD_DIR}/"
 
 # Remove any temporary or pycache files

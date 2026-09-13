@@ -23,6 +23,11 @@
         </category>
         <category id="playback" label="30010">
             <group id="1">
+                <setting id="update_ytdlp_btn" type="action" label="30013" help="30014">
+                    <level>0</level>
+                    <data>RunScript(plugin.service.ytlounge-cast, update_ytdlp)</data>
+                    <control type="action" format="action"/>
+                </setting>
                 <setting id="ytdlp_path" type="string" label="30011">
                     <default></default>
                     <control type="edit" format="string"/>

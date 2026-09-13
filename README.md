@@ -10,6 +10,8 @@ Under the hood, stream URLs are resolved locally via `yt-dlp` and passed directl
 - **Permanent pairing:** Device identity and lounge tokens are persisted; re-pair is not required across restarts.
 - **Full remote control:** Play, pause, seek, stop, queue/playlist navigation, and volume control from the phone app.
 - **Native Kodi playback:** Video streams are extracted via yt-dlp and fed directly to Kodi's player.
+- **Automatic yt-dlp binary management:** Automatically detects system architecture (x86_64, aarch64, armv7l, Windows, macOS) and downloads the matching yt-dlp binary upon install/startup.
+- **Manual update button:** Update yt-dlp on demand at any time directly in Addon Settings -> Playback.
 - **Zero non-stdlib dependencies in Kodi:** Operates using Python's standard library (`urllib.request`, `json`, `threading`, `subprocess`).
 
 ## Installation

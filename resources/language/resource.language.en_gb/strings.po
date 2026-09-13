@@ -38,6 +38,14 @@ msgctxt "#30010"
 msgid "Playback"
 msgstr "Playback"
 
+msgctxt "#30013"
+msgid "Update yt-dlp binary now"
+msgstr "Update yt-dlp binary now"
+
+msgctxt "#30014"
+msgid "Download the latest release of yt-dlp matching your hardware architecture"
+msgstr "Download the latest release of yt-dlp matching your hardware architecture"
+
 msgctxt "#30011"
 msgid "Custom yt-dlp binary path (leave empty for auto)"
 msgstr "Custom yt-dlp binary path (leave empty for auto)"

@@ -32,6 +32,7 @@ from resources.lib.lounge.listener import CommandDispatcher, LoungeListener
 from resources.lib.player_bridge import KodiPlayerBridge
 from resources.lib.resolver import VideoResolver
 from resources.lib.ytdlp_bridge import YtDlpBridge, find_ytdlp_binary
+from resources.lib.ytdlp_downloader import ensure_ytdlp, download_ytdlp
 from resources.lib.ui.pairing_dialog import PairingDialog
 
 
@@ -59,7 +60,19 @@ def log_kodi(msg: str, level: int = 1) -> None:
 
 
 def run_service() -> None:
+    # Check if triggered as script action (e.g. RunScript for manual update)
+    if len(sys.argv) > 1 and sys.argv[1] in ("update_ytdlp", "--update-ytdlp"):
+        log_kodi("Running manual yt-dlp binary update", 1)
+        try:
+            download_ytdlp(force=True, show_ui=True)
+        except Exception as e:
+            log_kodi(f"Manual yt-dlp update failed: {e}", 2)
+        return
+
     log_kodi("Starting YouTube Lounge Cast Receiver service", 1)
+
+    # Ensure yt-dlp binary is installed on first run / service start
+    ensure_ytdlp()
 
     store = SessionStore()
     session_data = store.load()

@@ -20,6 +20,18 @@ def find_ytdlp_binary(custom_path: Optional[str] = None) -> Optional[str]:
     if custom_path and os.path.isfile(custom_path) and os.access(custom_path, os.X_OK):
         return os.path.abspath(custom_path)
 
+    # Check Kodi user profile addon_data bin directory
+    try:
+        import xbmcaddon
+        import xbmcvfs
+        profile = xbmcvfs.translatePath(xbmcaddon.Addon().getAddonInfo("profile"))
+        for name in POSSIBLE_BIN_NAMES:
+            profile_path = os.path.join(profile, "bin", name)
+            if os.path.isfile(profile_path) and os.access(profile_path, os.X_OK):
+                return profile_path
+    except Exception:
+        pass
+
     # Check bundled bin dir inside addon
     addon_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     bundled_bin_dir = os.path.join(addon_root, "resources", "bin")

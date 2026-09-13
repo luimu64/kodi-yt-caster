@@ -78,9 +78,19 @@ def test_player_bridge_queue():
     assert player.playlist == ["v1", "v3"]
 
 
+def test_ytdlp_downloader_metadata():
+    from resources.lib.ytdlp_downloader import get_platform_asset_name, get_binary_destination
+    asset, fn = get_platform_asset_name()
+    assert "yt-dlp" in asset
+    assert "yt-dlp" in fn
+    dest = get_binary_destination()
+    assert dest.endswith(fn)
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_persistence()
     test_resolver_cache()
     test_player_bridge_queue()
+    test_ytdlp_downloader_metadata()
     print("All unit tests passed successfully.")
