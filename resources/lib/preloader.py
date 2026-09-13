@@ -3,17 +3,20 @@
 The resolve-cache prefetch already eliminates the yt-dlp crawl on track
 change, but the media itself is still fetched cold: Kodi opens the
 googlevideo URL, pays CDN TLS + TTFB, and the first seconds stutter on
-slow links. This module downloads the first N bytes of the *next* video's
-progressive stream while the current one plays, and serves playback
-through the localhost manifest server:
+slow links. YouTube now serves only split HLS (no progressive formats),
+so this module preloads at the SEGMENT level:
 
-  - requests that fall inside the cached prefix are served from disk
-    (instant, no network),
-  - requests beyond it are seamlessly spliced onto the remote URL from
-    the right byte offset (seek support stays intact).
+  - preload(): fetches the media playlist for the variant+audio the local
+    master exposes, and background-downloads the first ~60s of segments.
+    Segment bytes land in an in-memory cache.
+  - The manifest server routes /preload/<vid>/... requests here:
+      playlist  -> remote media playlist with segment URLs rewritten to
+                   local /preload/<vid>/seg/<n> placeholders
+      seg/<n>   -> cached bytes when warm, else fetch-on-demand from the
+                   remote URL that placeholder maps to (seeks keep working)
 
-HLS/DASH manifests are not preloaded (their segment playlists rotate);
-those keep the resolve-cache-only path.
+Progressive streams (YouTube no longer serves them; kept for other
+resolvers) use the original byte-prefix disk cache with remote splice.
 """
 
 from __future__ import annotations
@@ -23,19 +26,21 @@ import os
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ytlounge.preloader")
 
 PRELOAD_SECONDS = 60
-MIN_BYTES = 4 * 1024 * 1024    # always cache at least ~4 MB
-MAX_BYTES = 24 * 1024 * 1024   # cap for high-bitrate progressive
+MIN_BYTES = 4 * 1024 * 1024    # progressive prefix floor
+MAX_BYTES = 24 * 1024 * 1024   # progressive prefix cap
+SEG_CACHE_LIMIT = 48 * 1024 * 1024  # total cached segment bytes per video
 
 _LOCK = threading.Lock()
 _ITEMS: Dict[str, Dict[str, Any]] = {}   # video_id -> meta
 _CACHE_DIR = tempfile.mkdtemp(prefix="ytc-preload-")
-_KEEP = 2  # prefix files to retain
+_KEEP = 2  # preload entries to retain
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -50,17 +55,25 @@ def _prefix_bytes(info: Dict[str, Any]) -> int:
     return max(MIN_BYTES, min(est or MIN_BYTES, MAX_BYTES))
 
 
-def _request(url: str, range_header: str) -> urllib.request.Request:
-    return urllib.request.Request(url, headers={"User-Agent": _UA, "Range": range_header})
+def _request(url: str, range_header: Optional[str] = None) -> urllib.request.Request:
+    headers = {"User-Agent": _UA}
+    if range_header:
+        headers["Range"] = range_header
+    return urllib.request.Request(url, headers=headers)
+
+
+def _http_get(url: str, timeout: float = 30.0) -> bytes:
+    with urllib.request.urlopen(_request(url), timeout=timeout) as resp:
+        return resp.read()
 
 
 def _trim_cache(keep_id: str) -> None:
-    """Keep only the most recent _KEEP prefix files."""
+    """Keep only the most recent _KEEP preload entries."""
     with _LOCK:
         items = sorted(_ITEMS.values(), key=lambda m: m.get("mtime", 0.0), reverse=True)
-        keep_paths = {m["id"] for m in items[:_KEEP]} | {keep_id}
+        keep_ids = {m["id"] for m in items[:_KEEP]} | {keep_id}
         for m in items:
-            if m["id"] not in keep_paths:
+            if m["id"] not in keep_ids:
                 path = m.get("path")
                 if path and os.path.isfile(path):
                     try:
@@ -70,22 +83,16 @@ def _trim_cache(keep_id: str) -> None:
                 _ITEMS.pop(m["id"], None)
 
 
-def preload(video_id: str, info: Dict[str, Any]) -> None:
-    """Background-download the first ~60s of a progressive stream."""
-    url = info.get("playable_url") or ""
-    if info.get("stream_type") != "progressive" or not url:
-        return
-    with _LOCK:
-        existing = _ITEMS.get(video_id)
-        if existing and existing.get("state") == "ready":
-            return
+# ---------------------------------------------------------------- progressive
 
+def _preload_progressive(video_id: str, info: Dict[str, Any]) -> None:
+    url = info["playable_url"]
     path = os.path.join(_CACHE_DIR, f"{video_id}.prefix")
     limit = _prefix_bytes(info)
     meta: Dict[str, Any] = {
-        "id": video_id, "url": url, "path": path, "size": 0,
-        "total": None, "ctype": "video/mp4", "state": "loading",
-        "mtime": time.time(), "limit": limit,
+        "id": video_id, "kind": "progressive", "url": url, "path": path,
+        "size": 0, "total": None, "ctype": "video/mp4", "state": "loading",
+        "mtime": time.time(),
     }
     with _LOCK:
         _ITEMS[video_id] = meta
@@ -114,9 +121,8 @@ def preload(video_id: str, info: Dict[str, Any]) -> None:
                         size += len(chunk)
             with _LOCK:
                 meta.update(size=size, total=total, ctype=ctype, state="ready", mtime=time.time())
-            logger.info("Preloaded %s: %.1f MB of %s in %.1fs",
-                        video_id, size / 1e6, f"{total / 1e6:.0f}MB" if total else "?",
-                        time.monotonic() - t0)
+            logger.info("Preloaded %s (progressive): %.1f MB in %.1fs",
+                        video_id, size / 1e6, time.monotonic() - t0)
             _trim_cache(video_id)
         except Exception:
             with _LOCK:
@@ -126,22 +132,297 @@ def preload(video_id: str, info: Dict[str, Any]) -> None:
     threading.Thread(target=_run, name=f"Preload-{video_id}", daemon=True).start()
 
 
+# ----------------------------------------------------------------------- HLS
+
+def _abs(base_url: str, url: str) -> str:
+    return urllib.parse.urljoin(base_url, url)
+
+
+def rewrite_master(body: str, video_id: str) -> Tuple[str, List[str]]:
+    """Rewrite a master playlist's media-playlist URLs (variant lines and
+    EXT-X-MEDIA URI= attributes) to local /preload/<vid>/<vkey> URLs.
+
+    Returns (rewritten_body, remote_media_urls)."""
+    urls: List[str] = []
+    lines = body.splitlines()
+    out: List[str] = []
+
+    def _local(u: str) -> str:
+        return f"/preload/{video_id}/{_vkey(u)}"
+
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("#EXT-X-MEDIA:") and "URI=" in s:
+            # split at URI=, take the quoted URL, keep the rest verbatim
+            pre, rest = s.split("URI=", 1)
+            u = rest.split('"', 2)
+            if len(u) >= 2:
+                remote = _abs("", u[1])
+                urls.append(remote)
+                out.append(pre + "URI=" + '"' + _local(remote) + '"' + u[2] if len(u) > 2 else pre + "URI=" + '"' + _local(remote) + '"')
+                continue
+            out.append(line)
+        elif s.startswith("#EXT-X-STREAM-INF:"):
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            if nxt and not nxt.startswith("#"):
+                remote = nxt
+                urls.append(remote)
+                out.append(line)
+                out.append(_local(remote))
+                continue
+        out.append(line)
+    return "\n".join(out) + "\n", urls
+
+
+def preload_hls(video_id: str, media_playlist_urls: List[str]) -> None:
+    """Preload first ~PRELOAD_SECONDS of the given remote media playlists.
+
+    Each playlist's segments are rewritten to local /preload/<vid>/<vkey>/<n>
+    URLs; segment bytes for the first ~60s are prefetched into the cache."""
+    meta: Dict[str, Any] = {
+        "id": video_id, "kind": "hls", "state": "loading",
+        "mtime": time.time(),
+        "segments": {},   # (vkey, n) -> remote segment URL
+        "cache": {},      # (vkey, n) -> bytes
+        "cached_bytes": 0,
+        "playlist_body": {},  # vkey -> rewritten playlist text
+        "master_lines": [],   # vkey list, master order preserved
+    }
+    with _LOCK:
+        _ITEMS[video_id] = meta
+
+    def _run() -> None:
+        try:
+            t0 = time.monotonic()
+            for vurl in media_playlist_urls:
+                vkey = _vkey(vurl)
+                body = _http_get(vurl).decode("utf-8", errors="replace")
+                target = 10.0
+                segs_raw: List[str] = []
+                for l in body.splitlines():
+                    s = l.strip()
+                    if not s:
+                        continue
+                    if s.startswith("#EXT-X-TARGETDURATION:"):
+                        try:
+                            target = float(s.split(":", 1)[1])
+                        except ValueError:
+                            pass
+                    elif not s.startswith("#"):
+                        segs_raw.append(s)
+                want = max(1, int(PRELOAD_SECONDS / max(target, 1)))
+
+                final_lines = []  # unused; rebuilt below
+                fetched = 0
+                with _LOCK:
+                    meta["master_lines"].append(vkey)
+                for i, seg in enumerate(segs_raw):
+                    remote = _abs(vurl, seg)
+                    final_lines.append(f"/preload/{video_id}/{vkey}/{i}")
+                    with _LOCK:
+                        meta["segments"][(vkey, i)] = remote
+                    if i < want:
+                        try:
+                            data = _http_get(remote)
+                            with _LOCK:
+                                _store_segment(meta, vkey, i, data)
+                                fetched += 1
+                        except Exception:
+                            logger.debug("segment %d prefetch failed for %s", i, video_id)
+                for l in body.splitlines():
+                    s = l.strip()
+                    if s and not s.startswith("#"):
+                        pass  # segment lines rebuilt below in original positions
+                # Rebuild playlist preserving tag lines in original positions.
+                rebuilt: List[str] = []
+                i = 0
+                for l in body.splitlines():
+                    s = l.strip()
+                    if s and not s.startswith("#"):
+                        rebuilt.append(f"/preload/{video_id}/{vkey}/{i}")
+                        i += 1
+                    else:
+                        rebuilt.append(l)
+                with _LOCK:
+                    meta["playlist_body"][vkey] = "\n".join(rebuilt) + "\n"
+
+            with _LOCK:
+                meta["state"] = "ready"
+                meta["mtime"] = time.time()
+            logger.info("Preloaded %s (hls): %d segments in %.1fs",
+                        video_id, len(meta["cache"]), time.monotonic() - t0)
+            _trim_cache(video_id)
+        except Exception:
+            with _LOCK:
+                meta["state"] = "failed"
+            logger.debug("HLS preload of %s failed", video_id, exc_info=True)
+
+    threading.Thread(target=_run, name=f"PreloadHLS-{video_id}", daemon=True).start()
+
+
+def _vkey(remote_url: str) -> str:
+    """Stable short key for a remote media-playlist URL."""
+    return urllib.parse.quote(remote_url, safe="")
+
+
+def _store_segment(meta: Dict[str, Any], vkey: str, n: int, data: bytes) -> None:
+    # caller holds _LOCK
+    key = (vkey, n)
+    if key in meta["cache"]:
+        return
+    meta["cache"][key] = data
+    meta["cached_bytes"] += len(data)
+    # Bound the cache: drop the oldest (lowest-n) entries.
+    while meta["cached_bytes"] > SEG_CACHE_LIMIT and len(meta["cache"]) > 1:
+        oldest = min(meta["cache"].keys(), key=lambda k: k[1])
+        meta["cached_bytes"] -= len(meta["cache"].pop(oldest))
+
+
+# ---------------------------------------------------------------- public API
+
+def preload(video_id: str, info: Dict[str, Any]) -> None:
+    """Background-download the first ~60s of the next queue item's stream."""
+    url = info.get("playable_url") or ""
+    if not url:
+        return
+    stype = info.get("stream_type")
+    with _LOCK:
+        existing = _ITEMS.get(video_id)
+        if existing and existing.get("state") == "ready":
+            return
+        if existing and existing.get("state") == "loading":
+            return
+
+    if stype == "progressive":
+        _preload_progressive(video_id, info)
+    elif stype == "hls_master":
+        # url is our localhost master; rewrite its media-playlist URLs to
+        # local ones and preload the first ~60s of segments behind them.
+        try:
+            from .manifest_server import fetch_manifest
+            master_body = fetch_manifest(url)
+            rewritten, urls = rewrite_master(master_body, video_id)
+            if urls:
+                preload_hls(video_id, urls)  # creates the meta entry
+                with _LOCK:
+                    m = _ITEMS.get(video_id)
+                    if m and m.get("kind") == "hls":
+                        m["master_body"] = rewritten
+        except Exception:
+            logger.debug("hls master preload setup failed", exc_info=True)
+    elif stype == "hls":
+        preload_hls(video_id, [url])
+    # dash: not preloaded (adaptive segment URLs need IA-side selection)
+
+
 def proxy_url(video_id: str, info: Dict[str, Any]) -> Optional[str]:
-    """Local URL when a usable prefix exists for this progressive stream."""
-    if info.get("stream_type") != "progressive":
-        return None
+    """Local URL when a usable preload exists for this stream."""
     with _LOCK:
         meta = _ITEMS.get(video_id)
-    if not meta or meta["url"] != (info.get("playable_url") or ""):
-        return None
-    if meta["state"] != "ready" or meta["size"] < 1024:
-        return None
+        if not meta or meta.get("state") != "ready":
+            return None
+        if meta["kind"] == "progressive":
+            if meta["url"] != (info.get("playable_url") or "") or meta["size"] < 1024:
+                return None
+        # kind == "hls": playlist bodies already rewritten to local URLs
     from .manifest_server import server_url_for
-    return server_url_for(f"preload/{video_id}")
+    return server_url_for(f"preload/{video_id}/master.m3u8")
 
+
+# ------------------------------------------------------- manifest server glue
+
+def handle_request(handler, path: str) -> None:
+    """Serve /preload/<vid>/... requests. path excludes the 'preload/' prefix."""
+    parts = path.split("/")
+    if len(parts) < 2:
+        handler.send_error(404, "Not Found")
+        return
+    video_id = parts[0]
+
+    with _LOCK:
+        meta = _ITEMS.get(video_id)
+    if not meta:
+        handler.send_error(404, "Not Found")
+        return
+
+    if meta["kind"] == "progressive" and len(parts) == 1:
+        _serve_progressive(handler, meta)
+        return
+
+    if meta["kind"] == "hls":
+        rest = "/".join(parts[1:])
+        if rest == "master.m3u8":
+            _serve_hls_master(handler, meta)
+            return
+        # rest = <vkey>/<n>  (segment) or <vkey> (media playlist);
+        # vkey is already the percent-encoded form used as dict key.
+        seg_parts = rest.split("/")
+        vkey = seg_parts[0]
+        if len(seg_parts) == 1:
+            _serve_hls_playlist(handler, meta, vkey)
+            return
+        if len(seg_parts) == 2 and seg_parts[1].isdigit():
+            _serve_hls_segment(handler, meta, vkey, int(seg_parts[1]))
+            return
+
+    handler.send_error(404, "Not Found")
+
+
+def _send(handler, code: int, headers: Dict[str, str], body: Optional[bytes] = None) -> None:
+    handler.send_response(code)
+    for k, v in headers.items():
+        handler.send_header(k, v)
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    if body is not None:
+        handler.wfile.write(body)
+
+
+def _serve_hls_master(handler, meta: Dict[str, Any]) -> None:
+    """Master playlist with media-playlist URLs rewritten to local ones."""
+    with _LOCK:
+        body = meta.get("master_body")
+    if not body:
+        body = "#EXTM3U\n" + "\n".join(
+            f"/preload/{meta['id']}/{vk}" for vk in meta.get("master_lines", [])
+        ) + "\n"
+    _send(handler, 200, {"Content-Type": "application/vnd.apple.mpegurl"},
+          body.encode("utf-8"))
+
+
+def _serve_hls_playlist(handler, meta: Dict[str, Any], vkey: str) -> None:
+    with _LOCK:
+        body = meta["playlist_body"].get(vkey)
+    if body is None:
+        handler.send_error(404, "Not Found")
+        return
+    _send(handler, 200, {"Content-Type": "application/vnd.apple.mpegurl"},
+          body.encode("utf-8"))
+
+
+def _serve_hls_segment(handler, meta: Dict[str, Any], vkey: str, n: int) -> None:
+    with _LOCK:
+        data = meta["cache"].get((vkey, n))
+        remote = meta["segments"].get((vkey, n))
+    if data is not None:
+        _send(handler, 200, {"Content-Type": "video/mp4"}, data)
+        return
+    if remote is None:
+        handler.send_error(404, "Not Found")
+        return
+    try:
+        data = _http_get(remote, timeout=30.0)
+    except Exception:
+        handler.send_error(502, "Upstream fetch failed")
+        return
+    with _LOCK:
+        _store_segment(meta, vkey, n, data)
+    _send(handler, 200, {"Content-Type": "video/mp4"}, data)
+
+
+# ------------------------------------------------------- progressive serving
 
 def _parse_range(header: Optional[str]) -> Optional[Tuple[int, Optional[int]]]:
-    """'bytes=a-b' -> (a, b); 'bytes=a-' -> (a, None). Suffix/invalid -> None."""
     if not header or not header.startswith("bytes="):
         return None
     spec = header[6:].split(",")[0].strip()
@@ -149,22 +430,11 @@ def _parse_range(header: Optional[str]) -> Optional[Tuple[int, Optional[int]]]:
         return None
     a, b = spec.split("-", 1)
     if not a.isdigit():
-        return None  # suffix range (-n) or invalid
-    start = int(a)
-    end = int(b) if b.isdigit() else None
-    return start, end
-
-
-def _send(handler, code: int, headers: Dict[str, str]) -> None:
-    handler.send_response(code)
-    for k, v in headers.items():
-        handler.send_header(k, v)
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.end_headers()
+        return None
+    return int(a), (int(b) if b.isdigit() else None)
 
 
 def _proxy_remote(handler, url: str, range_header: str, ctype: str) -> None:
-    """Forward a request verbatim to the remote stream and pipe it back."""
     try:
         with urllib.request.urlopen(_request(url, range_header), timeout=30.0) as resp:
             hdrs = {"Content-Type": resp.headers.get("Content-Type", ctype),
@@ -187,50 +457,38 @@ def _proxy_remote(handler, url: str, range_header: str, ctype: str) -> None:
         logger.debug("Remote proxy failed", exc_info=True)
 
 
-def handle_request(handler, video_id: str) -> None:
-    """Serve a preload prefix, splicing to the remote stream past its end."""
-    with _LOCK:
-        meta = _ITEMS.get(video_id)
-    if not meta or not os.path.isfile(meta["path"]):
+def _serve_progressive(handler, meta: Dict[str, Any]) -> None:
+    if not os.path.isfile(meta["path"]):
         handler.send_error(404, "Not Found")
         return
-
     size = os.path.getsize(meta["path"])
-    total = meta["total"]  # Optional[int]
+    total = meta["total"]
     ctype = str(meta["ctype"])
     url = str(meta["url"])
     range_header = handler.headers.get("Range")
 
-    # Suffix or absent range handling: open-ended start=0 is the common
-    # playback case and is served by the normal path; anything we cannot
-    # map to (start, end) exactly is proxied verbatim to the remote.
     parsed = _parse_range(range_header)
     if parsed is None:
-        if range_header:  # suffix range etc: let the origin handle it
+        if range_header:
             _proxy_remote(handler, url, range_header, ctype)
-        else:
-            parsed = (0, None)  # no Range header: full-file disk path below
-    if parsed is None:
-        return
+            return
+        parsed = (0, None)
 
     start, end = parsed
     if end is not None and total is not None:
         end = min(end, total - 1)
 
     if start >= size:
-        # Entirely past the cached prefix.
         rh = f"bytes={start}-" if end is None else f"bytes={start}-{end}"
         _proxy_remote(handler, url, rh, ctype)
         return
 
-    # Serve the warm disk prefix [start, min(end, size-1)] ...
     disk_end = size - 1 if end is None else min(end, size - 1)
     real_end = end if end is not None else ((total - 1) if total is not None else None)
     hdrs = {"Content-Type": ctype, "Accept-Ranges": "bytes"}
     if total is not None and real_end is not None:
-        content_len = real_end - start + 1
         hdrs["Content-Range"] = f"bytes {start}-{real_end}/{total}"
-        hdrs["Content-Length"] = str(content_len)
+        hdrs["Content-Length"] = str(real_end - start + 1)
     elif end is not None:
         hdrs["Content-Length"] = str(end - start + 1)
     _send(handler, 206, hdrs)
@@ -244,7 +502,6 @@ def handle_request(handler, video_id: str) -> None:
                     break
                 handler.wfile.write(chunk)
                 remaining -= len(chunk)
-        # ... then splice onto the remote for bytes past the prefix.
         past_prefix = end is None or end >= size
         if past_prefix and (total is None or total > size):
             rh = f"bytes={size}-" if end is None else (
@@ -257,6 +514,6 @@ def handle_request(handler, video_id: str) -> None:
                             break
                         handler.wfile.write(chunk)
     except (BrokenPipeError, ConnectionResetError):
-        pass  # client closed (seek/stop) — normal
+        pass
     except Exception:
-        logger.debug("Prefix serve for %s failed", video_id, exc_info=True)
+        logger.debug("Prefix serve failed", exc_info=True)

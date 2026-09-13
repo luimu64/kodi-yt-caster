@@ -57,6 +57,15 @@ class ManifestServer:
         return f"http://127.0.0.1:{self.port}/{name}"
 
 
+def fetch_manifest(url: str) -> str:
+    """Return the body previously published under this localhost URL."""
+    name = url.rsplit("/", 1)[-1]
+    if "?" in name:
+        name = name.split("?")[0]
+    with _LOCK:
+        return _MANIFESTS.get(name, "")
+
+
 def server_url_for(name: str) -> str:
     """Public helper: URL for a name without publishing manifest content."""
     global _SERVER
