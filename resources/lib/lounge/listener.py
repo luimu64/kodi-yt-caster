@@ -125,7 +125,12 @@ class LoungeListener(threading.Thread):
         with urllib.request.urlopen(req, timeout=120.0) as resp:
             buf = ""
             while not self.is_stopped():
-                chunk = resp.read(512)
+                # read1(): returns as soon as ANY bytes are buffered. resp.read(n)
+                # blocks until all n bytes arrive — and Lounge command frames are
+                # ~100-300 bytes followed by silence, so each command sat in the
+                # socket buffer until the NEXT command supplied the remaining
+                # bytes (every command relayed one late).
+                chunk = resp.fp.read1(4096)
                 if not chunk:
                     break
                 buf += chunk.decode("utf-8", errors="replace")
