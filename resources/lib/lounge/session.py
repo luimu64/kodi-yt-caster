@@ -17,10 +17,17 @@ logger = logging.getLogger("ytlounge.session")
 CMD_PATTERN = re.compile(r"\[(?P<code>\d+),\[\"(?P<cmd>.+?)\"(?:,(?P<data>.*?))?\]\]")
 
 
-def parse_frames(body: str) -> List[Tuple[int, str, Any]]:
-    """Parse length-delimited frames or fallback regex from /bc/bind responses."""
+def parse_frames(body: str) -> Tuple[List[Tuple[int, str, Any]], int]:
+    """Parse length-delimited frames from /bc/bind responses.
+
+    Returns (commands, consumed) where `consumed` is the number of bytes safely
+    processed. Callers MUST keep body[consumed:] buffered — it may contain the
+    beginning of a not-yet-complete frame whose remainder arrives in a later
+    chunk.
+    """
     commands: List[Tuple[int, str, Any]] = []
     pos = 0
+    consumed = 0
     while pos < len(body):
         newline = body.find("\n", pos)
         if newline == -1:
@@ -28,12 +35,16 @@ def parse_frames(body: str) -> List[Tuple[int, str, Any]]:
         length_str = body[pos:newline].strip()
         if not length_str:
             pos = newline + 1
+            consumed = pos
             continue
         try:
             length = int(length_str)
         except ValueError:
             break
         start = newline + 1
+        if start + length > len(body):
+            # Incomplete frame: wait for the rest in a later chunk.
+            break
         payload = body[start : start + length]
         try:
             items = json.loads(payload)
@@ -49,9 +60,10 @@ def parse_frames(body: str) -> List[Tuple[int, str, Any]]:
         except Exception:
             pass
         pos = start + length
+        consumed = pos
 
     if not commands:
-        for match in CMD_PATTERN.finditer(body):
+        for match in CMD_PATTERN.finditer(body[:consumed] if consumed else body):
             code = int(match.group("code"))
             name = match.group("cmd")
             raw_data = match.group("data")
@@ -63,7 +75,7 @@ def parse_frames(body: str) -> List[Tuple[int, str, Any]]:
                     data = raw_data
             commands.append((code, name, data))
 
-    return commands
+    return commands, consumed
 
 
 class LoungeSession:
@@ -126,7 +138,7 @@ class LoungeSession:
         except Exception as e:
             raise LoungeError(f"Handshake network error: {e}") from e
 
-        for _, name, data_val in parse_frames(body):
+        for _, name, data_val in parse_frames(body)[0]:
             if name == "c":
                 self.sid = str(data_val)
             elif name == "S":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import socket
 import struct
 import threading
@@ -63,17 +64,6 @@ class SSDPResponder(threading.Thread):
             logger.warning("Could not bind SSDP multicast socket on port 1900: %s", e)
             return
 
-        response_template = (
-            "HTTP/1.1 200 OK\r\n"
-            f"LOCATION: http://{self.local_ip}:{self.dial_port}/ssdp/device-desc.xml\r\n"
-            "CACHE-CONTROL: max-age=1800\r\n"
-            "EXT:\r\n"
-            "BOOTID.UPNP.ORG: 1\r\n"
-            "SERVER: UPnP/1.0\r\n"
-            f"USN: uuid:{self.device_uuid}::{DIAL_ST}\r\n"
-            f"ST: {DIAL_ST}\r\n\r\n"
-        ).encode("utf-8")
-
         while not self._stop_event.is_set():
             try:
                 data, addr = self._sock.recvfrom(2048)
@@ -81,9 +71,45 @@ class SSDPResponder(threading.Thread):
                     continue
 
                 msg = data.decode("utf-8", errors="replace")
-                if "M-SEARCH" in msg and (DIAL_ST in msg or "ssdp:all" in msg):
-                    logger.debug("Received DIAL M-SEARCH from %s, sending response", addr)
-                    self._sock.sendto(response_template, addr)
+                if "M-SEARCH" not in msg or not (DIAL_ST in msg or "ssdp:all" in msg):
+                    continue
+                # SSDP requires the MAN: header per spec.
+                if 'MAN: "ssdp:discover"' not in msg and "MAN: ssdp:discover" not in msg:
+                    continue
+
+                # Re-resolve the advertised IP: a stale address from startup
+                # makes discovery advertise an unreachable device forever.
+                current_ip = get_local_ip()
+                if current_ip != "127.0.0.1":
+                    self.local_ip = current_ip
+
+                # MX handling: wait a random 0..MX seconds so M-SEARCH floods
+                # do not desynchronise clients (SSDP/UPnP requirement).
+                mx = 1.0
+                m = re.search(r"^MX:\s*([\d.]+)", msg, re.MULTILINE)
+                if m:
+                    try:
+                        mx = min(float(m.group(1)), 5.0)
+                    except ValueError:
+                        pass
+                if mx > 0:
+                    for _ in range(int(mx * 20)):
+                        if self._stop_event.is_set():
+                            return
+                        time.sleep(0.05)
+
+                response = (
+                    "HTTP/1.1 200 OK\r\n"
+                    f"CACHE-CONTROL: max-age=1800\r\n"
+                    f"DATE: {time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())}\r\n"
+                    "EXT:\r\n"
+                    f"LOCATION: http://{self.local_ip}:{self.dial_port}/ssdp/device-desc.xml\r\n"
+                    "SERVER: UPnP/1.0\r\n"
+                    f"ST: {DIAL_ST}\r\n"
+                    f"USN: uuid:{self.device_uuid}::{DIAL_ST}\r\n\r\n"
+                ).encode("utf-8")
+                logger.debug("Sending SSDP response to %s", addr)
+                self._sock.sendto(response, addr)
             except socket.timeout:
                 continue
             except Exception as e:

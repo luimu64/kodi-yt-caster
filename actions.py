@@ -67,6 +67,8 @@ def action_show_pairing(reset: bool = False) -> None:
 
     code = get_pairing_code(screen_id, lounge_token, screen_name)
     data["pairing_code"] = code
+    # Ask the running service to re-read the store (it polls this flag).
+    data["reload_requested"] = True
     store.save(data)
 
     dlg = PairingDialog(pairing_code=code, screen_name=screen_name)

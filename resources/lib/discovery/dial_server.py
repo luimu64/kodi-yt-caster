@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.server
 import logging
+import re
 import threading
 import urllib.parse
 from typing import Callable, Optional
@@ -14,14 +15,17 @@ logger = logging.getLogger("ytlounge.dial")
 class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
     server: "DIALServer"
 
+    # Pairing codes are 12 digits (YouTube may deliver with or without dashes).
+    PAIRING_CODE_RE = re.compile(r"^\d{3}-?\d{3}-?\d{3}-?\d{3}$")
+
     def log_message(self, format: str, *args) -> None:
         logger.debug("%s - - [%s] %s", self.client_address[0], self.log_date_time_string(), format % args)
 
     def do_OPTIONS(self) -> None:
+        # No CORS headers: DIAL clients are native apps, not browsers, and
+        # Access-Control-Allow-Origin:* would let any web page drive pairing.
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Allow", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -45,9 +49,14 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(post_body)
             pairing_code = params.get("pairingCode", [""])[0]
 
-            logger.info("Received DIAL pairing code from %s: %s", self.client_address[0], pairing_code)
+            if not pairing_code or not self.PAIRING_CODE_RE.match(pairing_code):
+                logger.warning("Rejected malformed DIAL pairing code from %s", self.client_address[0])
+                self.send_error(400, "Bad Request")
+                return
 
-            if pairing_code and self.server.on_pairing_code:
+            logger.info("Received DIAL pairing code from %s", self.client_address[0])
+
+            if self.server.on_pairing_code:
                 try:
                     self.server.on_pairing_code(pairing_code)
                 except Exception as e:
@@ -55,16 +64,18 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
 
             host = self.headers.get("Host", f"127.0.0.1:{self.server.port}")
             self.send_response(201, "Created")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Location", f"http://{host}/apps/YouTube/run")
             self.end_headers()
         else:
             self.send_error(404, "Not Found")
 
     def do_DELETE(self) -> None:
-        self.send_response(200, "OK")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/apps/YouTube", "/apps/YouTube/", "/apps/YouTube/run"):
+            self.send_response(200, "OK")
+            self.end_headers()
+        else:
+            self.send_error(404, "Not Found")
 
     def _send_device_desc(self) -> None:
         host = self.headers.get("Host", f"127.0.0.1:{self.server.port}")
@@ -95,7 +106,6 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/xml; charset=utf-8")
         self.send_header("Content-Length", str(len(xml)))
         self.send_header("Application-URL", f"http://{host}/apps/")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(xml)
 
@@ -117,7 +127,6 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/xml; charset=utf-8")
         self.send_header("Content-Length", str(len(xml)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(xml)
 

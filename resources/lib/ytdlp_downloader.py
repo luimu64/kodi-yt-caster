@@ -7,6 +7,8 @@ import os
 import platform
 import shutil
 import sys
+import tempfile
+import time
 import urllib.request
 from typing import Optional, Tuple
 
@@ -74,12 +76,11 @@ def get_binary_destination() -> str:
 def download_ytdlp(force: bool = False, show_ui: bool = True) -> str:
     """Download or update yt-dlp binary."""
     dest_path = get_binary_destination()
-    if os.path.isfile(dest_path) and os.access(dest_path, os.X_OK) and not force:
+    if os.path.isfile(dest_path) and not force:
         return dest_path
 
     asset_name, _ = get_platform_asset_name()
     download_url = f"{GITHUB_RELEASES_URL}/{asset_name}"
-    tmp_path = f"{dest_path}.tmp"
 
     logger.info("Downloading yt-dlp from %s to %s", download_url, dest_path)
 
@@ -96,6 +97,11 @@ def download_ytdlp(force: bool = False, show_ui: bool = True) -> str:
         "Accept": "*/*",
     }
     req = urllib.request.Request(download_url, headers=headers)
+
+    # Unique temp name so concurrent downloads (service start + settings
+    # button) never corrupt each other.
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(dest_path) or ".", prefix=".ytdlp-", suffix=".tmp")
+    os.close(fd)
 
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
@@ -121,11 +127,14 @@ def download_ytdlp(force: bool = False, show_ui: bool = True) -> str:
                             f"Downloading yt-dlp ({asset_name})...\n{downloaded // 1024} KB / {total_size // 1024} KB",
                         )
 
-        # Atomic replace
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-        os.rename(tmp_path, dest_path)
-        os.chmod(dest_path, 0o755)
+        # Sanity check: native binaries are >1MB; anything smaller is an error
+        # page or truncated transfer.
+        if downloaded < 1_000_000:
+            raise RuntimeError(f"Downloaded yt-dlp looks truncated ({downloaded} bytes)")
+
+        os.chmod(tmp_path, 0o755)
+        # Atomic replace: never a window with no yt-dlp on disk.
+        os.replace(tmp_path, dest_path)
 
         logger.info("Successfully installed yt-dlp to %s", dest_path)
 
@@ -155,7 +164,9 @@ def download_ytdlp(force: bool = False, show_ui: bool = True) -> str:
 def ensure_ytdlp() -> Optional[str]:
     """Ensure yt-dlp is available, auto-downloading if missing."""
     dest = get_binary_destination()
-    if os.path.isfile(dest) and os.access(dest, os.X_OK):
+    # Gate on file presence, not the exec bit: on noexec userdata mounts
+    # os.access(X_OK) is always False and we would re-download on every boot.
+    if os.path.isfile(dest):
         return dest
 
     # Check if existing system binary exists
@@ -164,11 +175,31 @@ def ensure_ytdlp() -> Optional[str]:
         if sys_path:
             return sys_path
 
-    # Otherwise download it automatically on install / first run
+    # Otherwise download it automatically on install / first run.
+    # Back off for an hour after a failure so a broken network does not
+    # re-download ~25MB on every service start.
+    marker = dest + ".failed_at"
     try:
-        return download_ytdlp(force=False, show_ui=True)
+        if os.path.exists(marker) and time.time() - os.path.getmtime(marker) < 3600:
+            logger.debug("Skipping yt-dlp download; recent attempt failed")
+            return None
+    except Exception:
+        pass
+    try:
+        result = download_ytdlp(force=False, show_ui=True)
+        if os.path.exists(marker):
+            try:
+                os.remove(marker)
+            except Exception:
+                pass
+        return result
     except Exception as e:
         logger.warning("Automatic yt-dlp download failed: %s", e)
+        try:
+            with open(marker, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
         return None
 
 
