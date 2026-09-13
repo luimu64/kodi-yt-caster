@@ -64,7 +64,7 @@ def build_addons_xml(dist_dir: Path, base_url: str) -> str:
         info = ET.SubElement(ext, "info", compressed="false")
         info.text = url
         checksum = ET.SubElement(ext, "checksum")
-        checksum.text = f"{sha1_of_file(zp)}"
+        checksum.text = f"{base_url}/addons.xml.md5"
         datadir = ET.SubElement(ext, "datadir", zip="true")
         datadir.text = f"{base_url}/"
         # serialize the addon node with repository extension appended
