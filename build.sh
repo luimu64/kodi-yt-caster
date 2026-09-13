@@ -37,9 +37,9 @@ if [ -n "${ARCH}" ]; then
     chmod +x "${BUILD_DIR}/resources/bin/${BIN_NAME}"
 fi
 
-# Package zip
+# Package zip (use python zipfile — zip binary not always present)
 cd build
-zip -rq "../${DIST_DIR}/${ZIP_NAME}" "${ADDON_ID}"
+python3 -m zipfile -c "../${DIST_DIR}/${ZIP_NAME}" "${ADDON_ID}"
 cd ..
 
 echo "==> Addon package created at ${DIST_DIR}/${ZIP_NAME}"

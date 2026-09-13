@@ -1,0 +1,50 @@
+name: Build addon + repository index
+
+on:
+  push:
+    branches: [main]
+  tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build addon zip (noarch, yt-dlp fetched on-device)
+        run: ./build.sh
+
+      - name: Build repository index
+        run: python3 build_repo_index.py
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: kodi-repo
+          path: dist/
+
+      - name: Deploy to GitHub Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/
+
+  deploy:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
