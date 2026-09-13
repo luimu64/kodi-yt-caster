@@ -51,6 +51,9 @@ class KodiPlayerBridge:
         self.current_video_id: Optional[str] = None
         self.current_duration: int = 0
         self.pending_seek: Optional[float] = None
+        # 'm' when the current item was cast from YouTube Music, 'cl' from
+        # YouTube; None until the first cast.
+        self.current_theme: Optional[str] = None
         self.state = PlayerState.STOPPED
         self._lock = threading.Lock()
         self._play_gen = 0  # monotonic play-request epoch; supersedes stale requests
@@ -138,6 +141,7 @@ class KodiPlayerBridge:
             else:
                 self.current_index = 0
 
+            self.current_theme = str(data.get("_theme") or self.current_theme or "")
             target_id = self.playlist[self.current_index] if self.playlist else video_id
             if target_id:
                 # Dedup: Google relays the same setPlaylist on both Lounge sessions (and resends
@@ -147,7 +151,7 @@ class KodiPlayerBridge:
                     return
                 self.pending_seek = current_time if current_time > 0 else None
                 self._play_gen += 1
-                threading.Thread(target=self._play_video, args=(target_id, self._play_gen), daemon=True).start()
+                threading.Thread(target=self._play_video, args=(target_id, self._play_gen, self.current_theme), daemon=True).start()
 
     def update_playlist(self, data: Dict[str, Any]) -> None:
         """Handle queue modifications (add, remove, reorder)."""
@@ -157,13 +161,13 @@ class KodiPlayerBridge:
                 self.playlist = [v for v in video_ids_str.split(",") if v]
         self._resync_index()
 
-    def play_video_id(self, video_id: str, seek_time: float = 0.0) -> None:
+    def play_video_id(self, video_id: str, seek_time: float = 0.0, theme: Optional[str] = None) -> None:
         with self._lock:
             self.current_video_id = video_id
             self.pending_seek = seek_time if seek_time > 0 else None
             self._play_gen += 1
             self._resync_index_locked()
-            threading.Thread(target=self._play_video, args=(video_id, self._play_gen), daemon=True).start()
+            threading.Thread(target=self._play_video, args=(video_id, self._play_gen, theme), daemon=True).start()
 
     def _resync_index_locked(self) -> None:
         # caller holds self._lock
@@ -209,7 +213,7 @@ class KodiPlayerBridge:
 
         threading.Thread(target=_run, name="Prefetch", daemon=True).start()
 
-    def _play_video(self, video_id: str, gen: int) -> None:
+    def _play_video(self, video_id: str, gen: int, theme: Optional[str] = None) -> None:
         logger.info("TIMING %s: _play_video start (gen=%s)", video_id, gen)
         self._notify("YouTube Cast", "Loading video…")
         try:
@@ -260,10 +264,23 @@ class KodiPlayerBridge:
             # audio player and shows its visualization instead of a static
             # album-art video. "always" applies to every track, "auto" only to
             # detected static-art songs.
+            music_theme = theme if theme is not None else self.current_theme
+            low_bitrate_video = float(info.get("max_video_tbr") or 0) < 1500.0
             audio_mode = (
                 info.get("audio_url")
-                and (self.music_visualizer == "always"
-                     or (self.music_visualizer != "never" and info.get("is_static_art")))
+                and (
+                    self.music_visualizer == "always"
+                    or (
+                        self.music_visualizer != "never"
+                        and (
+                            info.get("is_static_art")
+                            # YT Music cast + low-bitrate video = still-image song;
+                            # modern art videos ship as 1080p so bitrate/height
+                            # alone can no longer detect them.
+                            or (music_theme == "m" and low_bitrate_video)
+                        )
+                    )
+                )
             )
             if audio_mode:
                 playable_url = info["audio_url"]
@@ -299,6 +316,24 @@ class KodiPlayerBridge:
 
             player = xbmc.Player()
             player.play(playable_url, list_item)
+
+            # Audio mode: route to the music/visualisation window. Player.play()
+            # always plays through the video player fullscreen even for
+            # music-typed ListItems, so Kodi's visualizer never shows. The
+            # addon-compatible way is to activate the music player window
+            # once audio playback has started; it renders the visualizer.
+            if audio_mode and KODI_AVAILABLE and xbmc:
+                def _activate_viz() -> None:
+                    for _ in range(20):  # wait up to ~10s for playback start
+                        try:
+                            if self._kodi_player and self._kodi_player.isPlayingAudio():
+                                # 12005 = music player / visualisation window
+                                xbmc.executebuiltin("ActivateWindow(12005)")
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                threading.Thread(target=_activate_viz, daemon=True, name="VizActivator").start()
         else:
             self.state = PlayerState.PLAYING
             for s in self.sessions:
@@ -509,4 +544,4 @@ class KodiPlayerBridge:
                 next_id = self.playlist[self.current_index]
                 logger.info("Auto-advancing to next video: %s", next_id)
                 self._play_gen += 1
-                threading.Thread(target=self._play_video, args=(next_id, self._play_gen), daemon=True).start()
+                threading.Thread(target=self._play_video, args=(next_id, self._play_gen, self.current_theme), daemon=True).start()

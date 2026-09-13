@@ -356,6 +356,7 @@ class YtDlpBridge:
             "stream_type": stream_type,
             "audio_url": best_audio.get("url") if best_audio else None,
             "is_static_art": is_static_art,
+            "max_video_tbr": max_video_tbr,
             "artist": data.get("artist") or data.get("uploader") or "",
             "album": data.get("album") or "",
         }

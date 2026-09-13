@@ -147,6 +147,11 @@ class LoungeListener(threading.Thread):
 
     def _handle_command(self, name: str, data: Any) -> None:
         logger.debug("Received command: %s (data: %s)", name, data)
+        # Stamp the originating app on dict payloads: 'm' = YouTube Music
+        # sender, 'cl' = YouTube. The player uses it for music-visualizer
+        # auto mode (static-art detection is unreliable for 1080p art videos).
+        if isinstance(data, dict):
+            data.setdefault("_theme", self.session.theme)
         try:
             if name == "remoteConnected":
                 if self.dispatcher.on_remote_connected and isinstance(data, dict):
