@@ -204,6 +204,8 @@ class KodiPlayerBridge:
                 list_item.setArt({"thumb": info["thumbnail"], "icon": info["thumbnail"]})
 
             stream_type = info.get("stream_type")
+            # Multi-rendition masters carry detached EXT-X-MEDIA audio, which only inputstream.adaptive
+            # merges correctly; Kodi's native demuxer plays the video rendition alone (no sound).
             if stream_type in ("hls", "hls_master"):
                 list_item.setMimeType("application/x-mpegURL")
                 list_item.setProperty("inputstream", "inputstream.adaptive")
@@ -221,7 +223,8 @@ class KodiPlayerBridge:
                 if self.max_resolution and self.max_resolution != "auto":
                     list_item.setProperty("inputstream.adaptive.chooser_resolution_max", self.max_resolution)
 
-            self._kodi_player.play(playable_url, list_item)
+            player = xbmc.Player()
+            player.play(playable_url, list_item)
         else:
             self.state = PlayerState.PLAYING
             for s in self.sessions:

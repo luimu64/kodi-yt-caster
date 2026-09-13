@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 from typing import Any, Dict, List, Optional
 
+from .manifest_server import publish
+
 logger = logging.getLogger("ytlounge.ytdlp")
 
 # ponytail: simple binary search ladder; bundled binary -> PATH -> common locations
@@ -111,18 +113,51 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
 
     hls_audio.sort(key=_audio_quality, reverse=True)
 
+    # Strip YouTube auto-dubs: keep only creator-made audio (original and human dubs).
+    # Auto-dub tracks carry "dubbed-auto" in format_note; they are machine-TTS and
+    # nobody wants them in the picker.
+    real_audio = [a for a in hls_audio if "dubbed-auto" not in str(a.get("format_note") or "").lower()]
+    hls_audio = real_audio or hls_audio  # fall back to everything if filtering removed all
+
+    # Default audio = the ORIGINAL track when the video carries multiple audio renditions
+    # (YouTube auto-dubs: 19 dubs + 1 original). Choosing by quality alone leaves all dub
+    # tracks tied at 0 (format ids like "233-0" are not numeric), and list order then promotes
+    # the first auto-dub (e.g. Bengali, often silent) to DEFAULT — the "no sound" bug.
+    def _is_original(a: Dict[str, Any]) -> bool:
+        return "original" in str(a.get("format_note") or "").lower()
+
+    originals = [a for a in hls_audio if _is_original(a)]
+    if originals:
+        default_track = originals[0]
+    else:
+        default_track = max(hls_audio, key=_audio_quality) if hls_audio else None
+
     lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
     has_audio = bool(hls_audio)
 
     for i, a in enumerate(hls_audio):
         name = a.get("format_note") or f"Audio {i + 1}"
-        is_default = "YES" if i == 0 else "NO"
+        # Keep the readable part ("American English - original"), drop the parenthesised suffix.
+        if " - " in str(name):
+            name = str(name).split(" - ")[0]
+        is_default = "YES" if a is default_track else "NO"
+        lang = str(a.get("language") or "").replace("-", "").replace("_", "") or "und"
+        autoselect = "YES" if a is default_track else "NO"
         lines.append(
-            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",DEFAULT={is_default},AUTOSELECT=YES,URI="{a["url"]}"'
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",LANGUAGE="{lang}",DEFAULT={is_default},AUTOSELECT={autoselect},URI="{a["url"]}"'
         )
 
     # Sort video streams from highest to lowest resolution/bitrate
-    hls_video.sort(key=lambda x: (x.get("height") or 0, x.get("tbr") or 0), reverse=True)
+    # Sort video streams highest-first, but H.264 ahead of VP9 at equal height: a Pi 4 cannot hardware-decode
+    # VP9, so leading with VP9 gives a black screen or a stall rather than playback.
+    hls_video.sort(
+        key=lambda x: (
+            1 if str(x.get("vcodec") or "").startswith("avc1") else 0,
+            x.get("height") or 0,
+            x.get("tbr") or 0,
+        ),
+        reverse=True,
+    )
     for v in hls_video:
         bw = int((v.get("tbr") or 1000) * 1000)
         res = v.get("resolution") or (f"{v.get('width')}x{v.get('height')}" if v.get("width") else "")
@@ -142,11 +177,10 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
 
     # Unique temp file: predictable shared names in the temp dir are symlink
     # clobber targets and collide across concurrent resolves.
-    fd, manifest_path = tempfile.mkstemp(prefix=f"yt_{video_id}_", suffix=".m3u8")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-    return manifest_path
+    # Serve the master over localhost http instead of writing a local file: split-rendition masters carry
+    # detached EXT-X-MEDIA audio, which only inputstream.adaptive merges, and IA refuses local paths.
+    name = f"yt_{video_id}.m3u8"
+    return publish(name, "\n".join(lines))
 
 
 class YtDlpBridge:
@@ -188,12 +222,36 @@ class YtDlpBridge:
         playable_url = None
         stream_type = "progressive"
 
-        # 1. Build multi-rendition HLS master playlist for native Kodi resolution switching
         formats = data.get("formats", [])
-        master_path = build_hls_master_manifest(formats, video_id)
-        if master_path:
-            playable_url = master_path
-            stream_type = "hls_master"
+
+        # 1. Prefer a single progressive (muxed audio+video) stream: Kodi's native player plays it with
+        #    audio and needs no local manifest. A split-rendition HLS master with detached EXT-X-MEDIA
+        #    audio renders VIDEO ONLY in Kodi (the external audio playlist is dropped) — that was the
+        #    "picture but no sound" bug. H.264 first: the Pi 4 cannot hardware-decode VP9.
+        progressive: List[Dict[str, Any]] = []
+        for f in formats:
+            proto = str(f.get("protocol") or "")
+            f_url = str(f.get("url") or "")
+            vcodec = str(f.get("vcodec") or "")
+            acodec = str(f.get("acodec") or "")
+            if proto.startswith("http") and ".m3u8" not in f_url and vcodec and vcodec != "none" and acodec and acodec != "none":
+                progressive.append(f)
+
+        if progressive:
+            def _prog_key(f: Dict[str, Any]) -> tuple:
+                is_avc = 1 if str(f.get("vcodec") or "").startswith("avc1") else 0
+                return (is_avc, f.get("height") or 0, f.get("tbr") or 0)
+
+            best_prog = max(progressive, key=_prog_key)
+            playable_url = best_prog["url"]
+            stream_type = "progressive"
+
+        # 2. Fall back to the multi-rendition HLS master playlist (resolution switching in the Kodi OSD)
+        if not playable_url:
+            master_path = build_hls_master_manifest(formats, video_id)
+            if master_path:
+                playable_url = master_path
+                stream_type = "hls_master"
 
         # 2. Look for single HLS playlist fallback
         if not playable_url:
