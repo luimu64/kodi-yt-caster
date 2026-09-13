@@ -55,23 +55,11 @@ def build_addons_xml(dist_dir: Path, base_url: str) -> str:
             continue
         seen.add(key)
 
-        # inject extension point with download URL + checksum
-        url = f"{base_url}/{urllib.parse.quote(zp.name)}"
-        ext = ET.Element("extension", {
-            "point": "kodi.addon.repository",
-            "name": base_url,
-        })
-        info = ET.SubElement(ext, "info", compressed="false")
-        info.text = url
-        checksum = ET.SubElement(ext, "checksum")
-        checksum.text = f"{base_url}/addons.xml.md5"
-        datadir = ET.SubElement(ext, "datadir", zip="true")
-        datadir.text = f"{base_url}/"
-        # serialize the addon node with repository extension appended
+        # NOTE: addons.xml addon nodes are the plain addon.xml content;
+        # per-addon repository extensions / checksums are NOT expected here.
         parent = ET.Element("addon", root.attrib)
         for child in root:
             parent.append(child)
-        parent.append(ext)
         out.append(ET.tostring(parent, encoding="unicode"))
     out.append("</addons>")
     return "\n".join(out)
@@ -88,12 +76,12 @@ def main() -> int:
     md5 = hashlib.md5(xml.encode("utf-8")).hexdigest()
     (dist / "addons.xml.md5").write_text(md5 + "\n", encoding="ascii")
     # simple browsable index page (zips, addons.xml linked)
-    items = "".join(
-        f'<li><a href="{zp.name}">{zp.name}</a>'
-        + ("<b> (install this in Kodi)</b>" if zp.name.startswith("repository.") else "")
-        + "</li>"
-        for zp in sorted(dist.glob("*.zip"))
-    )
+    def link_for(zp: Path) -> str:
+        rel = zp.relative_to(dist)
+        suffix = "<b> (install this in Kodi)</b>" if zp.name.startswith("repository.") else ""
+        return f'<li><a href="{rel}">{zp.name}</a>{suffix}</li>'
+    items = "".join(link_for(zp) for zp in sorted(dist.glob("*.zip")))
+    items += "".join(link_for(zp) for zp in sorted(dist.glob("*/*.zip")))
     (dist / "index.html").write_text(
         '<!DOCTYPE html><html><head><meta charset="utf-8"><title>kodi-yt-caster</title></head>'
         '<body style="font-family:sans-serif"><h1>luimu&#39;s Kodi Repository</h1>'

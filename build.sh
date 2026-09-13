@@ -38,8 +38,10 @@ if [ -n "${ARCH}" ]; then
 fi
 
 # Package zip (use python zipfile — zip binary not always present)
+# Kodi repo datadir layout: <datadir>/<addon.id>/<addon.id>-<version>.zip
+mkdir -p "${DIST_DIR}/${ADDON_ID}"
 cd build
-python3 -m zipfile -c "../${DIST_DIR}/${ZIP_NAME}" "${ADDON_ID}"
+python3 -m zipfile -c "../${DIST_DIR}/${ADDON_ID}/${ZIP_NAME}" "${ADDON_ID}"
 cd ..
 
 # Build the repository bootstrap zip (install-from-zip entry point)
