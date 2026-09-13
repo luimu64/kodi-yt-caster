@@ -59,7 +59,7 @@
                 <setting id="update_ytdlp_btn" type="action" label="30013" help="30014">
                     <level>0</level>
                     <data>RunScript(plugin.service.ytlounge-cast,update_ytdlp)</data>
-                    <control type="button" format="action" data="RunScript(plugin.service.ytlounge-cast,update_ytdlp)"/>
+                    <control type="button" format="action"/>
                 </setting>
                 <setting id="ytdlp_path" type="string" label="30011">
                     <control type="edit" format="string"/>
