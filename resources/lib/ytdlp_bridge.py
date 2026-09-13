@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any, Dict, List, Optional
 
 from .manifest_server import publish
@@ -209,11 +210,22 @@ class YtDlpBridge:
     def __init__(self, binary_path: Optional[str] = None, cookies_path: Optional[str] = None):
         self.binary_path = binary_path or find_ytdlp_binary()
         self.cookies_path = cookies_path
+        self._cache: Dict[str, tuple] = {}  # video_id -> (monotonic_ts, info)
 
     def resolve(self, video_id: str) -> Dict[str, Any]:
         """Resolve YouTube video ID to playable stream details."""
+        t0 = time.monotonic()
         if not self.binary_path:
             raise RuntimeError("yt-dlp executable not found. Please install yt-dlp or configure its path.")
+
+        # Cache: resolve results live for 30 min. Playback URLs (googlevideo) expire ~6h, and a
+        # hit costs 0ms instead of a multi-second yt-dlp crawl — this is what makes auto-advance
+        # and repeated casts of the same track fast.
+        now = time.monotonic()
+        cached = self._cache.get(video_id)
+        if cached and now - cached[0] < 1800:
+            logger.info("TIMING %s: cache hit (+%.0fms total)", video_id, (time.monotonic() - t0) * 1000)
+            return cached[1]
 
         url = f"https://www.youtube.com/watch?v={video_id}"
         cmd = [
@@ -227,13 +239,20 @@ class YtDlpBridge:
 
         cmd.append(url)
 
-        logger.debug("Executing: %s", " ".join(cmd[:4]))
+        logger.info("TIMING %s: launching yt-dlp subprocess", video_id)
+        t1 = time.monotonic()
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        t2 = time.monotonic()
+        logger.info("TIMING %s: yt-dlp subprocess took %.2fs (rc=%s, %dB stdout)", video_id, t2 - t1, proc.returncode, len(proc.stdout or ""))
         if proc.returncode != 0:
             raise RuntimeError(f"yt-dlp error ({proc.returncode}): {proc.stderr.strip()[:300]}")
 
         data = json.loads(proc.stdout)
-        return self._extract_stream_info(data)
+        t3 = time.monotonic()
+        info = self._extract_stream_info(data)
+        logger.info("TIMING %s: json parse %.0fms, extract %.0fms, total %.2fs", video_id, (t3 - t2) * 1000, (time.monotonic() - t3) * 1000, time.monotonic() - t0)
+        self._cache[video_id] = (time.monotonic(), info)
+        return info
 
     def _extract_stream_info(self, data: Dict[str, Any]) -> Dict[str, Any]:
         video_id = data.get("id", "")

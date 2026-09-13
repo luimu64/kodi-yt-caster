@@ -51,6 +51,7 @@ class KodiPlayerBridge:
         self.state = PlayerState.STOPPED
         self._lock = threading.Lock()
         self._play_gen = 0  # monotonic play-request epoch; supersedes stale requests
+        self._prefetch_id: Optional[str] = None
         self._active_gen = 0  # generation of the item currently loaded in Kodi
         self._monitor_stop = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
@@ -136,6 +137,11 @@ class KodiPlayerBridge:
 
             target_id = self.playlist[self.current_index] if self.playlist else video_id
             if target_id:
+                # Dedup: Google relays the same setPlaylist on both Lounge sessions (and resends
+                # on rebind), so the same video can arrive 2-4x in a burst. If we are already
+                # resolving/playing exactly this video, the duplicate is a no-op.
+                if target_id == self.current_video_id and self.state != PlayerState.STOPPED:
+                    return
                 self.pending_seek = current_time if current_time > 0 else None
                 self._play_gen += 1
                 threading.Thread(target=self._play_video, args=(target_id, self._play_gen), daemon=True).start()
@@ -175,8 +181,30 @@ class KodiPlayerBridge:
         except Exception:
             logger.debug("notification failed", exc_info=True)
 
+    def _kick_prefetch(self) -> None:
+        """Resolve the next queue item in the background (populates the resolver cache)."""
+        with self._lock:
+            if not self.playlist:
+                return
+            idx = self.current_index + 1
+            if idx >= len(self.playlist):
+                return
+            next_id = self.playlist[idx]
+        if next_id == self._prefetch_id:
+            return
+        self._prefetch_id = next_id
+
+        def _run() -> None:
+            try:
+                logger.info("Prefetching next video: %s", next_id)
+                self.resolver.resolve(next_id)
+            except Exception:
+                logger.debug("Prefetch of %s failed", next_id, exc_info=True)
+
+        threading.Thread(target=_run, name="Prefetch", daemon=True).start()
+
     def _play_video(self, video_id: str, gen: int) -> None:
-        logger.info("Resolving video %s for playback (gen=%s)", video_id, gen)
+        logger.info("TIMING %s: _play_video start (gen=%s)", video_id, gen)
         self._notify("YouTube Cast", "Loading video…")
         try:
             info = self.resolver.resolve(video_id)
@@ -205,8 +233,12 @@ class KodiPlayerBridge:
             self._active_gen = gen
 
         title = info.get("title") or "YouTube Video"
-        logger.info("Playing: %s (%s)", title, playable_url[:60])
+        logger.info("TIMING %s: resolved -> now calling player.play", video_id)
         self._notify("YouTube Cast", f"Now playing: {title}")
+
+        # Prefetch the next queue item while this one plays: auto-advance then starts
+        # instantly instead of paying the full yt-dlp resolve on track change.
+        self._kick_prefetch()
 
         if KODI_AVAILABLE and self._kodi_player:
             list_item = xbmcgui.ListItem(info.get("title", "YouTube Video"))
@@ -353,6 +385,7 @@ class KodiPlayerBridge:
 
     # Callbacks from Kodi player
     def _on_playback_started(self) -> None:
+        logger.info("TIMING %s: Kodi onPlayBackStarted fired (video visible)", self.current_video_id)
         self.state = PlayerState.PLAYING
         cur_time = self.get_time()
         with self._lock:

@@ -16,7 +16,9 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
     server: "DIALServer"
 
     # Pairing codes are 12 digits (YouTube may deliver with or without dashes).
-    PAIRING_CODE_RE = re.compile(r"^\d{3}-?\d{3}-?\d{3}-?\d{3}$")
+    # The YouTube app sends a 12-digit code (431-874-395-211); YouTube Music sends a UUID.
+    # Both are registered with the Lounge API as-is, so accept either shape.
+    PAIRING_CODE_RE = re.compile(r"^(?:\d{3}-?\d{3}-?\d{3}-?\d{3}|[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})$")
 
     def log_message(self, format: str, *args) -> None:
         logger.debug("%s - - [%s] %s", self.client_address[0], self.log_date_time_string(), format % args)
