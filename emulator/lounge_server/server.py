@@ -52,6 +52,8 @@ class _Session:
 
 
 class MockLoungeServer:
+    IDLE_NOOP_INTERVAL = 30.0  # real-relay cadence
+
     def __init__(self):
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(self))
         self.httpd.daemon_threads = True
@@ -88,22 +90,28 @@ class MockLoungeServer:
     def url(self):
         return self.base_url
 
-    def queue_command(self, item, sids=None):
+    def queue_command(self, item, sids=None, broadcast=False):
         """Queue ONE command pair (cmd, data) to bound sessions.
 
         The relay assigns a monotonically increasing code per delivery —
         receivers drop anything <= last seen code, so codes are stamped here
         per session (never by the sender).
+
+        broadcast=True mirrors relay session-start pushes (e.g.
+        getDiscoveryDeviceId) which land on EVERY actively-polled lounge,
+        not just the first.
         """
         with self._lock:
-            if sids is None:
+            if sids is not None:
+                targets = list(sids)
+            elif broadcast:
+                targets = [sid for sid, sess in self.sessions.items() if sess.polled]
+            else:
                 # A real sender drives ONE lounge: the first actively-polled
                 # session. Delivering to both lounges double-fires every
                 # command (cl + m listeners) and races the bridge dedup.
                 polled = [sid for sid, sess in self.sessions.items() if sess.polled]
                 targets = polled[:1]
-            else:
-                targets = list(sids)
             for sid in targets:
                 sess = self.sessions.get(sid)
                 if sess:
@@ -227,7 +235,7 @@ def _make_handler(server: MockLoungeServer):
 
             self._send(404, "not found")
 
-        # ---- /bc/bind ----
+        # ---- /bc/bind (restored banner) ----
         def _bind(self, parsed, post_body=""):
             q = dict(urllib.parse.parse_qsl(parsed.query))
             token = q.get("loungeIdToken", "")
@@ -282,28 +290,54 @@ def _make_handler(server: MockLoungeServer):
             sess.polled = True
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
-            # close-delimited streaming (no Content-Length): read1() on the
-            # client returns each write as it arrives; the socket stays open
+            # Real relay streams GET /bc/bind with chunked transfer-encoding
+            # (captured on-device: every read surfaces "23\r\n"-style chunk
+            # size markers when the client reads the raw socket). Emulating
+            # that exercises the addec's de-chunking path identically.
+            self.send_header("Transfer-Encoding", "chunked")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
 
             def chunk(data: bytes):
+                self.wfile.write(f"{len(data):x}\r\n".encode('ascii'))
                 self.wfile.write(data)
+                self.wfile.write(b"\r\n")
                 self.wfile.flush()
 
+            def chunk_final():
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+
+            last_frame = time.monotonic()
             while not server._stop.is_set() and not sess.wake.is_set() and not sess.killed:
+                beat = time.monotonic() - last_frame >= server.IDLE_NOOP_INTERVAL
                 try:
                     items = sess.commands.get(timeout=0.25)
+                    idle = False
                 except queue.Empty:
-                    continue
+                    if not beat:
+                        continue
+                    idle = True
                 try:
+                    if idle:
+                        # Real relay noop keepalives every ~30s (archived
+                        # stream dump: codes 8,9,10 ... at 20-30s cadence).
+                        sess.next_code += 1
+                        chunk(encode_frame([[sess.next_code, ["noop"]]]))
+                        last_frame = time.monotonic()
+                        continue
                     chunk(encode_frame([items]))
                     # noop after each command, mirroring the real relay
                     sess.next_code += 1
                     chunk(encode_frame([[sess.next_code, ["noop"]]]))
+                    last_frame = time.monotonic()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
+            try:
+                chunk_final()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
 
     return Handler
 

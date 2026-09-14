@@ -135,7 +135,7 @@ class LoungeListener(threading.Thread):
                 # ~100-300 bytes followed by silence, so each command sat in the
                 # socket buffer until the NEXT command supplied the remaining
                 # bytes (every command relayed one late).
-                chunk = resp.fp.read1(4096)
+                chunk = resp.read1(4096)
                 if not chunk:
                     break
                 buf += chunk.decode("utf-8", errors="replace")

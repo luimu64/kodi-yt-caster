@@ -46,6 +46,25 @@ from resources.lib.ytdlp_downloader import ensure_ytdlp, download_ytdlp
 from resources.lib.ui.pairing_dialog import PairingDialog
 
 
+def _maybe_install_traffic_capture() -> None:
+    """Arm the Lounge traffic recorder when the user asked for it.
+
+    Opt-in via the 'capture_traffic' setting: when enabled the addon records
+    every inbound phone command and outbound report to captures/session.jsonl
+    so the emulator can be rebuilt from real traffic rather than assumptions.
+    Never raises — capture must not be able to break casting.
+    """
+    try:
+        if not get_setting_bool("capture_traffic", False):
+            return
+        from tools import capture_traffic
+        capture_traffic.install()
+        capture_traffic.cmd_start()
+        log_kodi("Lounge traffic capture ARMED -> captures/session.jsonl", 1)
+    except Exception:
+        logger.debug("traffic capture install failed", exc_info=True)
+
+
 def get_setting(name: str, default: str = "") -> str:
     if KODI_AVAILABLE and xbmcaddon:
         try:

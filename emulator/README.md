@@ -66,3 +66,20 @@ listener needs ~62s of backoff; scenarios drive `on_token_expired` directly).
   (verified — zip contains 0 `emulator` entries).
 - Thread-leak debugging: `test_boot_smoke.test_teardown_clean` fails if any
   LoungeListener/DIAL/SSDP/PlaybackMonitor thread survives a scenario.
+
+## Wire fidelity (from the 2026-09-14 device capture)
+
+The dump-derived upgrades lock the mock to the real backend:
+
+- **Chunked transfer-encoding on GET /bc/bind** — the real relay streams
+  long-poll bodies chunked; reading the raw socket surfaces `23\r\n`-style
+  size markers. The mock now sends chunked, so the addon's de-chunking path
+  is exercised identically.
+- **Idle noop keepalives** — every ~30s while a poll is open (real cadence
+  seen in the dump: codes 8, 9, 10 …).
+- **Session-start broadcast** — `phone.get_discovery_device_id()` + 
+  `queue_command(broadcast=True)` reproduce the relay's push of
+  code-4 `getDiscoveryDeviceId` to *every* actively-polled lounge.
+- **Fixture replay** — `test_dump_replay` feeds the archived capture
+  (`fixtures/tv_capture_20260914.json`) through `parse_frames` and asserts
+  the outgoing report shapes match what a real session emits.

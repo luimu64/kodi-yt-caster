@@ -80,6 +80,12 @@ class Phone:
     def get_now_playing(self):
         self._send("getNowPlaying")
 
+    def get_discovery_device_id(self):
+        # Captured on-device (tv_frames dump 2026-09-14): the real relay pushes
+        # code-4 `getDiscoveryDeviceId` to every actively-polled lounge right
+        # at session start, before any user action.
+        self._send("getDiscoveryDeviceId")
+
     def burst_set_playlist(self, video_id, video_ids, current_time=0, n=3, gap=0.03):
         """Relay-duplicate simulation: the real backend redelivers the same
         setPlaylist 2-5x within ~100ms. Commands carry the SAME code so the
