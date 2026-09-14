@@ -351,9 +351,12 @@ class KodiPlayerBridge:
                            "icon": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"})
                 return li
 
+            # Titles must be in the cache BEFORE add() (Kodi snapshots labels
+            # at add time); the sync burst covers the visible window, the
+            # background thread the rest.
+            self._fetch_queue_titles(list(self.playlist or [video_id]))
             for vid in self.playlist or [video_id]:
                 playlist.add(f"plugin://plugin.service.ytlounge-cast/?play={vid}", _item(vid))
-            self._fetch_queue_titles(list(self.playlist or [video_id]))
             xbmc.Player().play(playlist, list_item, False, position)
             self._activate_visualizer()
         except Exception:
@@ -363,26 +366,43 @@ class KodiPlayerBridge:
 
     _queue_titles: Dict[str, str] = {}
 
+    @staticmethod
+    def _fetch_title_sync(video_id: str) -> Optional[str]:
+        """Single oEmbed title lookup (~100-300ms)."""
+        try:
+            import urllib.request
+            import json
+            url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                return json.loads(resp.read().decode("utf-8")).get("title")
+        except Exception:
+            return None
+
     def _fetch_queue_titles(self, video_ids: List[str]) -> None:
-        """Background-fill titles for queue items via YouTube oEmbed (keyless,
-        handles CJK). Cached; runs while the current track plays."""
+        """Fill titles for queue items via YouTube oEmbed (keyless, CJK-safe).
+
+        Kodi snapshots labels at add() time, so the first ~12 uncached items
+        after the current position are fetched synchronously (bounded burst,
+        ~2s max) BEFORE the playlist is built; the background thread covers
+        the rest and caches across track changes.
+        """
         todo = [v for v in video_ids if v not in self._queue_titles]
         if not todo:
             return
+        for vid in todo[:12]:
+            title = self._fetch_title_sync(vid)
+            if title:
+                self._queue_titles[vid] = title
+        rest = [v for v in todo if v not in self._queue_titles]
+        if not rest:
+            return
 
         def _run() -> None:
-            import urllib.request
-            for vid in todo:
-                try:
-                    url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json"
-                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=10.0) as resp:
-                        import json
-                        title = json.loads(resp.read().decode("utf-8")).get("title")
-                    if title:
-                        self._queue_titles[vid] = title
-                except Exception:
-                    pass
+            for vid in rest:
+                title = self._fetch_title_sync(vid)
+                if title:
+                    self._queue_titles[vid] = title
         threading.Thread(target=_run, name="QueueTitles", daemon=True).start()
 
     def _activate_visualizer(self) -> None:
