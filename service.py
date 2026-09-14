@@ -299,7 +299,17 @@ def run_service() -> None:
                             int(player.get_time()),
                             player.current_duration,
                             int(player.state),
+                            current_index=player.current_index,
                         )
+                        if player.playlist or player.current_video_id:
+                            s.report_now_playing_playlist(
+                                player.playlist or ([player.current_video_id] if player.current_video_id else []),
+                                player.current_video_id or "",
+                                player.current_index,
+                                int(player.get_time()),
+                                player.current_duration,
+                                int(player.state),
+                            )
                     except Exception:
                         logger.debug("nowPlaying announcement failed", exc_info=True)
 
@@ -320,10 +330,29 @@ def run_service() -> None:
             dispatcher.on_seek = player.seek_to
             dispatcher.on_set_volume = player.set_volume
             dispatcher.on_get_volume = player.get_volume
-            dispatcher.on_get_now_playing = lambda: [
-                s.report_now_playing(player.current_video_id or "", player.get_time(), player.current_duration, player.state)
-                for s in sessions
-            ]
+            def _handle_get_now_playing() -> None:
+                for s in sessions:
+                    try:
+                        s.report_now_playing(
+                            player.current_video_id or "",
+                            player.get_time(),
+                            player.current_duration,
+                            player.state,
+                            current_index=player.current_index,
+                        )
+                        if player.playlist or player.current_video_id:
+                            s.report_now_playing_playlist(
+                                player.playlist or ([player.current_video_id] if player.current_video_id else []),
+                                player.current_video_id or "",
+                                player.current_index,
+                                player.get_time(),
+                                player.current_duration,
+                                player.state,
+                            )
+                    except Exception:
+                        pass
+
+            dispatcher.on_get_now_playing = _handle_get_now_playing
 
             store_lock = threading.Lock()
 

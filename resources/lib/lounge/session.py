@@ -297,24 +297,81 @@ class LoungeSession:
                 pass
             self._conn = None
 
-    def report_now_playing(self, video_id: str, current_time: int, duration: int, state: int) -> None:
+    def report_now_playing(
+        self,
+        video_id: str,
+        current_time: int,
+        duration: int,
+        state: int,
+        current_index: Optional[int] = None,
+        list_id: str = "",
+    ) -> None:
         """Report now playing status to Lounge (state: 1=playing, 2=paused, 0=stopped)."""
-        self.post_action("nowPlaying", {
+        dur = max(0, int(duration or 0))
+        cur = max(0, int(current_time or 0))
+        payload = {
             "videoId": video_id,
-            "currentTime": str(max(0, int(current_time or 0))),
-            "duration": str(max(0, int(duration or 0))),
+            "currentTime": str(cur),
+            "duration": str(dur),
             "state": str(state),
             "cpn": "kodi",
-        })
+        }
+        if dur > 0:
+            payload["seekableStartTime"] = "0"
+            payload["seekableEndTime"] = str(dur)
+            payload["loadedTime"] = str(dur if state == 1 else cur)
+        if current_index is not None and current_index >= 0:
+            payload["currentIndex"] = str(current_index)
+        if list_id:
+            payload["listId"] = str(list_id)
+
+        self.post_action("nowPlaying", payload)
+
+    def report_now_playing_playlist(
+        self,
+        video_ids: List[str],
+        current_video_id: str,
+        current_index: int,
+        current_time: int,
+        duration: int,
+        state: int,
+        list_id: str = "",
+    ) -> None:
+        """Report now playing playlist status to Lounge."""
+        dur = max(0, int(duration or 0))
+        cur = max(0, int(current_time or 0))
+        payload = {
+            "videoIds": ",".join(video_ids) if video_ids else current_video_id,
+            "videoId": current_video_id,
+            "currentIndex": str(max(0, current_index)),
+            "currentTime": str(cur),
+            "duration": str(dur),
+            "state": str(state),
+        }
+        if dur > 0:
+            payload["seekableStartTime"] = "0"
+            payload["seekableEndTime"] = str(dur)
+        if list_id:
+            payload["listId"] = str(list_id)
+
+        self.post_action("nowPlayingPlaylist", payload)
 
     def report_state_change(self, state: int, current_time: int, duration: int) -> None:
         """Report state change (1=playing, 2=paused, 0=stopped)."""
-        self.post_action("onStateChange", {
+        dur = max(0, int(duration or 0))
+        cur = max(0, int(current_time or 0))
+        payload = {
             "state": str(state),
-            "currentTime": str(max(0, int(current_time or 0))),
-            "duration": str(max(0, int(duration or 0))),
+            "currentTime": str(cur),
+            "duration": str(dur),
             "cpn": "kodi",
-        })
+        }
+        if dur > 0:
+            payload["seekableStartTime"] = "0"
+            payload["seekableEndTime"] = str(dur)
+            payload["loadedTime"] = str(dur if state == 1 else cur)
+
+        self.post_action("onStateChange", payload)
 
     def report_volume(self, volume: int, muted: bool = False) -> None:
         """Report volume level (0-100) and mute status."""
