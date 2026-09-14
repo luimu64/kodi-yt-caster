@@ -278,12 +278,27 @@ class YtDlpBridge:
             if audio_candidates else None
         )
 
-        # Static album-art video detection: art videos compress to a trickle.
+        # Still-image song detection for the music visualizer. Bitrate alone
+        # CANNOT separate these: real old music videos run ~700kbps and modern
+        # art videos ~500-1600kbps (verified empirically). Signals that DO
+        # identify audio uploads, by confidence:
+        #   1. track/album metadata — only music uploads carry it
+        #   2. explicit audio-upload title patterns
+        #   3. trivially low video bitrate (<500kbps = near-static frames)
         heights = [f.get("height") or 0 for f in formats if f.get("vcodec") != "none"]
         tbrs = [float(f.get("tbr") or 0) for f in formats if f.get("vcodec") != "none"]
         max_video_tbr = max(tbrs) if tbrs else 0.0
+        title_l = str(data.get("title") or "").lower()
+        AUDIO_TITLE_MARKERS = (
+            "(audio)", "official audio", "audio only", "(lyric video)",
+            "lyric video", "official lyrics", "visualizer", "album version",
+        )
+        has_track_meta = bool(data.get("track") or data.get("album"))
+        title_is_audio = any(m in title_l for m in AUDIO_TITLE_MARKERS)
         is_static_art = bool(heights) and (
-            max(heights) <= 144 or (max_video_tbr > 0 and max_video_tbr < 300.0)
+            has_track_meta or title_is_audio
+            or max(heights) <= 144
+            or (0 < max_video_tbr < 600.0)
         )
 
         # 1. Prefer a single progressive (muxed audio+video) stream: Kodi's native player plays it with

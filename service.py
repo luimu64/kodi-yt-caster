@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("plugin.service.ytlounge-cast")
+
+ADDON_ROOT = os.path.dirname(os.path.abspath(__file__))
+if ADDON_ROOT not in sys.path:
+    sys.path.insert(0, ADDON_ROOT)
 
 try:
     import xbmc
@@ -62,6 +67,34 @@ def log_kodi(msg: str, level: int = 1) -> None:
         xbmc.log(f"[plugin.service.ytlounge-cast] {msg}", level)
     else:
         logger.info(msg)
+
+
+def write_port_file() -> None:
+    """Persist the manifest server port so plugin invocations can reach us."""
+    try:
+        from resources.lib import manifest_server
+        port = manifest_server.server_port()
+    except Exception:
+        return
+    if port is None:
+        return
+    for base in _profile_dirs():
+        try:
+            with open(os.path.join(base, "manifest_server.port"), "w", encoding="utf-8") as f:
+                f.write(str(port))
+        except Exception:
+            pass
+
+
+def _profile_dirs() -> list:
+    dirs = []
+    try:
+        import xbmcaddon
+        import xbmcvfs
+        dirs.append(xbmcvfs.translatePath(xbmcaddon.Addon().getAddonInfo("profile")))
+    except Exception:
+        dirs.append(ADDON_ROOT)
+    return dirs
 
 
 def run_service() -> None:
@@ -192,6 +225,11 @@ def run_service() -> None:
         music_visualizer=music_visualizer,
     )
     player.start_monitor()
+
+    # Let plugin invocations resolve queue items against our warm caches.
+    from resources.lib import manifest_server
+    manifest_server.set_resolver(resolver)
+    write_port_file()
 
     # Show pairing code only when the user opted in via settings (manual
     # linking); discovery handles the default first-time link.

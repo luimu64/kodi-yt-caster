@@ -264,22 +264,15 @@ class KodiPlayerBridge:
             # audio player and shows its visualization instead of a static
             # album-art video. "always" applies to every track, "auto" only to
             # detected static-art songs.
-            music_theme = theme if theme is not None else self.current_theme
-            low_bitrate_video = float(info.get("max_video_tbr") or 0) < 1500.0
+            # Auto = detected still-image songs only (metadata/title/bitrate
+            # heuristics in the resolver). The casting app (YT vs YT Music) is
+            # deliberately NOT a signal: real music videos are cast from the
+            # YT Music app constantly and must stay in video mode.
             audio_mode = (
                 info.get("audio_url")
                 and (
                     self.music_visualizer == "always"
-                    or (
-                        self.music_visualizer != "never"
-                        and (
-                            info.get("is_static_art")
-                            # YT Music cast + low-bitrate video = still-image song;
-                            # modern art videos ship as 1080p so bitrate/height
-                            # alone can no longer detect them.
-                            or (music_theme == "m" and low_bitrate_video)
-                        )
-                    )
+                    or (self.music_visualizer != "never" and info.get("is_static_art"))
                 )
             )
             if audio_mode:
@@ -314,26 +307,11 @@ class KodiPlayerBridge:
                 if self.max_resolution and self.max_resolution != "auto":
                     list_item.setProperty("inputstream.adaptive.chooser_resolution_max", self.max_resolution)
 
-            player = xbmc.Player()
-            player.play(playable_url, list_item)
-
-            # Audio mode: route to the music/visualisation window. Player.play()
-            # always plays through the video player fullscreen even for
-            # music-typed ListItems, so Kodi's visualizer never shows. The
-            # addon-compatible way is to activate the music player window
-            # once audio playback has started; it renders the visualizer.
-            if audio_mode and KODI_AVAILABLE and xbmc:
-                def _activate_viz() -> None:
-                    for _ in range(20):  # wait up to ~10s for playback start
-                        try:
-                            if self._kodi_player and self._kodi_player.isPlayingAudio():
-                                # 12005 = music player / visualisation window
-                                xbmc.executebuiltin("ActivateWindow(12005)")
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(0.5)
-                threading.Thread(target=_activate_viz, daemon=True, name="VizActivator").start()
+            if audio_mode:
+                self._play_music_queue(video_id, info, list_item)
+            else:
+                player = xbmc.Player()
+                player.play(playable_url, list_item)
         else:
             self.state = PlayerState.PLAYING
             for s in self.sessions:
@@ -342,6 +320,48 @@ class KodiPlayerBridge:
                     s.report_now_playing(self.current_video_id, 0, self.current_duration, self.state)
                 except Exception:
                     pass
+
+    def _play_music_queue(self, video_id: str, info: Dict[str, Any], list_item) -> None:
+        """Play through Kodi's music playlist so the YT Music queue is visible
+        in the music queue view and auto-advance is Kodi-native.
+
+        Items are plugin:// URLs; Kodi invokes the addon's plugin entry per
+        item, which resolves against the service's warm caches over localhost.
+        """
+        try:
+            import xbmc
+            playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+            position = max(0, self.current_index)
+            urls = [f"plugin://plugin.service.ytlounge-cast/?play={vid}"
+                    for vid in self.playlist] or [f"plugin://plugin.service.ytlounge-cast/?play={video_id}"]
+            playlist.clear()
+            time.sleep(0.1)  # Kodi needs a beat after clear
+            for vid, url in zip(self.playlist or [video_id], urls):
+                li = xbmcgui.ListItem(info.get("title", "") if vid == video_id else vid)
+                playlist.add(url, li)
+            xbmc.Player().play(playlist, list_item, False, position)
+            self._activate_visualizer()
+        except Exception:
+            logger.debug("music queue playback failed; direct play fallback", exc_info=True)
+            xbmc.Player().play(info.get("audio_url") or info.get("playable_url"), list_item)
+            self._activate_visualizer()
+
+    def _activate_visualizer(self) -> None:
+        """Route fullscreen video player to the music/visualisation window."""
+        if not (KODI_AVAILABLE and xbmc):
+            return
+
+        def _run() -> None:
+            for _ in range(20):  # wait up to ~10s for playback start
+                try:
+                    if self._kodi_player and self._kodi_player.isPlayingAudio():
+                        # 12005 = music player / visualisation window
+                        xbmc.executebuiltin("ActivateWindow(12005)")
+                        return
+                except Exception:
+                    pass
+                time.sleep(0.5)
+        threading.Thread(target=_run, daemon=True, name="VizActivator").start()
 
     def _is_paused(self) -> bool:
         # xbmc.Player.isPlaying() returns True WHILE PAUSED, so it cannot

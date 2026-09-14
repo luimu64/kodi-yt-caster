@@ -30,6 +30,9 @@ class _Handler(BaseHTTPRequestHandler):
             from . import preloader
             preloader.handle_request(self, name[len("preload/"):])
             return
+        if name.startswith("resolve/"):
+            _handle_resolve(self, name[len("resolve/"):])
+            return
         with _LOCK:
             body = _MANIFESTS.get(name)
         if body is None:
@@ -55,6 +58,40 @@ class ManifestServer:
 
     def url_for(self, name: str) -> str:
         return f"http://127.0.0.1:{self.port}/{name}"
+
+
+# Resolver hookup: set by service.py at boot so plugin invocations (separate
+# Kodi processes) can resolve video IDs against the service's warm caches
+# (yt-dlp resolve cache + preload segment cache) over localhost HTTP.
+_RESOLVER = None
+
+
+def set_resolver(resolver) -> None:
+    global _RESOLVER
+    _RESOLVER = resolver
+
+
+def _send_json(handler, code: int, obj) -> None:
+    import json
+    data = json.dumps(obj).encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def _handle_resolve(handler, video_id: str) -> None:
+    """GET /resolve/<video_id> -> stream info JSON from the service resolver."""
+    if not video_id or _RESOLVER is None:
+        handler.send_error(503 if _RESOLVER is None else 404, "No resolver")
+        return
+    try:
+        info = _RESOLVER.resolve(video_id)
+        _send_json(handler, 200, info)
+    except Exception as e:
+        _send_json(handler, 500, {"error": str(e)})
 
 
 def fetch_manifest(url: str) -> str:
@@ -87,3 +124,8 @@ def publish(name: str, body: str) -> str:
     with _LOCK:
         _MANIFESTS[name] = body
     return _SERVER.url_for(name)
+
+
+def server_port() -> Optional[int]:
+    """Port of the running manifest server (None if not started)."""
+    return _SERVER.port if _SERVER is not None else None
