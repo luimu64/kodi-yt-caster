@@ -300,6 +300,7 @@ def run_service() -> None:
                             player.current_duration,
                             int(player.state),
                             current_index=player.current_index,
+                            list_id=player.list_id,
                         )
                         if player.playlist or player.current_video_id:
                             s.report_now_playing_playlist(
@@ -309,6 +310,7 @@ def run_service() -> None:
                                 int(player.get_time()),
                                 player.current_duration,
                                 int(player.state),
+                                list_id=player.list_id,
                             )
                     except Exception:
                         logger.debug("nowPlaying announcement failed", exc_info=True)
@@ -339,6 +341,7 @@ def run_service() -> None:
                             player.current_duration,
                             player.state,
                             current_index=player.current_index,
+                            list_id=player.list_id,
                         )
                         if player.playlist or player.current_video_id:
                             s.report_now_playing_playlist(
@@ -348,6 +351,7 @@ def run_service() -> None:
                                 player.get_time(),
                                 player.current_duration,
                                 player.state,
+                                list_id=player.list_id,
                             )
                     except Exception:
                         pass
