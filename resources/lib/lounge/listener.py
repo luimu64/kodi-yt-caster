@@ -146,7 +146,7 @@ class LoungeListener(threading.Thread):
                             self._handle_command(name, data)
 
     def _handle_command(self, name: str, data: Any) -> None:
-        logger.debug("Received command: %s (data: %s)", name, data)
+        logger.info("Lounge command: %s (data: %s)", name, data)
         # Stamp the originating app on dict payloads: 'm' = YouTube Music
         # sender, 'cl' = YouTube. The player uses it for music-visualizer
         # auto mode (static-art detection is unreliable for 1080p art videos).

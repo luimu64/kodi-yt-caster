@@ -268,8 +268,13 @@ class KodiPlayerBridge:
             # heuristics in the resolver). The casting app (YT vs YT Music) is
             # deliberately NOT a signal: real music videos are cast from the
             # YT Music app constantly and must stay in video mode.
+            # Visualizer applies to MUSIC-APP content only: a cast from the
+            # YouTube app is video even if the setting is "always".
+            music_theme = theme if theme is not None else self.current_theme
+            is_music_cast = music_theme == "m"
             audio_mode = (
-                info.get("audio_url")
+                is_music_cast
+                and info.get("audio_url")
                 and (
                     self.music_visualizer == "always"
                     or (self.music_visualizer != "never" and info.get("is_static_art"))
