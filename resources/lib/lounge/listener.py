@@ -173,7 +173,7 @@ class LoungeListener(threading.Thread):
             elif name in ("play", "playVideo"):
                 if self.dispatcher.on_play:
                     self.dispatcher.on_play()
-            elif name == "pause":
+            elif name in ("pause", "pauseVideo"):
                 if self.dispatcher.on_pause:
                     self.dispatcher.on_pause()
             elif name == "stopVideo":

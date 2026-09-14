@@ -180,14 +180,13 @@ class LoungeSession:
                     self._conn = None
                 return
             tag, sc, data = item
-            # Coalesce: if a newer report with the same tag is already queued,
-            # skip this stale one (only the latest position/state matters).
+            # Coalesce: if newer reports with the same tag are already queued,
+            # take the latest one and drop the stale ones.
             # nowPlaying is EXEMPT: it carries the videoId, and dropping it
             # loses the "this song started" signal the phone needs after a
             # TV-side queue pick.
-            pending: list = []
-            newer = False
             if sc != "nowPlaying":
+                pending: list = []
                 while True:
                     try:
                         nxt = self._post_queue.get_nowait()
@@ -197,14 +196,12 @@ class LoungeSession:
                         pending.append(None)
                         break
                     if nxt[0] == tag:
-                        newer = True
-                        # drop older same-tag item(s) queued before this one
+                        item = nxt
+                        tag, sc, data = item
                     else:
                         pending.append(nxt)
                 for p in pending:
                     self._post_queue.put(p)
-            if newer:
-                continue
             try:
                 self._do_post(sc, data)
             except Exception:

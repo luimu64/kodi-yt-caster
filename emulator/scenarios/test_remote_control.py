@@ -19,7 +19,9 @@ def test_pause_while_playing():
         s.phone.pause()
         s.wait_until(lambda: not xbmc.getCondVisibility("Player.Paused") is False and xbmc.getCondVisibility("Player.Paused"), what="paused condition")
         r = s.lounge.wait_for_report("onStateChange", lambda r: r.get("state") == "2")
-        assert r, "PAUSED state must be reported"
+        assert r, "PAUSED state must be reported via onStateChange"
+        np = s.lounge.wait_for_report("nowPlaying", lambda r: r.get("state") == "2")
+        assert np, "PAUSED state must be reported via nowPlaying"
 
 
 def test_pause_while_paused_stays_paused():
@@ -43,6 +45,7 @@ def test_resume_after_pause():
         s.phone.play()
         s.wait_until(lambda: not xbmc.getCondVisibility("Player.Paused"), what="resumed")
         assert s.lounge.wait_for_report("onStateChange", lambda r: r.get("state") == "1")
+        assert s.lounge.wait_for_report("nowPlaying", lambda r: r.get("state") == "1")
 
 
 def test_seek():

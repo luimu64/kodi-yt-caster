@@ -434,6 +434,29 @@ def test_sync_current_from_kodi_refresh_dispatches_duration():
         pb.KODI_AVAILABLE = orig_kodi_avail
 
 
+def test_pause_and_resume_reporting():
+    session = LoungeSession("s1", "t1", "d1")
+    actions = []
+    session.post_action = lambda sc, data: actions.append((sc, data))
+
+    player = KodiPlayerBridge(session=session)
+    player.current_video_id = "v1"
+    player.current_duration = 120
+    player.state = PlayerState.PLAYING
+
+    actions.clear()
+    player.pause()
+    assert player.state == PlayerState.PAUSED
+    assert any(a[0] == "onStateChange" and a[1]["state"] == "2" for a in actions)
+    assert any(a[0] == "nowPlaying" and a[1]["state"] == "2" for a in actions)
+
+    actions.clear()
+    player.resume()
+    assert player.state == PlayerState.PLAYING
+    assert any(a[0] == "onStateChange" and a[1]["state"] == "1" for a in actions)
+    assert any(a[0] == "nowPlaying" and a[1]["state"] == "1" for a in actions)
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_frame_parsing_chunked()
@@ -453,4 +476,5 @@ if __name__ == "__main__":
     test_ofs_increment_thread_safe()
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
+    test_pause_and_resume_reporting()
     print("All unit tests passed successfully.")

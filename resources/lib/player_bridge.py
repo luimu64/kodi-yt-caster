@@ -623,46 +623,52 @@ class KodiPlayerBridge:
 
     def _is_paused(self) -> bool:
         # xbmc.Player.isPlaying() returns True WHILE PAUSED, so it cannot
-        # distinguish pause from play. Ask Kodi's GUI conditions instead.
+        # distinguish pause from play. Ask Kodi's GUI conditions and internal state.
+        if self.state == PlayerState.PAUSED:
+            return True
         if KODI_AVAILABLE and xbmc:
             try:
-                return xbmc.getCondVisibility("Player.Paused")
+                return bool(xbmc.getCondVisibility("Player.Paused"))
             except Exception:
                 pass
-        return self.state == PlayerState.PAUSED
+        return False
 
     def pause(self) -> None:
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             # pause() TOGGLES: guard so pause-while-paused does not resume.
             if not self._is_paused():
                 self._kodi_player.pause()
-        else:
-            self.state = PlayerState.PAUSED
-            for s in self.sessions:
-                try:
-                    s.report_state_change(self.state, self.get_time(), self.current_duration)
-                except Exception:
-                    pass
+        self.state = PlayerState.PAUSED
+        cur_time = self.get_time()
+        for s in self.sessions:
+            try:
+                s.report_state_change(self.state, cur_time, self.current_duration)
+                if self.current_video_id:
+                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, self.state)
+            except Exception:
+                pass
 
     def resume(self) -> None:
         if KODI_AVAILABLE and self._kodi_player:
             if self._is_paused():
                 # Kodi's pause() toggles pause/resume.
                 self._kodi_player.pause()
-                return
-            if self._kodi_player.isPlaying():
+            elif self._kodi_player.isPlaying():
                 # Actively playing: nothing to do.
                 return
-            if self.current_video_id:
+            elif self.current_video_id:
                 # Stopped/idle: restart the current item where we left off.
                 self.play_video_id(self.current_video_id, self.get_time())
-        else:
-            self.state = PlayerState.PLAYING
-            for s in self.sessions:
-                try:
-                    s.report_state_change(self.state, self.get_time(), self.current_duration)
-                except Exception:
-                    pass
+                return
+        self.state = PlayerState.PLAYING
+        cur_time = self.get_time()
+        for s in self.sessions:
+            try:
+                s.report_state_change(self.state, cur_time, self.current_duration)
+                if self.current_video_id:
+                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, self.state)
+            except Exception:
+                pass
 
     def stop(self) -> None:
         with self._lock:
@@ -901,6 +907,8 @@ class KodiPlayerBridge:
         for s in self.sessions:
             try:
                 s.report_state_change(PlayerState.PAUSED, cur_time, self.current_duration)
+                if self.current_video_id:
+                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PAUSED)
             except Exception:
                 pass
 
@@ -910,6 +918,8 @@ class KodiPlayerBridge:
         for s in self.sessions:
             try:
                 s.report_state_change(PlayerState.PLAYING, cur_time, self.current_duration)
+                if self.current_video_id:
+                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PLAYING)
             except Exception:
                 pass
 
