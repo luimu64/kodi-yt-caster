@@ -132,10 +132,21 @@ class KodiPlayerBridge:
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
                 cur_duration = self.current_duration
+                cur_index = self.current_index
+                cur_playlist = list(self.playlist or ([self.current_video_id] if self.current_video_id else []))
                 for s in self.sessions:
                     try:
                         s.report_now_playing(
                             video_id=self.current_video_id,
+                            current_time=int(cur_time),
+                            duration=cur_duration,
+                            state=self.state,
+                            current_index=cur_index,
+                        )
+                        s.report_now_playing_playlist(
+                            video_ids=cur_playlist,
+                            current_video_id=self.current_video_id,
+                            current_index=cur_index,
                             current_time=int(cur_time),
                             duration=cur_duration,
                             state=self.state,
@@ -386,7 +397,22 @@ class KodiPlayerBridge:
             for s in self.sessions:
                 try:
                     s.report_state_change(self.state, 0, self.current_duration)
-                    s.report_now_playing(self.current_video_id, 0, self.current_duration, self.state)
+                    s.report_now_playing(
+                        self.current_video_id,
+                        0,
+                        self.current_duration,
+                        self.state,
+                        current_index=self.current_index,
+                    )
+                    if self.current_video_id:
+                        s.report_now_playing_playlist(
+                            self.playlist or [self.current_video_id],
+                            self.current_video_id,
+                            self.current_index,
+                            0,
+                            self.current_duration,
+                            self.state,
+                        )
                 except Exception:
                     pass
 
@@ -772,7 +798,21 @@ class KodiPlayerBridge:
             for s in self.sessions:
                 try:
                     s.report_state_change(PlayerState.PLAYING, cur_time, self.current_duration)
-                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PLAYING)
+                    s.report_now_playing(
+                        self.current_video_id,
+                        cur_time,
+                        self.current_duration,
+                        PlayerState.PLAYING,
+                        current_index=self.current_index,
+                    )
+                    s.report_now_playing_playlist(
+                        self.playlist or [self.current_video_id],
+                        self.current_video_id,
+                        self.current_index,
+                        cur_time,
+                        self.current_duration,
+                        PlayerState.PLAYING,
+                    )
                 except Exception:
                     pass
 
@@ -814,6 +854,9 @@ class KodiPlayerBridge:
             except Exception:
                 info = {}
             try:
+                cur_vid = None
+                cur_duration = 0
+                cur_state = PlayerState.PLAYING
                 with self._lock:
                     if self.current_video_id == vid:
                         duration = int(info.get("duration", 0) or 0)
@@ -824,13 +867,25 @@ class KodiPlayerBridge:
                         cur_duration = self.current_duration
                         cur_vid = self.current_video_id
                         cur_state = self.state
-                    else:
-                        cur_vid = None
                 if cur_vid:
                     cur_time = self.get_time()
                     for s in self.sessions:
                         try:
-                            s.report_now_playing(cur_vid, cur_time, cur_duration, cur_state)
+                            s.report_now_playing(
+                                cur_vid,
+                                cur_time,
+                                cur_duration,
+                                cur_state,
+                                current_index=self.current_index,
+                            )
+                            s.report_now_playing_playlist(
+                                self.playlist or [cur_vid],
+                                cur_vid,
+                                self.current_index,
+                                cur_time,
+                                cur_duration,
+                                cur_state,
+                            )
                             s.report_state_change(cur_state, cur_time, cur_duration)
                         except Exception:
                             pass

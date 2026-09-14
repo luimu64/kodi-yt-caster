@@ -305,9 +305,27 @@ def test_duration_reporting_and_fallback():
     assert actions[-1] == ("nowPlaying", {
         "videoId": "v1", "currentTime": "0", "duration": "0", "state": "1", "cpn": "kodi"
     })
+    session.report_now_playing("v1", 10, 120, 1, current_index=2, list_id="PL123")
+    assert actions[-1] == ("nowPlaying", {
+        "videoId": "v1", "currentTime": "10", "duration": "120", "state": "1", "cpn": "kodi",
+        "seekableStartTime": "0", "seekableEndTime": "120", "loadedTime": "120",
+        "currentIndex": "2", "listId": "PL123"
+    })
+    session.report_now_playing_playlist(["v1", "v2"], "v1", 0, 10, 120, 1)
+    assert actions[-1] == ("nowPlayingPlaylist", {
+        "videoIds": "v1,v2", "videoId": "v1", "currentIndex": "0",
+        "currentTime": "10", "duration": "120", "state": "1",
+        "seekableStartTime": "0", "seekableEndTime": "120"
+    })
     session.report_state_change(1, 15.6, 120.4)
     assert actions[-1] == ("onStateChange", {
-        "state": "1", "currentTime": "15", "duration": "120", "cpn": "kodi"
+        "state": "1",
+        "currentTime": "15",
+        "duration": "120",
+        "cpn": "kodi",
+        "seekableStartTime": "0",
+        "seekableEndTime": "120",
+        "loadedTime": "120",
     })
 
     # Test fallback to getTotalTime when current_duration <= 0 and media is active
