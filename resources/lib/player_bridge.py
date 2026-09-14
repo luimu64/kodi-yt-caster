@@ -545,8 +545,11 @@ class KodiPlayerBridge:
                     pass
 
     def get_time(self) -> int:
-        if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
+        if KODI_AVAILABLE and self._kodi_player:
             try:
+                # isPlaying() is True while paused too, so getTime() works in
+                # both states. Gating on it returned 0 for paused audio and
+                # froze the phone's position display.
                 return int(self._kodi_player.getTime())
             except Exception:
                 return 0
