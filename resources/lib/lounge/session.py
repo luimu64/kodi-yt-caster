@@ -325,6 +325,10 @@ class LoungeSession:
         if list_id:
             payload["listId"] = str(list_id)
 
+        logger.info(
+            "REPORT nowPlaying vid=%s idx=%s t=%s dur=%s state=%s listId=%s",
+            video_id, payload.get("currentIndex"), cur, dur, state, payload.get("listId") or "-",
+        )
         self.post_action("nowPlaying", payload)
 
     def report_now_playing_playlist(
