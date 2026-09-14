@@ -415,9 +415,9 @@ class KodiPlayerBridge:
     def _patch_playlist_label(self, snapshot: List[str], video_id: str, title: str) -> None:
         """Update one live playlist entry's label after its title arrives.
 
-        Only upcoming items (after the playing position) are touched; the
-        playing item and already-played items are left alone. Bails if the
-        queue was replaced since (size/order mismatch).
+        Only the currently playing item is left alone (remove+add on it
+        could disrupt playback); already-played earlier items are safe to
+        patch. Bails if the queue was replaced since (size/order mismatch).
         """
         if not KODI_AVAILABLE:
             return
@@ -431,7 +431,7 @@ class KodiPlayerBridge:
                 idx = snapshot.index(video_id)
             except ValueError:
                 return
-            if idx <= playlist.getposition():
+            if idx == playlist.getposition():
                 return
             url = f"plugin://plugin.service.ytlounge-cast/?play={video_id}"
             li = xbmcgui.ListItem(title)
