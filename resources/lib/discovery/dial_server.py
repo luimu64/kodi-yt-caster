@@ -58,9 +58,15 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
 
             logger.info("Received DIAL pairing code from %s", self.client_address[0])
 
+            # The phone sends its theme alongside the code ('cl' = YouTube,
+            # 'm' = YouTube Music). Register ONLY that theme's screen: a
+            # pairing code is single-use server-side, so registering both
+            # made the second (music) register silently fail and YT Music
+            # retried forever.
+            theme = params.get("theme", [""])[0]
             if self.server.on_pairing_code:
                 try:
-                    self.server.on_pairing_code(pairing_code)
+                    self.server.on_pairing_code(pairing_code, theme)
                 except Exception as e:
                     logger.error("Error processing DIAL pairing code: %s", e)
 
@@ -140,7 +146,7 @@ class DIALServer(http.server.ThreadingHTTPServer):
         device_uuid: str,
         friendly_name: str,
         screen_id: str,
-        on_pairing_code: Optional[Callable[[str], None]] = None,
+        on_pairing_code: Optional[Callable[[str, str], None]] = None,
     ):
         super().__init__(("0.0.0.0", port), DIALRequestHandler)
         self.port = port
@@ -158,7 +164,7 @@ class DIALService(threading.Thread):
         device_uuid: str,
         friendly_name: str,
         screen_id: str,
-        on_pairing_code: Optional[Callable[[str], None]] = None,
+        on_pairing_code: Optional[Callable[[str, str], None]] = None,
     ):
         super().__init__(name="DIALService", daemon=True)
         self.port = port

@@ -194,7 +194,7 @@ def test_dial_and_ssdp_discovery():
         device_uuid="test-uuid",
         friendly_name="Kodi Test Discovery",
         screen_id="screen_123",
-        on_pairing_code=lambda code: paired_codes.append(code),
+        on_pairing_code=lambda code, theme="": paired_codes.append((code, theme)),
     )
     port = server.server_address[1]
 
@@ -217,13 +217,13 @@ def test_dial_and_ssdp_discovery():
             assert "<screenId>screen_123</screenId>" in app_data
 
         # 3. Test /apps/YouTube POST pairing code
-        post_data = urllib.parse.urlencode({"pairingCode": "123-456-789-000"}).encode("utf-8")
+        post_data = urllib.parse.urlencode({"pairingCode": "123-456-789-000", "theme": "cl"}).encode("utf-8")
         req = urllib.request.Request(app_url, data=post_data)
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 201
             loc = resp.headers.get("Location")
             assert "/apps/YouTube/run" in loc
-            assert paired_codes == ["123-456-789-000"]
+            assert paired_codes == [("123-456-789-000", "cl")]
     finally:
         server.shutdown()
         server.server_close()
