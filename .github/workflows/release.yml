@@ -25,6 +25,12 @@ jobs:
       - name: Build addon zip (noarch, yt-dlp fetched on-device)
         run: ./build.sh
 
+      - name: Unit tests
+        run: python3 test_addon.py
+
+      - name: Emulator scenarios
+        run: python3 emulator/run_all.py
+
       - name: Build repository index
         run: python3 build_repo_index.py
 
