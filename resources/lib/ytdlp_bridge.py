@@ -213,7 +213,7 @@ class YtDlpBridge:
         self.cookies_path = cookies_path
         self._cache: Dict[str, tuple] = {}  # video_id -> (monotonic_ts, info)
 
-    def resolve(self, video_id: str) -> Dict[str, Any]:
+    def resolve(self, video_id: str, prefetch: bool = False) -> Dict[str, Any]:
         """Resolve YouTube video ID to playable stream details."""
         t0 = time.monotonic()
         if not self.binary_path and not inproc.available():
@@ -234,13 +234,16 @@ class YtDlpBridge:
         if inproc.try_init(self.binary_path):
             t1 = time.monotonic()
             try:
-                data = inproc.resolve(video_id, cookies_path=self.cookies_path)
+                data = inproc.resolve(video_id, cookies_path=self.cookies_path, prefetch=prefetch)
                 logger.info("TIMING %s: inproc extract %.2fs", video_id, time.monotonic() - t1)
             except Exception as e:
                 logger.warning("inproc resolve failed (%s); trying subprocess", e)
                 data = None
             if data is not None:
                 info = self._extract_stream_info(data)
+                self._cache.pop(video_id, None)
+                while len(self._cache) >= 50:
+                    self._cache.pop(next(iter(self._cache)))
                 self._cache[video_id] = (time.monotonic(), info)
                 logger.info("TIMING %s: total %.2fs (inproc)", video_id, time.monotonic() - t0)
                 return info
@@ -275,6 +278,9 @@ class YtDlpBridge:
         t3 = time.monotonic()
         info = self._extract_stream_info(data)
         logger.info("TIMING %s: json parse %.0fms, extract %.0fms, total %.2fs", video_id, (t3 - t2) * 1000, (time.monotonic() - t3) * 1000, time.monotonic() - t0)
+        self._cache.pop(video_id, None)
+        while len(self._cache) >= 50:
+            self._cache.pop(next(iter(self._cache)))
         self._cache[video_id] = (time.monotonic(), info)
         return info
 

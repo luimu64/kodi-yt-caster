@@ -445,14 +445,14 @@ def run_service() -> None:
             while not monitor.abortRequested():
                 if monitor.waitForAbort(2):
                     break
-                if store.load().get("reload_requested") and ready.is_set() and not components.get("player"):
+                cfg = store.load()
+                if cfg.get("reload_requested") and ready.is_set() and not components.get("player"):
                     # reload requested before bootstrap completed; let bootstrap finish first
                     continue
-                if store.load().get("reload_requested"):
+                if cfg.get("reload_requested"):
                     state["reload_requested"] = True
-                    data = store.load()
-                    data["reload_requested"] = False
-                    store.save(data)
+                    cfg["reload_requested"] = False
+                    store.save(cfg)
                     if not ready.is_set():
                         # stop the still-running bootstrap and wait for it
                         stopping.set()
@@ -461,11 +461,11 @@ def run_service() -> None:
         else:
             while True:
                 time.sleep(2)
-                if store.load().get("reload_requested"):
+                cfg = store.load()
+                if cfg.get("reload_requested"):
                     state["reload_requested"] = True
-                    data = store.load()
-                    data["reload_requested"] = False
-                    store.save(data)
+                    cfg["reload_requested"] = False
+                    store.save(cfg)
                     if not ready.is_set():
                         stopping.set()
                         ready.wait(timeout=30)

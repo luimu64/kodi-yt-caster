@@ -127,6 +127,9 @@ def publish(name: str, body: str) -> str:
         _SERVER.start()
         logger.info("Manifest server listening on port %s", _SERVER.port)
     with _LOCK:
+        _MANIFESTS.pop(name, None)
+        while len(_MANIFESTS) >= 50:
+            _MANIFESTS.pop(next(iter(_MANIFESTS)))
         _MANIFESTS[name] = body
     return _SERVER.url_for(name)
 

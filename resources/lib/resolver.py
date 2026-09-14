@@ -15,7 +15,7 @@ class VideoResolver:
         self.bridge = bridge or YtDlpBridge()
         self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
-    def resolve(self, video_id: str) -> Dict[str, Any]:
+    def resolve(self, video_id: str, prefetch: bool = False) -> Dict[str, Any]:
         """Resolve video_id, serving from cache if valid."""
         now = time.time()
         if video_id in self._cache:
@@ -24,9 +24,18 @@ class VideoResolver:
                 logger.debug("Serving %s from resolver cache", video_id)
                 return cached_data
 
-        info = self.bridge.resolve(video_id)
+        try:
+            info = self.bridge.resolve(video_id, prefetch=prefetch)
+        except TypeError:
+            info = self.bridge.resolve(video_id)
         # Cache TTL: duration or 3600 seconds (minimum 300 seconds)
         ttl = max(300, min(info.get("duration", 3600), 3600))
+        expired = [k for k, (exp, _) in self._cache.items() if now >= exp]
+        for k in expired:
+            self._cache.pop(k, None)
+        self._cache.pop(video_id, None)
+        while len(self._cache) >= 50:
+            self._cache.pop(next(iter(self._cache)))
         self._cache[video_id] = (now + ttl, info)
         return info
 

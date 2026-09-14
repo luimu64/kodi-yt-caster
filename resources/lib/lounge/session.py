@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import queue
 import random
 import re
+import socket
 import string
 import threading
 import urllib.error
@@ -106,6 +108,9 @@ class LoungeSession:
         # so a slow network cannot build an unbounded backlog of stale states.
         self._post_queue: "queue.Queue[Optional[Tuple[str, str, Dict[str, Any]]]]" = queue.Queue()
         self._ofs_lock = threading.Lock()
+        self._conn: Optional[http.client.HTTPConnection] = None
+        self._conn_host: Optional[str] = None
+        self._conn_scheme: Optional[str] = None
         self._post_worker = threading.Thread(
             target=self._post_worker_loop, daemon=True, name=f"LoungePoster-{theme}"
         )
@@ -167,6 +172,12 @@ class LoungeSession:
         while True:
             item = self._post_queue.get()
             if item is None:
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
                 return
             tag, sc, data = item
             # Coalesce: if a newer report with the same tag is already queued,
@@ -231,16 +242,60 @@ class LoungeSession:
         if self.gsessionid:
             params["gsessionid"] = self.gsessionid
 
-        url = f"{BASE_URL}/bc/bind?{urllib.parse.urlencode(params)}"
+        parsed = urllib.parse.urlparse(BASE_URL)
+        host = parsed.netloc
+        scheme = parsed.scheme or "https"
+        path = f"{parsed.path}/bc/bind?{urllib.parse.urlencode(params)}"
         encoded = urllib.parse.urlencode(post_data).encode("utf-8")
-        req = urllib.request.Request(url, data=encoded, headers=DEFAULT_HEADERS)
+        headers = dict(DEFAULT_HEADERS)
+        headers["Content-Type"] = "application/x-www-form-urlencoded;charset=utf-8"
+        headers["Content-Length"] = str(len(encoded))
+
+        def _get_conn() -> http.client.HTTPConnection:
+            if self._conn is not None and self._conn_host == host and self._conn_scheme == scheme:
+                return self._conn
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            if scheme == "https":
+                self._conn = http.client.HTTPSConnection(host, timeout=10.0)
+            else:
+                self._conn = http.client.HTTPConnection(host, timeout=10.0)
+            self._conn_host = host
+            self._conn_scheme = scheme
+            return self._conn
+
         try:
-            with urllib.request.urlopen(req, timeout=10.0) as resp:
+            conn = _get_conn()
+            try:
+                conn.request("POST", path, body=encoded, headers=headers)
+                resp = conn.getresponse()
+                resp.read()
+            except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
+                    ConnectionResetError, BrokenPipeError, socket.error):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                conn = _get_conn()
+                conn.request("POST", path, body=encoded, headers=headers)
+                resp = conn.getresponse()
                 resp.read()
         except Exception as e:
             # INFO-level: post failures break the phone-side session
             # (remote never sees our state) and must be visible in kodi.log.
             logger.info("Failed to post action %s: %s (ofs=%s)", sc, e, ofs)
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
     def report_now_playing(self, video_id: str, current_time: int, duration: int, state: int) -> None:
         """Report now playing status to Lounge (state: 1=playing, 2=paused, 0=stopped)."""

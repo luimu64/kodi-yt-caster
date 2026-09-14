@@ -55,7 +55,7 @@ class KodiPlayerBridge:
         # YouTube; None until the first cast.
         self.current_theme: Optional[str] = None
         self.state = PlayerState.STOPPED
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._play_gen = 0  # monotonic play-request epoch; supersedes stale requests
         self._requested_id: Optional[str] = None  # video the latest play request targets (set at ENQUEUE time)
         self._prefetch_id: Optional[str] = None
@@ -160,6 +160,8 @@ class KodiPlayerBridge:
                 # (and arming the stale-gen guard to eat a later STOPPED report).
                 # Cleared on real Ended/Stopped so a deliberate recast works.
                 if target_id == self._requested_id:
+                    if current_time > 0:
+                        self.seek_to(current_time)
                     return
                 self._requested_id = target_id
                 self.pending_seek = current_time if current_time > 0 else None
@@ -192,10 +194,13 @@ class KodiPlayerBridge:
         else:
             self.current_index = 0
 
-    def _notify(self, message: str, title: str = "YouTube Cast", error: bool = False) -> None:
+    def _notify(self, title: str = "YouTube Cast", message: str = "", error: bool = False) -> None:
         """Show an on-screen notification; safe to call from any thread."""
         if not (KODI_AVAILABLE and xbmcgui):
             return
+        if not message:
+            message = title
+            title = "YouTube Cast"
         try:
             icon = xbmcgui.NOTIFICATION_ERROR if error else xbmcgui.NOTIFICATION_INFO
             xbmcgui.Dialog().notification(title, message, icon, 5000)
@@ -211,6 +216,7 @@ class KodiPlayerBridge:
             if idx >= len(self.playlist):
                 return
             next_id = self.playlist[idx]
+            gen = self._play_gen
         if next_id == self._prefetch_id:
             return
         self._prefetch_id = next_id
@@ -218,7 +224,11 @@ class KodiPlayerBridge:
         def _run() -> None:
             try:
                 logger.info("Prefetching next video: %s", next_id)
-                info = self.resolver.resolve(next_id)
+                if self._play_gen != gen:
+                    return
+                info = self.resolver.resolve(next_id, prefetch=True)
+                if self._play_gen != gen:
+                    return
                 # Preload the first ~60s of media itself: track change then
                 # starts from warm disk instead of a cold CDN round-trip.
                 preloader.preload(next_id, info)
@@ -234,13 +244,15 @@ class KodiPlayerBridge:
             info = self.resolver.resolve(video_id)
         except Exception as e:
             logger.error("Failed to resolve video %s: %s", video_id, e)
+            should_notify = False
             with self._lock:
                 if gen == self._play_gen:
                     self._requested_id = None
-                    if KODI_AVAILABLE and xbmcgui:
-                        xbmcgui.Dialog().notification("YouTube Cast", f"Failed to resolve video: {e}", xbmcgui.NOTIFICATION_ERROR)
+                    should_notify = True
                 else:
                     logger.info("Resolve failure for superseded request %s, not notifying", video_id)
+            if should_notify and KODI_AVAILABLE and xbmcgui:
+                xbmcgui.Dialog().notification("YouTube Cast", f"Failed to resolve video: {e}", xbmcgui.NOTIFICATION_ERROR)
             return
 
         playable_url = info.get("playable_url")
@@ -391,6 +403,13 @@ class KodiPlayerBridge:
     _queue_titles: Dict[str, str] = {}
     _queue_titles_inflight: set = set()
 
+    @classmethod
+    def _store_queue_title(cls, vid: str, title: str) -> None:
+        cls._queue_titles.pop(vid, None)
+        while len(cls._queue_titles) >= 50:
+            cls._queue_titles.pop(next(iter(cls._queue_titles)))
+        cls._queue_titles[vid] = title
+
     @staticmethod
     def _fetch_title_sync(video_id: str) -> Optional[str]:
         """Single oEmbed title lookup (~100-300ms). Raw title, no processing."""
@@ -453,6 +472,8 @@ class KodiPlayerBridge:
         thread per track change, each holding the interpreter for seconds.
         """
         with self._lock:
+            if len(self._queue_titles_inflight) >= 50:
+                self._queue_titles_inflight.clear()
             todo = [v for v in video_ids if v not in self._queue_titles and v not in self._queue_titles_inflight]
             if not todo:
                 return
@@ -465,7 +486,8 @@ class KodiPlayerBridge:
             # from cast-command to first sound. Parallel workers (above)
             # make the typical case ~300ms; the deadline is the worst case.
             titles = self._fetch_titles_parallel(window, deadline=time.monotonic() + 2.5)
-            self._queue_titles.update(titles)
+            for vid, title in titles.items():
+                self._store_queue_title(vid, title)
             rest = [v for v in todo if v not in self._queue_titles]
             if not rest:
                 return
@@ -478,7 +500,7 @@ class KodiPlayerBridge:
                         title = self._fetch_title_sync(vid)
                         if not title:
                             continue
-                        self._queue_titles[vid] = title
+                        self._store_queue_title(vid, title)
                         self._patch_playlist_label(snapshot, vid, title)
                 finally:
                     with self._lock:
@@ -586,6 +608,10 @@ class KodiPlayerBridge:
                     pass
 
     def stop(self) -> None:
+        with self._lock:
+            self._play_gen += 1
+            self._active_gen = self._play_gen
+            self._requested_id = None
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             self._kodi_player.stop()
         else:
@@ -602,11 +628,11 @@ class KodiPlayerBridge:
         else:
             with self._lock:
                 self.pending_seek = seconds
-            for s in self.sessions:
-                try:
-                    s.report_state_change(self.state, int(seconds), self.current_duration)
-                except Exception:
-                    pass
+        for s in self.sessions:
+            try:
+                s.report_state_change(self.state, int(seconds), self.current_duration)
+            except Exception:
+                pass
 
     def get_time(self) -> int:
         if KODI_AVAILABLE and self._kodi_player:
@@ -682,14 +708,19 @@ class KodiPlayerBridge:
                 # stall every other player event behind it.
                 seek_target = pending
                 kodi_player = self._kodi_player
+                gen = self._play_gen
 
                 def _apply_seek() -> None:
                     for _attempt in range(5):
+                        if self._play_gen != gen:
+                            return
                         try:
                             kodi_player.seekTime(seek_target)
                         except Exception:
                             pass
                         time.sleep(0.4)
+                        if self._play_gen != gen:
+                            return
                         try:
                             if kodi_player.isPlaying() and abs(kodi_player.getTime() - seek_target) < 2.0:
                                 break

@@ -26,6 +26,7 @@ logger = logging.getLogger("ytlounge.inproc")
 
 _IMPORT_LOCK = threading.Lock()
 _INSTANCE_LOCK = threading.Lock()
+_PREFETCH_LOCK = threading.Lock()
 _STATE: Dict[str, Any] = {"tried": False, "ok": False, "ydl": None, "path": None}
 
 
@@ -73,6 +74,10 @@ def try_init(binary_path: Optional[str] = None) -> bool:
             }
             ydl = yt_dlp.YoutubeDL(opts)
             _STATE["ydl"] = ydl
+            try:
+                _STATE["ydl_bg"] = yt_dlp.YoutubeDL(dict(opts))
+            except Exception:
+                _STATE["ydl_bg"] = ydl
             _STATE["path"] = path
             _STATE["ok"] = True
             logger.info("inproc yt-dlp ready (version %s, from %s)",
@@ -87,15 +92,17 @@ def available() -> bool:
     return bool(_STATE["ok"]) or try_init(_STATE.get("path"))
 
 
-def resolve(video_id: str, cookies_path: Optional[str] = None) -> Dict[str, Any]:
+def resolve(video_id: str, cookies_path: Optional[str] = None, prefetch: bool = False) -> Dict[str, Any]:
     """extract_info via the persistent instance. Raises on failure."""
     if not available():
         raise RuntimeError("in-process yt-dlp not initialized")
-    ydl = _STATE["ydl"]
+    lock = _PREFETCH_LOCK if prefetch else _INSTANCE_LOCK
+    ydl_key = "ydl_bg" if (prefetch and "ydl_bg" in _STATE) else "ydl"
+    ydl = _STATE.get(ydl_key) or _STATE["ydl"]
     url = f"https://www.youtube.com/watch?v={video_id}"
     # Cookies: YoutubeDL accepts a cookiefile at construction; per-call swap
     # would rebuild the jar, so only re-instantiate when the path changed.
-    with _INSTANCE_LOCK:
+    with lock:
         if cookies_path and getattr(ydl, "_ytcfg_cookiefile", None) != cookies_path:
             import yt_dlp  # type: ignore
             opts = {
@@ -105,7 +112,7 @@ def resolve(video_id: str, cookies_path: Optional[str] = None) -> Dict[str, Any]
             }
             ydl = yt_dlp.YoutubeDL(opts)
             ydl._ytcfg_cookiefile = cookies_path
-            _STATE["ydl"] = ydl
+            _STATE[ydl_key] = ydl
         info = ydl.extract_info(url, download=False)
     if not info:
         raise RuntimeError(f"yt-dlp returned no info for {video_id}")
