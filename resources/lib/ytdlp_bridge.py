@@ -241,7 +241,13 @@ class YtDlpBridge:
 
         logger.info("TIMING %s: launching yt-dlp subprocess", video_id)
         t1 = time.monotonic()
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        # Explicit UTF-8 stdio: LibreELEC's default locale is not UTF-8 and
+        # text=True would decode with ASCII, breaking/mojibaking every
+        # non-ASCII (CJK, etc.) title and corrupting the JSON parse.
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=45,
+            encoding="utf-8", errors="replace",
+        )
         t2 = time.monotonic()
         logger.info("TIMING %s: yt-dlp subprocess took %.2fs (rc=%s, %dB stdout)", video_id, t2 - t1, proc.returncode, len(proc.stdout or ""))
         if proc.returncode != 0:

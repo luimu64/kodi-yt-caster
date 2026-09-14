@@ -337,19 +337,53 @@ class KodiPlayerBridge:
             import xbmc
             playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
             position = max(0, self.current_index)
-            urls = [f"plugin://plugin.service.ytlounge-cast/?play={vid}"
-                    for vid in self.playlist] or [f"plugin://plugin.service.ytlounge-cast/?play={video_id}"]
             playlist.clear()
             time.sleep(0.1)  # Kodi needs a beat after clear
-            for vid, url in zip(self.playlist or [video_id], urls):
-                li = xbmcgui.ListItem(info.get("title", "") if vid == video_id else vid)
-                playlist.add(url, li)
+
+            def _item(vid):
+                # Current item carries resolved metadata; upcoming items get
+                # a thumbnail (URL-derivable, no resolve) and their title via
+                # a cheap keyless oEmbed lookup, cached across track changes.
+                if vid == video_id:
+                    return list_item
+                li = xbmcgui.ListItem(self._queue_titles.get(vid) or vid)
+                li.setArt({"thumb": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+                           "icon": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"})
+                return li
+
+            for vid in self.playlist or [video_id]:
+                playlist.add(f"plugin://plugin.service.ytlounge-cast/?play={vid}", _item(vid))
+            self._fetch_queue_titles(list(self.playlist or [video_id]))
             xbmc.Player().play(playlist, list_item, False, position)
             self._activate_visualizer()
         except Exception:
             logger.debug("music queue playback failed; direct play fallback", exc_info=True)
             xbmc.Player().play(info.get("audio_url") or info.get("playable_url"), list_item)
             self._activate_visualizer()
+
+    _queue_titles: Dict[str, str] = {}
+
+    def _fetch_queue_titles(self, video_ids: List[str]) -> None:
+        """Background-fill titles for queue items via YouTube oEmbed (keyless,
+        handles CJK). Cached; runs while the current track plays."""
+        todo = [v for v in video_ids if v not in self._queue_titles]
+        if not todo:
+            return
+
+        def _run() -> None:
+            import urllib.request
+            for vid in todo:
+                try:
+                    url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json"
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=10.0) as resp:
+                        import json
+                        title = json.loads(resp.read().decode("utf-8")).get("title")
+                    if title:
+                        self._queue_titles[vid] = title
+                except Exception:
+                    pass
+        threading.Thread(target=_run, name="QueueTitles", daemon=True).start()
 
     def _activate_visualizer(self) -> None:
         """Route fullscreen video player to the music/visualisation window."""
@@ -360,8 +394,10 @@ class KodiPlayerBridge:
             for _ in range(20):  # wait up to ~10s for playback start
                 try:
                     if self._kodi_player and self._kodi_player.isPlayingAudio():
-                        # 12005 = music player / visualisation window
-                        xbmc.executebuiltin("ActivateWindow(12005)")
+                        # 12006 = music visualisation window (12005 is the
+                        # fullscreen VIDEO window — that showed a frozen
+                        # frame over the GUI).
+                        xbmc.executebuiltin("ActivateWindow(12006)")
                         return
                 except Exception:
                     pass
