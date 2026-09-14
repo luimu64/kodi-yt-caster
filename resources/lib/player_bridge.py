@@ -344,9 +344,11 @@ class KodiPlayerBridge:
                 # Current item carries resolved metadata; upcoming items get
                 # a thumbnail (URL-derivable, no resolve) and their title via
                 # a cheap keyless oEmbed lookup, cached across track changes.
+                # Raw title straight through — never normalize/strip/re-encode
+                # (CJK renders blank if anything touches the string).
                 if vid == video_id:
                     return list_item
-                li = xbmcgui.ListItem(self._queue_titles.get(vid) or vid)
+                li = xbmcgui.ListItem(label=self._queue_titles.get(vid) or vid)
                 li.setArt({"thumb": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
                            "icon": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"})
                 return li
@@ -370,14 +372,15 @@ class KodiPlayerBridge:
 
     @staticmethod
     def _fetch_title_sync(video_id: str) -> Optional[str]:
-        """Single oEmbed title lookup (~100-300ms)."""
+        """Single oEmbed title lookup (~100-300ms). Raw title, no processing."""
         try:
             import urllib.request
             import json
             url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=3.0) as resp:
-                return json.loads(resp.read().decode("utf-8")).get("title")
+                title = json.loads(resp.read().decode("utf-8")).get("title")
+                return title or None
         except Exception:
             return None
 
@@ -451,7 +454,10 @@ class KodiPlayerBridge:
             if idx == playlist.getposition():
                 return
             url = f"plugin://plugin.service.ytlounge-cast/?play={video_id}"
-            li = xbmcgui.ListItem(title)
+            # NOTE: pass the raw title straight through — no normalization,
+            # stripping, or re-encoding. CJK renders blank if anything in the
+            # chain touches the string, so hands off.
+            li = xbmcgui.ListItem(label=title)
             li.setArt({"thumb": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
                        "icon": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"})
             playlist.remove(url)
