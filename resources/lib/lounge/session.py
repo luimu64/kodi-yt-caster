@@ -234,7 +234,9 @@ class LoungeSession:
             with urllib.request.urlopen(req, timeout=10.0) as resp:
                 resp.read()
         except Exception as e:
-            logger.debug("Failed to post action %s: %s", sc, e)
+            # INFO-level: post failures break the phone-side session
+            # (remote never sees our state) and must be visible in kodi.log.
+            logger.info("Failed to post action %s: %s (ofs=%s)", sc, e, ofs)
 
     def report_now_playing(self, video_id: str, current_time: int, duration: int, state: int) -> None:
         """Report now playing status to Lounge (state: 1=playing, 2=paused, 0=stopped)."""

@@ -352,13 +352,14 @@ def run_service() -> None:
             nonlocal pairing_dialog
             log_kodi(f"Registering DIAL pairing code: {code} (theme={theme or 'cl'})", 1)
             try:
-                # Register ONLY the screen matching the sender's app: a pairing
-                # code is single-use, so registering both consumed it on the
-                # first (cl) and the YT Music (m) registration silently failed.
-                if theme == "m" and screen_id_m:
+                # Register both screens: pairing codes are NOT single-use
+                # (verified: same code registers twice with 200), and the
+                # music app sends theme=cl anyway, so routing by theme is
+                # unreliable. Both registrations let either app join either
+                # lounge.
+                register_pairing_code(screen_id, code, screen_name, device_id)
+                if screen_id_m:
                     register_pairing_code(screen_id_m, code, screen_name, device_id)
-                else:
-                    register_pairing_code(screen_id, code, screen_name, device_id)
                 if pairing_dialog:
                     pairing_dialog.dismiss()
                     pairing_dialog = None
