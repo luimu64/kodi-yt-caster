@@ -366,6 +366,7 @@ class KodiPlayerBridge:
             self._activate_visualizer()
 
     _queue_titles: Dict[str, str] = {}
+    _queue_titles_inflight: set = set()
 
     @staticmethod
     def _fetch_title_sync(video_id: str) -> Optional[str]:
@@ -388,29 +389,45 @@ class KodiPlayerBridge:
         ~2s max) BEFORE the playlist is built. The background thread covers
         the rest AND patches the live playlist entries in place, since Kodi
         never re-reads labels after add().
+
+        Guarded against pile-up: a 100+ item queue would otherwise spawn one
+        thread per track change, each holding the interpreter for seconds.
         """
-        todo = [v for v in video_ids if v not in self._queue_titles]
-        if not todo:
-            return
-        window = [v for v in video_ids[position:position + 12] if v in todo]
-        for vid in window:
-            title = self._fetch_title_sync(vid)
-            if title:
-                self._queue_titles[vid] = title
-        rest = [v for v in todo if v not in self._queue_titles]
-        if not rest:
-            return
-
-        snapshot = list(video_ids)
-
-        def _run() -> None:
-            for vid in rest:
+        with self._lock:
+            todo = [v for v in video_ids if v not in self._queue_titles and v not in self._queue_titles_inflight]
+            if not todo:
+                return
+            for v in todo:
+                self._queue_titles_inflight.add(v)
+        try:
+            window = [v for v in video_ids[position:position + 12] if v in todo]
+            for vid in window:
                 title = self._fetch_title_sync(vid)
-                if not title:
-                    continue
-                self._queue_titles[vid] = title
-                self._patch_playlist_label(snapshot, vid, title)
-        threading.Thread(target=_run, name="QueueTitles", daemon=True).start()
+                if title:
+                    self._queue_titles[vid] = title
+            rest = [v for v in todo if v not in self._queue_titles]
+            if not rest:
+                return
+
+            snapshot = list(video_ids)
+
+            def _run() -> None:
+                try:
+                    for vid in rest:
+                        title = self._fetch_title_sync(vid)
+                        if not title:
+                            continue
+                        self._queue_titles[vid] = title
+                        self._patch_playlist_label(snapshot, vid, title)
+                finally:
+                    with self._lock:
+                        for v in rest:
+                            self._queue_titles_inflight.discard(v)
+            threading.Thread(target=_run, name="QueueTitles", daemon=True).start()
+        except Exception:
+            with self._lock:
+                for v in todo:
+                    self._queue_titles_inflight.discard(v)
 
     def _patch_playlist_label(self, snapshot: List[str], video_id: str, title: str) -> None:
         """Update one live playlist entry's label after its title arrives.
