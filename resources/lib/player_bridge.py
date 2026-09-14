@@ -49,6 +49,13 @@ class KodiPlayerBridge:
         self.playlist: List[str] = []
         self.current_index: int = 0
         self.current_video_id: Optional[str] = None
+        # Lounge queue identity handed to us by the mobile client in the
+        # setPlaylist command. The phone keys its player model on this
+        # listId: a nowPlaying report whose videoId/currentIndex is not
+        # attached to a listId the client already knows is silently
+        # rejected, which is what made the app keep rendering the old
+        # track (0:00 + replay glyph) after a TV-side advance.
+        self.list_id: str = ""
         self._current_duration: int = 0
         self.pending_seek: Optional[float] = None
         # 'm' when the current item was cast from YouTube Music, 'cl' from
@@ -101,6 +108,9 @@ class KodiPlayerBridge:
         parent = self
 
         class SubclassPlayer(xbmc.Player):
+            def __init__(self):
+                super().__init__()
+
             def onPlayBackStarted(self):
                 parent._on_playback_started()
 
@@ -129,10 +139,20 @@ class KodiPlayerBridge:
     def _position_loop(self) -> None:
         while not self._monitor_stop.is_set():
             time.sleep(2.0)
+            if KODI_AVAILABLE and self._kodi_player and self.current_video_id:
+                try:
+                    if self._kodi_player.isPlaying():
+                        if self.state != PlayerState.PLAYING and not self._is_paused():
+                            self.state = PlayerState.PLAYING
+                            self._sync_current_from_kodi()
+                except Exception:
+                    pass
+
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
                 cur_duration = self.current_duration
                 cur_index = self.current_index
+                cur_list_id = self.list_id
                 cur_playlist = list(self.playlist or ([self.current_video_id] if self.current_video_id else []))
                 for s in self.sessions:
                     try:
@@ -142,6 +162,7 @@ class KodiPlayerBridge:
                             duration=cur_duration,
                             state=self.state,
                             current_index=cur_index,
+                            list_id=cur_list_id,
                         )
                         s.report_now_playing_playlist(
                             video_ids=cur_playlist,
@@ -150,6 +171,7 @@ class KodiPlayerBridge:
                             current_time=int(cur_time),
                             duration=cur_duration,
                             state=self.state,
+                            list_id=cur_list_id,
                         )
                         s.report_state_change(
                             state=self.state,
@@ -175,6 +197,11 @@ class KodiPlayerBridge:
             video_id = data.get("videoId")
             video_ids_str = data.get("videoIds", "")
             current_time = float(data.get("currentTime", 0.0) or 0.0)
+            list_id = str(data.get("listId") or "")
+            if list_id:
+                if self.list_id and self.list_id != list_id:
+                    logger.info("Lounge listId changed: %s -> %s", self.list_id, list_id)
+                self.list_id = list_id
 
             if video_ids_str:
                 self.playlist = [v for v in video_ids_str.split(",") if v]
@@ -389,8 +416,9 @@ class KodiPlayerBridge:
                 self._play_music_queue(video_id, info, list_item)
             else:
                 self._kodi_queue_mode = False
-                player = xbmc.Player()
-                player.play(playable_url, list_item)
+                player = self._kodi_player if self._kodi_player is not None else (xbmc.Player() if xbmc else None)
+                if player:
+                    player.play(playable_url, list_item)
         else:
             self._kodi_queue_mode = False
             self.state = PlayerState.PLAYING
@@ -403,6 +431,7 @@ class KodiPlayerBridge:
                         self.current_duration,
                         self.state,
                         current_index=self.current_index,
+                        list_id=self.list_id,
                     )
                     if self.current_video_id:
                         s.report_now_playing_playlist(
@@ -412,6 +441,7 @@ class KodiPlayerBridge:
                             0,
                             self.current_duration,
                             self.state,
+                            list_id=self.list_id,
                         )
                 except Exception:
                     pass
@@ -450,11 +480,15 @@ class KodiPlayerBridge:
             self._fetch_queue_titles(list(self.playlist or [video_id]), position)
             for vid in self.playlist or [video_id]:
                 playlist.add(f"plugin://plugin.service.ytlounge-cast/?play={vid}", _item(vid))
-            xbmc.Player().play(playlist, list_item, False, position)
+            kodi_player = self._kodi_player if self._kodi_player is not None else (xbmc.Player() if xbmc else None)
+            if kodi_player:
+                kodi_player.play(playlist, list_item, False, position)
             self._activate_visualizer()
         except Exception:
             logger.debug("music queue playback failed; direct play fallback", exc_info=True)
-            xbmc.Player().play(info.get("audio_url") or info.get("playable_url"), list_item)
+            kodi_player = self._kodi_player
+            if kodi_player:
+                kodi_player.play(info.get("audio_url") or info.get("playable_url"), list_item)
             self._activate_visualizer()
 
     _queue_titles: Dict[str, str] = {}
@@ -810,6 +844,7 @@ class KodiPlayerBridge:
                         self.current_duration,
                         PlayerState.PLAYING,
                         current_index=self.current_index,
+                        list_id=self.list_id,
                     )
                     s.report_now_playing_playlist(
                         self.playlist or [self.current_video_id],
@@ -818,6 +853,7 @@ class KodiPlayerBridge:
                         cur_time,
                         self.current_duration,
                         PlayerState.PLAYING,
+                        list_id=self.list_id,
                     )
                 except Exception:
                     pass
@@ -883,6 +919,7 @@ class KodiPlayerBridge:
                                 cur_duration,
                                 cur_state,
                                 current_index=self.current_index,
+                                list_id=self.list_id,
                             )
                             s.report_now_playing_playlist(
                                 self.playlist or [cur_vid],
@@ -891,6 +928,7 @@ class KodiPlayerBridge:
                                 cur_time,
                                 cur_duration,
                                 cur_state,
+                                list_id=self.list_id,
                             )
                             s.report_state_change(cur_state, cur_time, cur_duration)
                         except Exception:

@@ -14,12 +14,12 @@
                 <setting id="show_pairing_btn" type="action" label="30034" help="30035">
                     <level>0</level>
                     <data>RunScript(plugin.service.ytlounge-cast, show_pairing)</data>
-                    <control type="action" format="action"/>
+                    <control type="button" format="action"/>
                 </setting>
                 <setting id="reset_pairing_btn" type="action" label="30036" help="30037">
                     <level>0</level>
                     <data>RunScript(plugin.service.ytlounge-cast, reset_pairing)</data>
-                    <control type="action" format="action"/>
+                    <control type="button" format="action"/>
                 </setting>
                 <setting id="show_pairing_on_boot" type="boolean" label="30003" help="30038">
                     <default>false</default>
