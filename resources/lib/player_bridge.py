@@ -606,6 +606,12 @@ class KodiPlayerBridge:
                         continue
             cur_time = int(pending)
 
+        # Re-derive which queue item actually started: the user may have
+        # picked a different song through Kodi's own queue view (native
+        # auto-advance or manual selection), in which case current_video_id
+        # still points at the phone's last cast and the phone desyncs.
+        self._sync_current_from_kodi()
+
         if self.current_video_id:
             for s in self.sessions:
                 try:
@@ -613,6 +619,48 @@ class KodiPlayerBridge:
                     s.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PLAYING)
                 except Exception:
                     pass
+
+    def _sync_current_from_kodi(self) -> bool:
+        """Align bridge state with what Kodi is actually playing.
+
+        Returns True if the playing item differs from current_video_id.
+        """
+        if not (KODI_AVAILABLE and self._kodi_player):
+            return False
+        try:
+            playing_file = self._kodi_player.getPlayingFile()
+        except Exception:
+            return False
+        if not playing_file or "play=" not in playing_file:
+            return False
+        import urllib.parse
+        try:
+            qs = urllib.parse.urlparse(playing_file).query
+            vid = dict(urllib.parse.parse_qsl(qs)).get("play")
+        except Exception:
+            return False
+        if not vid or vid == self.current_video_id:
+            return False
+        logger.info("Queue pick via Kodi UI: %s -> %s", self.current_video_id, vid)
+        with self._lock:
+            self.current_video_id = vid
+            if self.playlist and vid in self.playlist:
+                self.current_index = self.playlist.index(vid)
+            self._play_gen += 1
+            self._active_gen = self._play_gen
+        # Duration unknown until resolve; refresh it (and the preload chain)
+        # in the background without blocking the state reports below.
+        def _refresh() -> None:
+            try:
+                info = self.resolver.resolve(vid)
+                with self._lock:
+                    if self.current_video_id == vid:
+                        self.current_duration = int(info.get("duration", 0) or 0)
+                self._kick_prefetch()
+            except Exception:
+                pass
+        threading.Thread(target=_refresh, name="QueueSync", daemon=True).start()
+        return True
 
     def _on_playback_paused(self) -> None:
         self.state = PlayerState.PAUSED
