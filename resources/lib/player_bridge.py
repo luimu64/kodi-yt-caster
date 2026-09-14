@@ -73,6 +73,13 @@ class KodiPlayerBridge:
         self._kodi_queue_mode = False
         self._monitor_stop = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
+        # Time-stall pause detection: getCondVisibility("Player.Paused") is
+        # unreliable inside the service process (verified returning False while
+        # the audio player was paused), and onPlayBackPaused/Resumed callbacks
+        # do not fire reliably. The one signal that never lies: a live player
+        # whose getTime() stops advancing.
+        self._last_poll_time: Optional[int] = None
+        self._stall_polls = 0
 
         if KODI_AVAILABLE:
             self._kodi_player = self._create_kodi_player()
@@ -139,6 +146,7 @@ class KodiPlayerBridge:
     def _position_loop(self) -> None:
         while not self._monitor_stop.is_set():
             time.sleep(2.0)
+            self._poll_pause_state()
             if KODI_AVAILABLE and self._kodi_player and self.current_video_id:
                 try:
                     if self._kodi_player.isPlaying():
@@ -180,6 +188,48 @@ class KodiPlayerBridge:
                         )
                     except Exception:
                         pass
+
+    def _poll_pause_state(self) -> None:
+        """Detect pause via time-stall: a live Kodi player whose getTime()
+        stops advancing across consecutive 2s polls is paused. Covers both
+        broken-signal cases verified live: getCondVisibility("Player.Paused")
+        returning False inside the service process, and
+        onPlayBackPaused/Resumed callbacks never firing (TV-side JSONRPC pause).
+
+        Requires duration loaded (skip buffering stalls) and two consecutive
+        zero-advance polls (hysteresis against demuxer hiccups).
+        """
+        if not (KODI_AVAILABLE and self._kodi_player) or not self.current_video_id:
+            self._last_poll_time = None
+            self._stall_polls = 0
+            return
+        try:
+            if not self._kodi_player.isPlaying():
+                self._last_poll_time = None
+                self._stall_polls = 0
+                return
+            cur = int(self._kodi_player.getTime())
+        except Exception:
+            return
+        dur = self.current_duration
+        if not dur or cur >= dur - 2:
+            # No trustworthy clock yet, or track finished.
+            self._last_poll_time = None
+            self._stall_polls = 0
+            return
+        if self._last_poll_time is not None and cur == self._last_poll_time:
+            self._stall_polls += 1
+        else:
+            self._stall_polls = 0
+        self._last_poll_time = cur
+        if self._stall_polls >= 2:
+            if self.state != PlayerState.PAUSED:
+                logger.info("Pause detected via time-stall (t=%s x%s polls)", cur, self._stall_polls)
+                self._on_playback_paused()
+        elif self._stall_polls == 0 and self.state == PlayerState.PAUSED:
+            # Clock moving again while we believe paused: TV-side resume.
+            logger.info("Resume detected via time advance (t=%s)", cur)
+            self._on_playback_resumed()
 
     def _resync_index(self) -> None:
         """Re-derive current_index from current_video_id after queue edits."""
