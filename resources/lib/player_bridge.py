@@ -729,11 +729,28 @@ class KodiPlayerBridge:
             except Exception:
                 pass
 
-        # Advance playlist
+        # Advance playlist. Kodi fires Ended for a manual skip too — but in
+        # that case it has ALREADY started the next item itself and
+        # onPlayBackStarted (with _sync_current_from_kodi) adopts it. The
+        # only signal distinguishing natural end from manual skip is whether
+        # the bridge already moved off the ended item: natural end leaves
+        # current_video_id on the finished track; a manual skip's Started
+        # event fires first and syncs it forward. So: advance only if the
+        # ended item is still current.
+        #
+        # NOTE: current_video_id is only trustworthy here because
+        # _sync_current_from_kodi() runs on EVERY onPlayBackStarted. If the
+        # manual skip's Started event hasn't been processed yet (race), this
+        # may still double-start; the generation guard in _play_video drops
+        # the stale one.
         with self._lock:
             if self.playlist and self.current_index + 1 < len(self.playlist):
-                self.current_index += 1
-                next_id = self.playlist[self.current_index]
-                logger.info("Auto-advancing to next video: %s", next_id)
-                self._play_gen += 1
-                threading.Thread(target=self._play_video, args=(next_id, self._play_gen, self.current_theme), daemon=True).start()
+                next_id = self.playlist[self.current_index + 1]
+                if self.current_video_id == self.playlist[self.current_index]:
+                    self.current_index += 1
+                    logger.info("Auto-advancing to next video: %s", next_id)
+                    self._play_gen += 1
+                    threading.Thread(target=self._play_video, args=(next_id, self._play_gen, self.current_theme), daemon=True).start()
+                else:
+                    logger.debug("Ended after manual skip to %s; Kodi already playing it",
+                                 self.current_video_id)
