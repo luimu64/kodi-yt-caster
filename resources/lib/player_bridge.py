@@ -49,7 +49,7 @@ class KodiPlayerBridge:
         self.playlist: List[str] = []
         self.current_index: int = 0
         self.current_video_id: Optional[str] = None
-        self.current_duration: int = 0
+        self._current_duration: int = 0
         self.pending_seek: Optional[float] = None
         # 'm' when the current item was cast from YouTube Music, 'cl' from
         # YouTube; None until the first cast.
@@ -71,6 +71,31 @@ class KodiPlayerBridge:
             self._kodi_player = self._create_kodi_player()
         else:
             self._kodi_player = None
+
+    @property
+    def current_duration(self) -> int:
+        if self._current_duration <= 0:
+            player = getattr(self, "_kodi_player", None)
+            if KODI_AVAILABLE and player:
+                try:
+                    if player.isPlaying():
+                        total = player.getTotalTime()
+                        if total is not None and total > 0:
+                            self._current_duration = max(0, int(total))
+                except Exception:
+                    pass
+        return max(0, self._current_duration)
+
+    @current_duration.setter
+    def current_duration(self, val: Any) -> None:
+        try:
+            self._current_duration = max(0, int(val or 0))
+        except (TypeError, ValueError):
+            self._current_duration = 0
+
+    def get_duration(self) -> int:
+        """Return total duration in seconds, querying Kodi player if unknown."""
+        return self.current_duration
 
     def _create_kodi_player(self):
         parent = self
@@ -106,13 +131,19 @@ class KodiPlayerBridge:
             time.sleep(2.0)
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
+                cur_duration = self.current_duration
                 for s in self.sessions:
                     try:
                         s.report_now_playing(
                             video_id=self.current_video_id,
                             current_time=int(cur_time),
-                            duration=self.current_duration,
+                            duration=cur_duration,
                             state=self.state,
+                        )
+                        s.report_state_change(
+                            state=self.state,
+                            current_time=int(cur_time),
+                            duration=cur_duration,
                         )
                     except Exception:
                         pass
@@ -612,6 +643,7 @@ class KodiPlayerBridge:
             self._play_gen += 1
             self._active_gen = self._play_gen
             self._requested_id = None
+            self.current_duration = 0
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             self._kodi_player.stop()
         else:
@@ -769,6 +801,7 @@ class KodiPlayerBridge:
         with self._lock:
             self._requested_id = vid
             self.current_video_id = vid
+            self.current_duration = 0
             if self.playlist and vid in self.playlist:
                 self.current_index = self.playlist.index(vid)
             self._play_gen += 1
@@ -778,9 +811,29 @@ class KodiPlayerBridge:
         def _refresh() -> None:
             try:
                 info = self.resolver.resolve(vid)
+            except Exception:
+                info = {}
+            try:
                 with self._lock:
                     if self.current_video_id == vid:
-                        self.current_duration = int(info.get("duration", 0) or 0)
+                        duration = int(info.get("duration", 0) or 0)
+                        if duration > 0:
+                            self.current_duration = duration
+                        elif self.current_duration <= 0:
+                            _ = self.current_duration
+                        cur_duration = self.current_duration
+                        cur_vid = self.current_video_id
+                        cur_state = self.state
+                    else:
+                        cur_vid = None
+                if cur_vid:
+                    cur_time = self.get_time()
+                    for s in self.sessions:
+                        try:
+                            s.report_now_playing(cur_vid, cur_time, cur_duration, cur_state)
+                            s.report_state_change(cur_state, cur_time, cur_duration)
+                        except Exception:
+                            pass
                 self._kick_prefetch()
             except Exception:
                 pass
@@ -816,6 +869,7 @@ class KodiPlayerBridge:
         self.state = PlayerState.STOPPED
         with self._lock:
             self._requested_id = None
+            self.current_duration = 0
         for s in self.sessions:
             try:
                 s.report_state_change(PlayerState.STOPPED, 0, 0)
@@ -826,6 +880,7 @@ class KodiPlayerBridge:
         self.state = PlayerState.STOPPED
         with self._lock:
             self._requested_id = None
+            self.current_duration = 0
         for s in self.sessions:
             try:
                 s.report_state_change(PlayerState.STOPPED, 0, 0)

@@ -66,6 +66,7 @@ def test_player_quirks():
     assert events == ["started"], events
     assert callsites[0] != caller, "callback must be async"
     assert p.isPlaying()
+    assert p.getTotalTime() == 60.0
     # pause keeps isPlaying True, pause() toggles
     p.pause()
     time.sleep(0.2)
@@ -85,6 +86,7 @@ def test_player_quirks():
     time.sleep(0.2)
     assert events[-1] == "stopped" and not p.isPlaying()
     assert p.getTime() == 0.0
+    assert p.getTotalTime() == 0.0
 
 
 def test_playlist_snapshot():

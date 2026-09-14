@@ -339,6 +339,11 @@ class Player:
             return _engine.clock.get_time()
         return 0.0
 
+    def getTotalTime(self):
+        if self.isPlaying() and _engine.clock:
+            return _engine.clock.duration
+        return 0.0
+
     def getPlayingFile(self):
         if _engine.url is None:
             raise RuntimeError("xbmc stub: no file playing")

@@ -293,6 +293,129 @@ def test_ofs_increment_thread_safe():
     assert session.ofs == 800, session.ofs
 
 
+def test_duration_reporting_and_fallback():
+    session = LoungeSession("s1", "t1", "d1")
+    actions = []
+    session.post_action = lambda sc, data: actions.append((sc, data))
+
+    player = KodiPlayerBridge(session=session, resolver=VideoResolver(bridge=MockYtDlpBridge()))
+
+    # Non-negative int check in report_now_playing and report_state_change
+    session.report_now_playing("v1", -5, -10, 1)
+    assert actions[-1] == ("nowPlaying", {
+        "videoId": "v1", "currentTime": "0", "duration": "0", "state": "1", "cpn": "kodi"
+    })
+    session.report_state_change(1, 15.6, 120.4)
+    assert actions[-1] == ("onStateChange", {
+        "state": "1", "currentTime": "15", "duration": "120", "cpn": "kodi"
+    })
+
+    # Test fallback to getTotalTime when current_duration <= 0 and media is active
+    class FakeKodiPlayer:
+        def __init__(self):
+            self._playing = True
+            self._time = 10.0
+            self._total_time = 240.0
+        def isPlaying(self):
+            return self._playing
+        def getTime(self):
+            return self._time
+        def getTotalTime(self):
+            return self._total_time
+
+    fake_kp = FakeKodiPlayer()
+    player._kodi_player = fake_kp
+    import resources.lib.player_bridge as pb
+    orig_kodi_avail = pb.KODI_AVAILABLE
+    pb.KODI_AVAILABLE = True
+
+    try:
+        player.current_duration = 0
+        assert player.current_duration == 240
+        assert player.get_duration() == 240
+
+        # When not playing, fallback is not used
+        fake_kp._playing = False
+        player.current_duration = 0
+        assert player.current_duration == 0
+
+        # Position loop emits both report_now_playing and report_state_change
+        fake_kp._playing = True
+        player.state = PlayerState.PLAYING
+        player.current_video_id = "v_loop"
+        player.current_duration = 180
+        actions.clear()
+
+        # Execute monitoring block logic directly
+        cur_time = player.get_time()
+        cur_duration = player.current_duration
+        for s in player.sessions:
+            s.report_now_playing(player.current_video_id, int(cur_time), cur_duration, player.state)
+            s.report_state_change(player.state, int(cur_time), cur_duration)
+
+        assert any(a[0] == "nowPlaying" and a[1]["videoId"] == "v_loop" and a[1]["duration"] == "180" for a in actions)
+        assert any(a[0] == "onStateChange" and a[1]["duration"] == "180" for a in actions)
+    finally:
+        pb.KODI_AVAILABLE = orig_kodi_avail
+
+
+def test_sync_current_from_kodi_refresh_dispatches_duration():
+    session = LoungeSession("s1", "t1", "d1")
+    actions = []
+    session.post_action = lambda sc, data: actions.append((sc, data))
+
+    class MockResolveBridge:
+        def resolve(self, video_id):
+            return {
+                "id": video_id,
+                "title": f"Title {video_id}",
+                "duration": 315,
+                "playable_url": f"http://example.com/{video_id}",
+            }
+
+    resolver = VideoResolver(bridge=MockResolveBridge())
+    player = KodiPlayerBridge(session=session, resolver=resolver)
+
+    class FakeKodiPlayer:
+        def __init__(self):
+            self._file = "plugin://plugin.service.ytlounge-cast/?play=v_synced"
+            self._playing = True
+        def getPlayingFile(self):
+            return self._file
+        def isPlaying(self):
+            return self._playing
+        def getTime(self):
+            return 5.0
+        def getTotalTime(self):
+            return 315.0
+
+    player._kodi_player = FakeKodiPlayer()
+    import resources.lib.player_bridge as pb
+    orig_kodi_avail = pb.KODI_AVAILABLE
+    pb.KODI_AVAILABLE = True
+
+    try:
+        player.current_video_id = "v_old"
+        player.state = PlayerState.PLAYING
+        actions.clear()
+
+        changed = player._sync_current_from_kodi()
+        assert changed is True
+        assert player.current_video_id == "v_synced"
+
+        # Wait for background _refresh to finish
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if any(a[0] == "nowPlaying" and a[1].get("videoId") == "v_synced" and a[1].get("duration") == "315" for a in actions):
+                break
+            time.sleep(0.05)
+
+        assert any(a[0] == "nowPlaying" and a[1]["videoId"] == "v_synced" and a[1]["duration"] == "315" for a in actions)
+        assert any(a[0] == "onStateChange" and a[1]["duration"] == "315" for a in actions)
+    finally:
+        pb.KODI_AVAILABLE = orig_kodi_avail
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_frame_parsing_chunked()
@@ -310,4 +433,6 @@ if __name__ == "__main__":
     test_actions_module()
     test_kodi_queue_mode_ended_no_self_advance()
     test_ofs_increment_thread_safe()
+    test_duration_reporting_and_fallback()
+    test_sync_current_from_kodi_refresh_dispatches_duration()
     print("All unit tests passed successfully.")

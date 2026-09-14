@@ -301,8 +301,8 @@ class LoungeSession:
         """Report now playing status to Lounge (state: 1=playing, 2=paused, 0=stopped)."""
         self.post_action("nowPlaying", {
             "videoId": video_id,
-            "currentTime": str(current_time),
-            "duration": str(duration),
+            "currentTime": str(max(0, int(current_time or 0))),
+            "duration": str(max(0, int(duration or 0))),
             "state": str(state),
             "cpn": "kodi",
         })
@@ -311,8 +311,8 @@ class LoungeSession:
         """Report state change (1=playing, 2=paused, 0=stopped)."""
         self.post_action("onStateChange", {
             "state": str(state),
-            "currentTime": str(current_time),
-            "duration": str(duration),
+            "currentTime": str(max(0, int(current_time or 0))),
+            "duration": str(max(0, int(duration or 0))),
             "cpn": "kodi",
         })
 
