@@ -194,9 +194,44 @@ def preload_hls(video_id: str, media_playlist_urls: List[str]) -> None:
     def _run() -> None:
         try:
             t0 = time.monotonic()
-            for vurl in media_playlist_urls:
+            # Fetch all media playlist bodies in PARALLEL first (a 4K master
+            # carries ~10 variants; serial fetches stretched ready-time to
+            # 5-6s). Then process each body (pure string ops, fast) and only
+            # mark ready once every variant body is built — the served master
+            # references every variant, and a 404 on one Kodi happens to pick
+            # would abort playback.
+            bodies: List[Tuple[str, str]] = []
+            fetch_lock = threading.Lock()
+
+            def _fetch_playlist(vurl: str) -> None:
+                try:
+                    body = _http_get(vurl).decode("utf-8", errors="replace")
+                except Exception:
+                    logger.debug("playlist fetch failed during preload of %s", video_id)
+                    return
+                with fetch_lock:
+                    bodies.append((vurl, body))
+
+            workers = min(6, max(1, len(media_playlist_urls)))
+            it = iter(media_playlist_urls)
+            running: List[threading.Thread] = []
+            while True:
+                running = [t for t in running if t.is_alive()]
+                while len(running) < workers:
+                    try:
+                        vurl = next(it)
+                    except StopIteration:
+                        break
+                    t = threading.Thread(target=_fetch_playlist, args=(vurl,), daemon=True)
+                    t.start()
+                    running.append(t)
+                if not running:
+                    break
+                running[0].join(0.2)
+
+            fetch_plan: List[Tuple[str, List[int]]] = []
+            for vurl, body in bodies:
                 vkey = _vkey(vurl)
-                body = _http_get(vurl).decode("utf-8", errors="replace")
                 target = 10.0
                 segs_raw: List[str] = []
                 for l in body.splitlines():
@@ -212,28 +247,13 @@ def preload_hls(video_id: str, media_playlist_urls: List[str]) -> None:
                         segs_raw.append(s)
                 want = max(1, int(PRELOAD_SECONDS / max(target, 1)))
 
-                final_lines = []  # unused; rebuilt below
-                fetched = 0
                 with _LOCK:
                     meta["master_lines"].append(vkey)
-                for i, seg in enumerate(segs_raw):
-                    remote = _abs(vurl, seg)
-                    final_lines.append(f"/preload/{video_id}/{vkey}/{i}")
-                    with _LOCK:
-                        meta["segments"][(vkey, i)] = remote
-                    if i < want:
-                        try:
-                            data = _http_get(remote)
-                            with _LOCK:
-                                _store_segment(meta, vkey, i, data)
-                                fetched += 1
-                        except Exception:
-                            logger.debug("segment %d prefetch failed for %s", i, video_id)
-                for l in body.splitlines():
-                    s = l.strip()
-                    if s and not s.startswith("#"):
-                        pass  # segment lines rebuilt below in original positions
-                # Rebuild playlist preserving tag lines in original positions.
+                    # Map ALL segment placeholders so fetch-on-demand can
+                    # serve any seek position even before its bytes are warm.
+                    for i, seg in enumerate(segs_raw):
+                        meta["segments"][(vkey, i)] = _abs(vurl, seg)
+
                 rebuilt: List[str] = []
                 i = 0
                 for l in body.splitlines():
@@ -245,12 +265,21 @@ def preload_hls(video_id: str, media_playlist_urls: List[str]) -> None:
                         rebuilt.append(l)
                 with _LOCK:
                     meta["playlist_body"][vkey] = "\n".join(rebuilt) + "\n"
+                fetch_plan.append((vkey, list(range(min(want, len(segs_raw))))))
 
             with _LOCK:
-                meta["state"] = "ready"
+                meta["state"] = "ready"  # all bodies served; segments warm next
                 meta["mtime"] = time.time()
+
+            # PASS 2 (bytes): parallel prefetch of the first ~60s per variant.
+            # Serial fetch of ~6 segments x ~300-800ms each stretched preload
+            # to 5s+; with a small thread pool the wall time is ~one segment.
+            fetched = 0
+            for vkey, idxs in fetch_plan:
+                fetched += _prefetch_segments(meta, video_id, [(vkey, i) for i in idxs])
+
             logger.info("Preloaded %s (hls): %d segments in %.1fs",
-                        video_id, len(meta["cache"]), time.monotonic() - t0)
+                        video_id, fetched, time.monotonic() - t0)
             _trim_cache(video_id)
         except Exception:
             with _LOCK:
@@ -258,6 +287,52 @@ def preload_hls(video_id: str, media_playlist_urls: List[str]) -> None:
             logger.debug("HLS preload of %s failed", video_id, exc_info=True)
 
     threading.Thread(target=_run, name=f"PreloadHLS-{video_id}", daemon=True).start()
+
+
+def _prefetch_segments(meta: Dict[str, Any], video_id: str, keys: List[Tuple[str, int]]) -> int:
+    """Fetch the given segment keys concurrently into the cache.
+
+    Bounded 6-worker pool: wall time ~one segment instead of N serial
+    round-trips. Fetch-on-demand serves any segment not yet warm, so an
+    interrupted prefetch never breaks playback. Returns segments fetched.
+    """
+    fetched = 0
+    lock = threading.Lock()
+
+    def _fetch(key: Tuple[str, int]) -> None:
+        nonlocal fetched
+        with _LOCK:
+            if key in meta["cache"]:
+                return
+            remote = meta["segments"].get(key)
+        if not remote:
+            return
+        try:
+            data = _http_get(remote)
+            with _LOCK:
+                _store_segment(meta, key[0], key[1], data)
+                with lock:
+                    fetched += 1
+        except Exception:
+            logger.debug("segment %s prefetch failed for %s", key[1], video_id)
+
+    workers = min(6, max(1, len(keys)))
+    it = iter(keys)
+    running: List[threading.Thread] = []
+    while True:
+        running = [t for t in running if t.is_alive()]
+        while len(running) < workers:
+            try:
+                key = next(it)
+            except StopIteration:
+                break
+            t = threading.Thread(target=_fetch, args=(key,), daemon=True)
+            t.start()
+            running.append(t)
+        if not running:
+            break
+        running[0].join(0.2)
+    return fetched
 
 
 def _vkey(remote_url: str) -> str:
@@ -369,10 +444,15 @@ def handle_request(handler, path: str) -> None:
 
 
 def _send(handler, code: int, headers: Dict[str, str], body: Optional[bytes] = None) -> None:
+    # HTTP/1.1 keep-alive server: every response needs an exact
+    # Content-Length (or an explicit Connection: close), otherwise the
+    # client hangs waiting for more bytes on the persistent connection.
+    if body is not None and "Content-Length" not in headers:
+        headers = dict(headers)
+        headers["Content-Length"] = str(len(body))
     handler.send_response(code)
     for k, v in headers.items():
         handler.send_header(k, v)
-    handler.send_header("Access-Control-Allow-Origin", "*")
     handler.end_headers()
     if body is not None:
         handler.wfile.write(body)
@@ -435,10 +515,12 @@ def _parse_range(header: Optional[str]) -> Optional[Tuple[int, Optional[int]]]:
 
 
 def _proxy_remote(handler, url: str, range_header: str, ctype: str) -> None:
+    headers = {"Connection": "close"}  # streamed body, no length known up front
     try:
         with urllib.request.urlopen(_request(url, range_header), timeout=30.0) as resp:
             hdrs = {"Content-Type": resp.headers.get("Content-Type", ctype),
-                    "Accept-Ranges": "bytes"}
+                    "Accept-Ranges": "bytes", "Connection": "close"}
+            hdrs.update(headers)
             cl = resp.headers.get("Content-Length")
             cr = resp.headers.get("Content-Range")
             if cl:

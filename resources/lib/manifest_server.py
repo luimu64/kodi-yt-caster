@@ -21,6 +21,13 @@ _SERVER: Optional["ManifestServer"] = None
 
 
 class _Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 keep-alive: Kodi's demuxer fetches dozens of segments in
+    # quick succession; with the 1.0 default every segment pays a fresh
+    # TCP connect + accept on the Python (GIL-bound) server thread.
+    # Every response below carries an exact Content-Length to keep the
+    # persistent connection well-formed.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format: str, *args) -> None:  # keep Kodi's log clean
         logger.debug("%s - %s", self.client_address[0], format % args)
 
@@ -42,7 +49,6 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/vnd.apple.mpegurl")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data)
 
@@ -77,7 +83,6 @@ def _send_json(handler, code: int, obj) -> None:
     handler.send_response(code)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(data)))
-    handler.send_header("Access-Control-Allow-Origin", "*")
     handler.end_headers()
     handler.wfile.write(data)
 

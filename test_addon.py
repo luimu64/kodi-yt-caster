@@ -250,6 +250,49 @@ def test_actions_module():
     assert hasattr(actions, "action_update_ytdlp")
 
 
+def test_kodi_queue_mode_ended_no_self_advance():
+    """In Kodi-queue (music playlist) mode, Ended must NOT spawn our own
+    play for the next item: Kodi's playlist auto-advances natively, and a
+    second _play_video races it into a restart-from-0 (regression test)."""
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session, resolver=VideoResolver(bridge=MockYtDlpBridge()))
+    player.set_playlist({"videoId": "v1", "videoIds": "v1,v2", "currentTime": 0})
+    time.sleep(0.3)
+    with player._lock:
+        player.current_video_id = "v1"
+        player.current_index = 0
+        player._kodi_queue_mode = True
+        before = player._play_gen
+    player._on_playback_ended()
+    time.sleep(0.2)
+    with player._lock:
+        assert player._play_gen == before, "queue mode Ended must not advance itself"
+        assert player.current_index == 0
+    # Non-queue mode still advances
+    player.state = PlayerState.PLAYING
+    with player._lock:
+        player._kodi_queue_mode = False
+    player._on_playback_ended()
+    time.sleep(0.2)
+    with player._lock:
+        assert player.current_index == 1
+
+
+def test_ofs_increment_thread_safe():
+    """Concurrent listener-style and post-worker increments must never
+    produce duplicate offsets (Lounge drops duplicate-ofs reports)."""
+    session = LoungeSession("s1", "t1", "d1")
+    import threading
+    def _bump():
+        for _ in range(200):
+            with session._ofs_lock:
+                session.ofs += 1
+    ts = [threading.Thread(target=_bump) for _ in range(4)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert session.ofs == 800, session.ofs
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_frame_parsing_chunked()
@@ -265,4 +308,6 @@ if __name__ == "__main__":
     test_dial_and_ssdp_discovery()
     test_pairing_dialog_non_blocking()
     test_actions_module()
+    test_kodi_queue_mode_ended_no_self_advance()
+    test_ofs_increment_thread_safe()
     print("All unit tests passed successfully.")

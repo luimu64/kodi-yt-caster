@@ -12,6 +12,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .manifest_server import publish
+from . import ytdlp_inproc as inproc
 
 logger = logging.getLogger("ytlounge.ytdlp")
 
@@ -215,7 +216,7 @@ class YtDlpBridge:
     def resolve(self, video_id: str) -> Dict[str, Any]:
         """Resolve YouTube video ID to playable stream details."""
         t0 = time.monotonic()
-        if not self.binary_path:
+        if not self.binary_path and not inproc.available():
             raise RuntimeError("yt-dlp executable not found. Please install yt-dlp or configure its path.")
 
         # Cache: resolve results live for 30 min. Playback URLs (googlevideo) expire ~6h, and a
@@ -226,6 +227,23 @@ class YtDlpBridge:
         if cached and now - cached[0] < 1800:
             logger.info("TIMING %s: cache hit (+%.0fms total)", video_id, (time.monotonic() - t0) * 1000)
             return cached[1]
+
+        # In-process resolve first: persistent YoutubeDL instance reuses its
+        # HTTP session across resolves (warm TLS + pooling), no ~30-40MB
+        # subprocess spawn per track. Falls back to subprocess below.
+        if inproc.try_init(self.binary_path):
+            t1 = time.monotonic()
+            try:
+                data = inproc.resolve(video_id, cookies_path=self.cookies_path)
+                logger.info("TIMING %s: inproc extract %.2fs", video_id, time.monotonic() - t1)
+            except Exception as e:
+                logger.warning("inproc resolve failed (%s); trying subprocess", e)
+                data = None
+            if data is not None:
+                info = self._extract_stream_info(data)
+                self._cache[video_id] = (time.monotonic(), info)
+                logger.info("TIMING %s: total %.2fs (inproc)", video_id, time.monotonic() - t0)
+                return info
 
         url = f"https://www.youtube.com/watch?v={video_id}"
         cmd = [

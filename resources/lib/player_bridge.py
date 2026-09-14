@@ -59,6 +59,10 @@ class KodiPlayerBridge:
         self._play_gen = 0  # monotonic play-request epoch; supersedes stale requests
         self._prefetch_id: Optional[str] = None
         self._active_gen = 0  # generation of the item currently loaded in Kodi
+        # True while playback runs through Kodi's own music playlist (plugin
+        # URLs): Kodi auto-advances natively, so _on_playback_ended must NOT
+        # spawn its own play for the next item there (restart-from-0 race).
+        self._kodi_queue_mode = False
         self._monitor_stop = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
 
@@ -313,11 +317,14 @@ class KodiPlayerBridge:
                     list_item.setProperty("inputstream.adaptive.chooser_resolution_max", self.max_resolution)
 
             if audio_mode:
+                self._kodi_queue_mode = True
                 self._play_music_queue(video_id, info, list_item)
             else:
+                self._kodi_queue_mode = False
                 player = xbmc.Player()
                 player.play(playable_url, list_item)
         else:
+            self._kodi_queue_mode = False
             self.state = PlayerState.PLAYING
             for s in self.sessions:
                 try:
@@ -384,6 +391,41 @@ class KodiPlayerBridge:
         except Exception:
             return None
 
+    _TITLE_WORKERS = 6
+
+    @classmethod
+    def _fetch_titles_parallel(cls, video_ids: List[str], deadline: float) -> Dict[str, str]:
+        """Fetch several oEmbed titles concurrently within a wall-clock budget.
+
+        The old code fetched the visible window SERIALLY — 'up to ~2s' was
+        actually 12 x (connect+TLS+request), i.e. worst case ~36s of dead
+        air before playback started on a music cast. Parallel fetch turns
+        the window into ~one request time (~300ms) and the hard deadline
+        bounds it regardless of network state.
+        """
+        results: Dict[str, str] = {}
+        lock = threading.Lock()
+        remaining = list(video_ids)
+
+        def _worker() -> None:
+            while True:
+                with lock:
+                    if not remaining or time.monotonic() > deadline:
+                        return
+                    vid = remaining.pop(0)
+                title = cls._fetch_title_sync(vid)
+                if title:
+                    with lock:
+                        results[vid] = title
+
+        threads = [threading.Thread(target=_worker, daemon=True, name="TitleFetch")
+                   for _ in range(min(cls._TITLE_WORKERS, max(1, len(video_ids))))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+        return results
+
     def _fetch_queue_titles(self, video_ids: List[str], position: int = 0) -> None:
         """Fill titles for queue items via YouTube oEmbed (keyless, CJK-safe).
 
@@ -404,10 +446,12 @@ class KodiPlayerBridge:
                 self._queue_titles_inflight.add(v)
         try:
             window = [v for v in video_ids[position:position + 12] if v in todo]
-            for vid in window:
-                title = self._fetch_title_sync(vid)
-                if title:
-                    self._queue_titles[vid] = title
+            # Hard 2.5s wall-clock budget for the synchronous burst: labels
+            # are snapshotted at playlist.add() time, so this gates the time
+            # from cast-command to first sound. Parallel workers (above)
+            # make the typical case ~300ms; the deadline is the worst case.
+            titles = self._fetch_titles_parallel(window, deadline=time.monotonic() + 2.5)
+            self._queue_titles.update(titles)
             rest = [v for v in todo if v not in self._queue_titles]
             if not rest:
                 return
@@ -618,18 +662,27 @@ class KodiPlayerBridge:
                 # Adaptive streams (HLS/DASH) are often not seekable the instant
                 # onPlayBackStarted fires: the demuxer is still opening and the
                 # seek is silently dropped, so a cast that should resume at T
-                # starts from 0 (position desync vs the phone). Retry briefly.
-                for attempt in range(5):
-                    try:
-                        self._kodi_player.seekTime(pending)
-                    except Exception:
-                        pass
-                    time.sleep(0.4)
-                    try:
-                        if self._kodi_player.isPlaying() and abs(self._kodi_player.getTime() - pending) < 2.0:
-                            break
-                    except Exception:
-                        continue
+                # starts from 0 (position desync vs the phone). Retry briefly —
+                # but on a background thread: this callback runs on one of
+                # Kodi's own player threads, and the 2s retry loop used to
+                # stall every other player event behind it.
+                seek_target = pending
+                kodi_player = self._kodi_player
+
+                def _apply_seek() -> None:
+                    for _attempt in range(5):
+                        try:
+                            kodi_player.seekTime(seek_target)
+                        except Exception:
+                            pass
+                        time.sleep(0.4)
+                        try:
+                            if kodi_player.isPlaying() and abs(kodi_player.getTime() - seek_target) < 2.0:
+                                break
+                        except Exception:
+                            continue
+
+                threading.Thread(target=_apply_seek, name="SeekRetry", daemon=True).start()
             cur_time = int(pending)
 
         # Re-derive which queue item actually started: the user may have
@@ -744,9 +797,18 @@ class KodiPlayerBridge:
         # may still double-start; the generation guard in _play_video drops
         # the stale one.
         with self._lock:
+            kodi_queue_mode = self._kodi_queue_mode
             if self.playlist and self.current_index + 1 < len(self.playlist):
                 next_id = self.playlist[self.current_index + 1]
                 if self.current_video_id == self.playlist[self.current_index]:
+                    if kodi_queue_mode:
+                        # Music-queue mode: the item played through Kodi's own
+                        # playlist, which auto-advances itself (next item's
+                        # onPlayBackStarted + _sync_current_from_kodi adopts
+                        # it). Spawning our own _play_video here would race
+                        # Kodi's advance and restart the track from 0.
+                        logger.debug("Ended in Kodi-queue mode; letting Kodi auto-advance to %s", next_id)
+                        return
                     self.current_index += 1
                     logger.info("Auto-advancing to next video: %s", next_id)
                     self._play_gen += 1

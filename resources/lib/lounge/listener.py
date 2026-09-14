@@ -105,7 +105,12 @@ class LoungeListener(threading.Thread):
         logger.info("LoungeListener thread finished")
 
     def _listen_stream(self) -> None:
-        self.session.ofs += 1
+        # ofs is shared with the post worker — Lounge silently drops reports
+        # with duplicate offsets, so the increment must take the same lock
+        # _do_post uses (race: listener + position loop incrementing
+        # concurrently produced colliding offsets).
+        with self.session._ofs_lock:
+            self.session.ofs += 1
         params = self.session._base_params()
         params.update({
             "RID": "rpc",
