@@ -101,6 +101,9 @@ class KodiPlayerBridge:
         parent = self
 
         class SubclassPlayer(xbmc.Player):
+            def __init__(self):
+                super().__init__()
+
             def onPlayBackStarted(self):
                 parent._on_playback_started()
 
@@ -129,6 +132,15 @@ class KodiPlayerBridge:
     def _position_loop(self) -> None:
         while not self._monitor_stop.is_set():
             time.sleep(2.0)
+            if KODI_AVAILABLE and self._kodi_player and self.current_video_id:
+                try:
+                    if self._kodi_player.isPlaying():
+                        if self.state != PlayerState.PLAYING and not self._is_paused():
+                            self.state = PlayerState.PLAYING
+                            self._sync_current_from_kodi()
+                except Exception:
+                    pass
+
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
                 cur_duration = self.current_duration
@@ -389,8 +401,9 @@ class KodiPlayerBridge:
                 self._play_music_queue(video_id, info, list_item)
             else:
                 self._kodi_queue_mode = False
-                player = xbmc.Player()
-                player.play(playable_url, list_item)
+                player = self._kodi_player if self._kodi_player is not None else (xbmc.Player() if xbmc else None)
+                if player:
+                    player.play(playable_url, list_item)
         else:
             self._kodi_queue_mode = False
             self.state = PlayerState.PLAYING
@@ -450,11 +463,15 @@ class KodiPlayerBridge:
             self._fetch_queue_titles(list(self.playlist or [video_id]), position)
             for vid in self.playlist or [video_id]:
                 playlist.add(f"plugin://plugin.service.ytlounge-cast/?play={vid}", _item(vid))
-            xbmc.Player().play(playlist, list_item, False, position)
+            kodi_player = self._kodi_player if self._kodi_player is not None else (xbmc.Player() if xbmc else None)
+            if kodi_player:
+                kodi_player.play(playlist, list_item, False, position)
             self._activate_visualizer()
         except Exception:
             logger.debug("music queue playback failed; direct play fallback", exc_info=True)
-            xbmc.Player().play(info.get("audio_url") or info.get("playable_url"), list_item)
+            kodi_player = self._kodi_player
+            if kodi_player:
+                kodi_player.play(info.get("audio_url") or info.get("playable_url"), list_item)
             self._activate_visualizer()
 
     _queue_titles: Dict[str, str] = {}
@@ -695,10 +712,8 @@ class KodiPlayerBridge:
     def get_time(self) -> int:
         if KODI_AVAILABLE and self._kodi_player:
             try:
-                # isPlaying() is True while paused too, so getTime() works in
-                # both states. Gating on it returned 0 for paused audio and
-                # froze the phone's position display.
-                return int(self._kodi_player.getTime())
+                if self._kodi_player.isPlaying():
+                    return int(self._kodi_player.getTime())
             except Exception:
                 return 0
         return 0
