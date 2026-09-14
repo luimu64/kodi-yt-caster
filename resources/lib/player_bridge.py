@@ -352,9 +352,10 @@ class KodiPlayerBridge:
                 return li
 
             # Titles must be in the cache BEFORE add() (Kodi snapshots labels
-            # at add time); the sync burst covers the visible window, the
-            # background thread the rest.
-            self._fetch_queue_titles(list(self.playlist or [video_id]))
+            # at add time); the sync burst covers the visible window from the
+            # current position, the background thread the rest (and patches
+            # live entries in place).
+            self._fetch_queue_titles(list(self.playlist or [video_id]), position)
             for vid in self.playlist or [video_id]:
                 playlist.add(f"plugin://plugin.service.ytlounge-cast/?play={vid}", _item(vid))
             xbmc.Player().play(playlist, list_item, False, position)
@@ -379,18 +380,20 @@ class KodiPlayerBridge:
         except Exception:
             return None
 
-    def _fetch_queue_titles(self, video_ids: List[str]) -> None:
+    def _fetch_queue_titles(self, video_ids: List[str], position: int = 0) -> None:
         """Fill titles for queue items via YouTube oEmbed (keyless, CJK-safe).
 
-        Kodi snapshots labels at add() time, so the first ~12 uncached items
-        after the current position are fetched synchronously (bounded burst,
-        ~2s max) BEFORE the playlist is built; the background thread covers
-        the rest and caches across track changes.
+        Kodi snapshots labels at add() time, so items in the visible window
+        (from the current position) are fetched synchronously (bounded burst,
+        ~2s max) BEFORE the playlist is built. The background thread covers
+        the rest AND patches the live playlist entries in place, since Kodi
+        never re-reads labels after add().
         """
         todo = [v for v in video_ids if v not in self._queue_titles]
         if not todo:
             return
-        for vid in todo[:12]:
+        window = [v for v in video_ids[position:position + 12] if v in todo]
+        for vid in window:
             title = self._fetch_title_sync(vid)
             if title:
                 self._queue_titles[vid] = title
@@ -398,12 +401,46 @@ class KodiPlayerBridge:
         if not rest:
             return
 
+        snapshot = list(video_ids)
+
         def _run() -> None:
             for vid in rest:
                 title = self._fetch_title_sync(vid)
-                if title:
-                    self._queue_titles[vid] = title
+                if not title:
+                    continue
+                self._queue_titles[vid] = title
+                self._patch_playlist_label(snapshot, vid, title)
         threading.Thread(target=_run, name="QueueTitles", daemon=True).start()
+
+    def _patch_playlist_label(self, snapshot: List[str], video_id: str, title: str) -> None:
+        """Update one live playlist entry's label after its title arrives.
+
+        Only upcoming items (after the playing position) are touched; the
+        playing item and already-played items are left alone. Bails if the
+        queue was replaced since (size/order mismatch).
+        """
+        if not KODI_AVAILABLE:
+            return
+        try:
+            import xbmc
+            import xbmcgui
+            playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+            if playlist.size() != len(snapshot):
+                return
+            try:
+                idx = snapshot.index(video_id)
+            except ValueError:
+                return
+            if idx <= playlist.getposition():
+                return
+            url = f"plugin://plugin.service.ytlounge-cast/?play={video_id}"
+            li = xbmcgui.ListItem(title)
+            li.setArt({"thumb": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+                       "icon": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"})
+            playlist.remove(url)
+            playlist.add(url, li, idx)
+        except Exception:
+            pass
 
     def _activate_visualizer(self) -> None:
         """Route fullscreen video player to the music/visualisation window."""
