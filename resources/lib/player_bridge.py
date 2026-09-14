@@ -57,6 +57,7 @@ class KodiPlayerBridge:
         self.state = PlayerState.STOPPED
         self._lock = threading.Lock()
         self._play_gen = 0  # monotonic play-request epoch; supersedes stale requests
+        self._requested_id: Optional[str] = None  # video the latest play request targets (set at ENQUEUE time)
         self._prefetch_id: Optional[str] = None
         self._active_gen = 0  # generation of the item currently loaded in Kodi
         # True while playback runs through Kodi's own music playlist (plugin
@@ -151,8 +152,16 @@ class KodiPlayerBridge:
                 # Dedup: Google relays the same setPlaylist on both Lounge sessions (and resends
                 # on rebind), so the same video can arrive 2-4x in a burst. If we are already
                 # resolving/playing exactly this video, the duplicate is a no-op.
-                if target_id == self.current_video_id and self.state != PlayerState.STOPPED:
+                # Dedup on _requested_id, not current_video_id+state: a request
+                # for this video may still be RESOLVING or waiting for the async
+                # onPlayBackStarted (state stays STOPPED for hundreds of ms on
+                # real Kodi while the demuxer opens) - the old check missed dups
+                # in that window, bumping _play_gen and restarting playback from 0
+                # (and arming the stale-gen guard to eat a later STOPPED report).
+                # Cleared on real Ended/Stopped so a deliberate recast works.
+                if target_id == self._requested_id:
                     return
+                self._requested_id = target_id
                 self.pending_seek = current_time if current_time > 0 else None
                 self._play_gen += 1
                 threading.Thread(target=self._play_video, args=(target_id, self._play_gen, self.current_theme), daemon=True).start()
@@ -167,6 +176,7 @@ class KodiPlayerBridge:
 
     def play_video_id(self, video_id: str, seek_time: float = 0.0, theme: Optional[str] = None) -> None:
         with self._lock:
+            self._requested_id = video_id
             self.current_video_id = video_id
             self.pending_seek = seek_time if seek_time > 0 else None
             self._play_gen += 1
@@ -226,6 +236,7 @@ class KodiPlayerBridge:
             logger.error("Failed to resolve video %s: %s", video_id, e)
             with self._lock:
                 if gen == self._play_gen:
+                    self._requested_id = None
                     if KODI_AVAILABLE and xbmcgui:
                         xbmcgui.Dialog().notification("YouTube Cast", f"Failed to resolve video: {e}", xbmcgui.NOTIFICATION_ERROR)
                 else:
@@ -235,6 +246,9 @@ class KodiPlayerBridge:
         playable_url = info.get("playable_url")
         if not playable_url:
             logger.error("No playable URL found for %s", video_id)
+            with self._lock:
+                if gen == self._play_gen:
+                    self._requested_id = None
             self._notify("YouTube Cast", "No playable stream found", error=True)
             return
 
@@ -722,6 +736,7 @@ class KodiPlayerBridge:
             return False
         logger.info("Queue pick via Kodi UI: %s -> %s", self.current_video_id, vid)
         with self._lock:
+            self._requested_id = vid
             self.current_video_id = vid
             if self.playlist and vid in self.playlist:
                 self.current_index = self.playlist.index(vid)
@@ -768,6 +783,8 @@ class KodiPlayerBridge:
                              self._active_gen, self._play_gen)
                 return
         self.state = PlayerState.STOPPED
+        with self._lock:
+            self._requested_id = None
         for s in self.sessions:
             try:
                 s.report_state_change(PlayerState.STOPPED, 0, 0)
@@ -776,6 +793,8 @@ class KodiPlayerBridge:
 
     def _on_playback_ended(self) -> None:
         self.state = PlayerState.STOPPED
+        with self._lock:
+            self._requested_id = None
         for s in self.sessions:
             try:
                 s.report_state_change(PlayerState.STOPPED, 0, 0)
@@ -810,6 +829,7 @@ class KodiPlayerBridge:
                         logger.debug("Ended in Kodi-queue mode; letting Kodi auto-advance to %s", next_id)
                         return
                     self.current_index += 1
+                    self._requested_id = next_id
                     logger.info("Auto-advancing to next video: %s", next_id)
                     self._play_gen += 1
                     threading.Thread(target=self._play_video, args=(next_id, self._play_gen, self.current_theme), daemon=True).start()
