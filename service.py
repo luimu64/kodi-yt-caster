@@ -229,6 +229,10 @@ def run_service() -> None:
     # Let plugin invocations resolve queue items against our warm caches.
     from resources.lib import manifest_server
     manifest_server.set_resolver(resolver)
+    # Boot the manifest server eagerly (it is lazy on first publish) so the
+    # port file exists before any plugin invocation tries to resolve a queue
+    # item.
+    manifest_server.server_url_for("__boot__")
     write_port_file()
 
     # Show pairing code only when the user opted in via settings (manual
