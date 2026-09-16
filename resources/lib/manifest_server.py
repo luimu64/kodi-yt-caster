@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
 
@@ -31,19 +32,60 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args) -> None:  # keep Kodi's log clean
         logger.debug("%s - %s", self.client_address[0], format % args)
 
+    def _manifest_body(self):
+        name = self.path.lstrip("/").split("?")[0]
+        with _LOCK:
+            return _MANIFESTS.get(name)
+
+    def do_HEAD(self) -> None:  # noqa: N802 (http.server API)
+        """Answer HEAD instantly — this is what Kodi STATs the playing file with.
+
+        Kodi's ``DoWork - Saving file state`` STATs the item it just stopped, and
+        that call runs *before* the player's stop is processed: a slow answer
+        (the service process is GIL-bound while resolving/preloading) delays
+        ``OnPlayBackStopped``/``PlaybackCleanup`` for the whole curl timeout —
+        which is what left a stopped video's last frame on screen and kept the
+        next (audio) item from ever starting. Answer with headers only, no body
+        work, and record anything slow enough to matter.
+        """
+        started = time.monotonic()
+        name = self.path.lstrip("/").split("?")[0]
+        if name.startswith("preload/") or name.startswith("resolve/"):
+            # Dynamic endpoints: answer 200 with no length (STAT only needs the
+            # headers; never trigger the fetch work for a HEAD).
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            body = self._manifest_body()
+            if body is None:
+                self.send_error(404, "Not Found")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(body.encode("utf-8"))))
+                self.end_headers()
+        elapsed = time.monotonic() - started
+        if elapsed > 2.0:
+            logger.warning("slow HEAD %s took %.1fs", self.path, elapsed)
+
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        started = time.monotonic()
         name = self.path.lstrip("/").split("?")[0]
         if name.startswith("preload/"):
             from . import preloader
             preloader.handle_request(self, name[len("preload/"):])
+            self._log_if_slow(started)
             return
         if name.startswith("resolve/"):
             _handle_resolve(self, name[len("resolve/"):])
+            self._log_if_slow(started)
             return
         with _LOCK:
             body = _MANIFESTS.get(name)
         if body is None:
             self.send_error(404, "Not Found")
+            self._log_if_slow(started)
             return
         data = body.encode("utf-8")
         self.send_response(200)
@@ -51,11 +93,23 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        self._log_if_slow(started)
+
+    def _log_if_slow(self, started: float) -> None:
+        # The demuxer and Kodi's post-playback STAT share this server with the
+        # resolver/preloader threads: a request that takes seconds means the
+        # service process is starved and playback start/stop will stall too.
+        elapsed = time.monotonic() - started
+        if elapsed > 2.0:
+            logger.warning("slow GET %s took %.1fs", self.path, elapsed)
 
 
 class ManifestServer:
     def __init__(self, port: int = 0):
         self._httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+        # A demuxer opens several connections at once and Kodi STATs the file
+        # right after playback stops; the default backlog of 5 can refuse them.
+        self._httpd.request_queue_size = 32
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="ManifestHTTP")
 

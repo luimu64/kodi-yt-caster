@@ -141,6 +141,13 @@ class KodiPlayerBridge:
         self._last_poll_time: Optional[int] = None
         self._stall_polls = 0
         self._last_stall_time: Optional[int] = None
+        # Playback-transition quiet window (monotonic deadline): while a play is
+        # being handed to Kodi — the outgoing item's post-stop STAT, the video
+        # window teardown, the new player opening — this process must keep the
+        # localhost manifest server responsive, so background resolve/preload
+        # work is held back. A starved server makes Kodi's STAT time out and
+        # defers OnPlayBackStopped/PlaybackCleanup with it.
+        self._transition_until: float = 0.0
 
         if KODI_AVAILABLE:
             self._kodi_player = self._create_kodi_player()
@@ -424,6 +431,19 @@ class KodiPlayerBridge:
         except Exception:
             logger.debug("notification failed", exc_info=True)
 
+    def _begin_transition(self, seconds: float = 8.0) -> None:
+        """Hold background resolve/preload work back during a playback handoff.
+
+        Kodi STATs the outgoing file (``DoWork - Saving file state``) right after
+        the player stops and before it processes the stop, and it opens the
+        incoming file right after; both need this process to answer localhost
+        HTTP. Saturating the interpreter here stalls playback itself.
+        """
+        self._transition_until = max(self._transition_until, time.monotonic() + seconds)
+
+    def _transition_remaining(self) -> float:
+        return max(0.0, self._transition_until - time.monotonic())
+
     def _kick_prefetch(self) -> None:
         """Resolve the next queue item in the background (populates the resolver cache)."""
         with self._lock:
@@ -436,10 +456,19 @@ class KodiPlayerBridge:
             gen = self._play_gen
         if next_id == self._prefetch_id:
             return
+        if next_id == self.current_video_id:
+            # Never background-resolve the item that is already playing: the
+            # play path resolves it, and a deferred prefetch can land after it.
+            return
         self._prefetch_id = next_id
 
         def _run() -> None:
             try:
+                delay = self._transition_remaining()
+                if delay > 0:
+                    logger.info("Prefetch of %s held back %.1fs (playback transition)",
+                                next_id, delay)
+                    time.sleep(min(delay, 12.0))
                 logger.info("Prefetching next video: %s", next_id)
                 if self._play_gen != gen:
                     return
@@ -448,6 +477,11 @@ class KodiPlayerBridge:
                     return
                 # Preload the first ~60s of media itself: track change then
                 # starts from warm disk instead of a cold CDN round-trip.
+                # Never while a handoff is still settling — 72 parallel segment
+                # fetches saturate this process and starve the manifest server.
+                delay = self._transition_remaining()
+                if delay > 0:
+                    time.sleep(min(delay, 12.0))
                 preloader.preload(next_id, info)
             except Exception:
                 logger.debug("Prefetch of %s failed", next_id, exc_info=True)
@@ -518,10 +552,12 @@ class KodiPlayerBridge:
         logger.info("TIMING %s: resolved -> now calling player.play", video_id)
         self._notify("YouTube Cast", f"Now playing: {title}")
 
-        # Prefetch the next queue item while this one plays: auto-advance then starts
-        # instantly instead of paying the full yt-dlp resolve on track change.
-        self._kick_prefetch()
-
+        # Prefetch of the next queue item is kicked per lane below: immediately
+        # for a video-lane play (fast auto-advance), and only once the
+        # audio-lane playback is actually running for a lane switch — a
+        # background resolve/preload running through the handoff starves the
+        # localhost manifest server, and Kodi's post-stop STAT then times out
+        # (the stop is delayed with it and the video frame stays on screen).
         if KODI_AVAILABLE and self._kodi_player:
             # Music visualizer mode: play audio-only so Kodi routes it to the
             # audio player and shows its visualization instead of a static
@@ -584,12 +620,21 @@ class KodiPlayerBridge:
 
             if audio_mode:
                 self._kodi_queue_mode = True
+                # Lane switch / audio start: keep this process quiet across the
+                # handoff (Kodi STATs the outgoing file and opens the incoming
+                # one back-to-back) and only warm the next track once playback
+                # is actually up — see _activate_visualizer.
+                self._begin_transition()
                 self._play_music_queue(video_id, info, list_item)
             else:
                 self._kodi_queue_mode = False
                 player = self._kodi_player if self._kodi_player is not None else (xbmc.Player() if xbmc else None)
                 if player:
                     player.play(playable_url, list_item)
+                # Warm the cache for the next track (auto-advance then starts
+                # without paying a cold resolve). Video lane only: the handoff is
+                # a plain replace, so nothing needs to stay quiet here.
+                self._kick_prefetch()
         else:
             self._kodi_queue_mode = False
             self.state = PlayerState.PLAYING
@@ -876,6 +921,10 @@ class KodiPlayerBridge:
                         xbmc.executebuiltin("ActivateWindow(12006)")
                         if self._visualisation_is_active():
                             logger.info("Visualisation window active")
+                            # Audio lane is up and the handoff has settled: only
+                            # now is it safe to saturate this process with the
+                            # next item's resolve/preload.
+                            self._kick_prefetch()
                             return
                         logger.info("ActivateWindow(12006) did not take (modal dialog?) — retrying")
                 except Exception:
