@@ -224,10 +224,22 @@ def fetch_manifest(url: str) -> str:
         return _MANIFESTS.get(name, "")
 
 
+def _child_alive() -> bool:
+    return bool(_CHILD_PORT) and _CHILD_PROC is not None and _CHILD_PROC.poll() is None
+
+
 def _public_port() -> Optional[int]:
-    """Port Kodi (and the plugin) should talk to: the front end, else in-process."""
-    if _CHILD_PORT:
+    """Port Kodi (and the plugin) should talk to: the front end, else in-process.
+
+    A dead front end must fall back immediately — handing Kodi a port nobody
+    serves would stop manifest fetches (and playback) altogether.
+    """
+    global _CHILD_PORT
+    if _child_alive():
         return _CHILD_PORT
+    if _CHILD_PORT:
+        logger.warning("HTTP front end exited; falling back to the in-process server")
+        _CHILD_PORT = None
     return _ensure_server().port
 
 
@@ -259,6 +271,6 @@ def publish(name: str, body: str) -> str:
 
 def server_port() -> Optional[int]:
     """Port that serves manifests (the out-of-process front end when it is up)."""
-    if _CHILD_PORT:
+    if _child_alive():
         return _CHILD_PORT
     return _SERVER.port if _SERVER is not None else None
