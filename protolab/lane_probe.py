@@ -69,7 +69,8 @@ def logslice(mark, pats=("Window Init", "Window Deinit", "Activating window ID",
 
 
 def resolve(vid):
-    with urllib.request.urlopen(f"http://127.0.0.1:33727/resolve/{vid}", timeout=90) as r:
+    port = int(open("/storage/.kodi/userdata/addon_data/plugin.service.ytlounge-cast/manifest_server.port").read().strip())
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/resolve/{vid}", timeout=90) as r:
         return json.loads(r.read().decode())
 
 
