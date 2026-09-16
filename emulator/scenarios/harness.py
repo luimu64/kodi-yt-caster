@@ -34,17 +34,22 @@ _CALLS = {"resolve": []}
 
 
 def _fake_bridge_resolve(self, video_id):
-    """Deterministic offline resolve: dash type (no preload network), audio+video URLs."""
+    """Deterministic offline resolve: dash type (no preload network), audio+video URLs.
+
+    ``is_static_art`` is True except for ids prefixed "v" — scenarios use that
+    to cast a real music video (video lane) next to a still-art track (audio
+    lane) in the same queue.
+    """
     _CALLS["resolve"].append(video_id)
     return {
         "id": video_id,
         "title": f"Title of {video_id}",
         "duration": 180,
         "thumbnail": f"http://127.0.0.1:9/thumb-{video_id}.jpg",
-        "playable_url": f"http://media.example/{video_id}/video.mpd",
+        "playable_url": f"http://video.example/{video_id}/video.mpd",
         "stream_type": "dash",
-        "audio_url": f"http://media.example/{video_id}/audio.m4a",
-        "is_static_art": True,
+        "audio_url": f"http://audio.example/{video_id}/audio.m4a",
+        "is_static_art": not video_id.startswith("v"),
         "max_video_tbr": 0.0,
         "artist": "Artist",
         "album": "Album",
@@ -72,6 +77,14 @@ class Scenario:
     def __enter__(self):
         kodi_stub.reset()
         xbmc.MEDIA.update({
+            # Lane fidelity: the receiver's video stream is a VIDEO item, the
+            # music-queue item is an AUDIO one (the stub's isPlayingAudio /
+            # isPlayingVideo and the window model key off this).
+            "http://video.example/": {"duration": 8.0, "audio": False},
+            "http://audio.example/": {"duration": 8.0, "audio": True},
+            # Kodi plays music-queue items through the plugin entry, which
+            # hands Kodi the audio URL for every queue item.
+            "plugin://plugin.service.ytlounge-cast/": {"duration": 8.0, "audio": True},
             "http://media.example/": {"duration": 8.0, "audio": True},
         })
         base = {
@@ -117,6 +130,7 @@ class Scenario:
         # the refresh path directly (the wire path needs ~62s of backoff)
         import resources.lib.lounge.listener as listener_mod
         service._last_token_handlers = getattr(service, "_last_token_handlers", {})
+        service._emu_sessions = {}
         if not getattr(listener_mod, "_emu_wrapped", False):
             listener_mod._emu_wrapped = True
             _orig_init = listener_mod.LoungeListener.__init__
@@ -125,6 +139,8 @@ class Scenario:
                 _orig_init(self, session=session, dispatcher=dispatcher,
                            on_token_expired=on_token_expired, **kw)
                 service._last_token_handlers[session.theme] = on_token_expired
+                # authoritative theme -> session map (carries the live mock sid)
+                service._emu_sessions[session.theme] = session
             listener_mod.LoungeListener.__init__ = _init
 
         self.service = service
@@ -152,6 +168,22 @@ class Scenario:
         if video_id is None:
             return len(_CALLS["resolve"])
         return _CALLS["resolve"].count(video_id)
+
+    def sid_for_theme(self, theme):
+        """Mock-Lounge session id served by the listener for a theme.
+
+        The receiver registers two screens (cl / YouTube, m / YouTube Music) and
+        the listener stamps each command with its session's theme — the addon
+        gates the visualiser lane on ``m``. The sid comes from the service's own
+        session object: the mock assigns a fresh one per bind, so a sid read out
+        of the store's screen id can be stale by the time a command is queued.
+        """
+        sess = getattr(self.service, "_emu_sessions", {}).get(theme)
+        return sess.sid if sess is not None and sess.sid else None
+
+    def wait_for_session(self, theme, timeout=10.0):
+        return self.wait_until(lambda: self.sid_for_theme(theme), timeout=timeout,
+                               what=f"lounge session for theme {theme}")
 
     # --- eventual-consistency helpers ---------------------------------------
     def wait_until(self, pred, timeout=10.0, what="condition"):

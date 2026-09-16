@@ -22,6 +22,70 @@ MEDIA = {}        # url-prefix -> {"duration": s, "audio": bool}; longest prefix
 DEFAULT_DURATION = 180.0
 DEFAULT_RATE = 1.0
 
+# Window ids used by the receiver (Kodi's real values).
+WINDOW_HOME = 10000
+WINDOW_FULLSCREEN_VIDEO = 12005
+WINDOW_VISUALISATION = 12006
+
+# Device-verified Kodi quirk: on LibreELEC 12 / Kodi 21.3 the service process
+# receives NO xbmc.Player callbacks at all (not even the first cast's Started).
+# Set by a scenario that needs to model that silence — the receiver then has to
+# notice playback changes from its own polls.
+SUPPRESS_PLAYER_CALLBACKS = False
+
+
+class _Windows:
+    """Kodi's window history, the part the receiver can disturb.
+
+    Mirrors the real rules that matter here:
+      * starting a VIDEO item activates the fullscreen video window (12005),
+      * an audio item does NOT activate the visualisation window by itself
+        (Kodi only requests fullscreen for the FIRST file of a music-playlist
+        session, and only with the right setting) — the receiver activates
+        12006 explicitly,
+      * ActivateWindow() makes a window active and leaves everything above it
+        closed (Kodi pops the duplicate entry out of the history).
+    """
+
+    def __init__(self):
+        self.history = [WINDOW_HOME]
+
+    @property
+    def active(self):
+        return self.history[-1]
+
+    def activate(self, win):
+        if win == self.active:
+            return
+        self.history = [w for w in self.history if w != win]
+        self.history.append(win)
+
+    def previous(self):
+        if len(self.history) > 1:
+            self.history.pop()
+
+    def reset(self):
+        self.history = [WINDOW_HOME]
+
+
+_windows = _Windows()
+
+# A modal dialog (Kodi's Busy dialog is up during playback start) makes
+# CGUIWindowManager::ActivateWindow_Internal REFUSE the activation:
+#   "Activate of window 'X' refused because there are active modal dialogs"
+# The caller only learns by checking whether the window actually became active.
+_modal_dialogs = 0
+
+
+def set_modal_dialog(active):
+    """Model a modal dialog (DialogBusy) being up; ActivateWindow is refused."""
+    global _modal_dialogs
+    _modal_dialogs = 1 if active else 0
+
+
+def modal_dialog_active():
+    return _modal_dialogs > 0
+
 RESET_REQUESTS = queue.Queue()  # engine -> harness: url playing on fresh-Player Started
 
 _volume = 50
@@ -43,9 +107,12 @@ def _reset():
     BUILTIN.clear()
     JSONRPC.clear()
     MEDIA.clear()
-    global _volume, _muted
+    _windows.reset()
+    global _volume, _muted, SUPPRESS_PLAYER_CALLBACKS, _modal_dialogs
     _volume = 50
     _muted = False
+    SUPPRESS_PLAYER_CALLBACKS = False
+    _modal_dialogs = 0
 
 
 def _lookup_media(url):
@@ -62,11 +129,53 @@ def _lookup_media(url):
 
 def executebuiltin(cmd):
     BUILTIN.append(str(cmd))
+    _apply_window_builtin(str(cmd))
+
+
+def _apply_window_builtin(cmd):
+    """Model the window builtins the receiver uses (ActivateWindow only)."""
+    if not cmd.startswith("ActivateWindow("):
+        return
+    args = cmd[len("ActivateWindow("):].rstrip(")").split(",")
+    if not args:
+        return
+    target = args[0].strip()
+    win = None
+    if target.isdigit():
+        win = int(target)
+    elif target.lower() in ("visualisation", "visualization"):
+        win = WINDOW_VISUALISATION
+    elif target.lower() == "fullscreenvideo":
+        win = WINDOW_FULLSCREEN_VIDEO
+    elif target.lower() == "home":
+        win = WINDOW_HOME
+    if win is not None:
+        if _modal_dialogs and win != _windows.active:
+            # Real Kodi behaviour (GUIWindowManager::ActivateWindow_Internal):
+            # the activation is refused, not queued — the caller must retry.
+            log(f"Activate of window '{win}' refused because there are active modal dialogs",
+                LOG_INFO)
+            return
+        _windows.activate(win)
+
+
+def _active_window():
+    return _windows.active
+
+
+def window_is_active(win):
+    return _windows.active == win
 
 
 def getCondVisibility(cond):
     if cond == "Player.Paused":
         return bool(_engine and _engine.paused)
+    if cond == "Window.IsActive(visualisation)":
+        return _windows.active == WINDOW_VISUALISATION
+    if cond == "Window.IsActive(fullscreenvideo)":
+        return _windows.active == WINDOW_FULLSCREEN_VIDEO
+    if cond == "Window.IsActive(home)":
+        return _windows.active == WINDOW_HOME
     return False
 
 
@@ -190,6 +299,15 @@ class _Engine:
         self.events = queue.Queue()   # (event, url)
         self.event_log = []           # (event, url) as fired — assertion surface
         self.players = weakref.WeakSet()
+        # Device-observed race: when the audio player starts while the video
+        # player is still the active one, Kodi's PlaybackCleanup skips the
+        # fullscreen-video window cleanup (it only closes that window when the
+        # video player is already gone and the window is the active one). The
+        # stale 12005 then keeps rendering the video's last frame on top while
+        # the audio plays underneath. An explicit video stop before the audio
+        # play avoids it — that is what the receiver has to do.
+        self.stale_video_window_on_lane_switch = True
+        self._window_left_stale = False
         self._alive = threading.Event()
         self._alive.set()
         self._pump = threading.Thread(target=self._run, name="SimPlayerPump", daemon=True)
@@ -212,6 +330,10 @@ class _Engine:
             if event == "started":
                 # fresh-Player playback: ask holders of stale views to retire
                 RESET_REQUESTS.put(url)
+            if SUPPRESS_PLAYER_CALLBACKS:
+                # LibreELEC/Kodi 21 device behaviour: the service process gets
+                # no callbacks at all, so the receiver must poll for changes.
+                continue
             for p in list(self.players):
                 cb = getattr(p, f"onPlayBack{event.capitalize()}", None)
                 if cb is None:
@@ -224,6 +346,8 @@ class _Engine:
 
     def reset(self):
         self.start_latency = 0.0
+        self.stale_video_window_on_lane_switch = True
+        self._window_left_stale = False
         self.set_stopped()
         self.players.clear()
         self.event_log.clear()
@@ -239,11 +363,21 @@ class _Engine:
     # --- engine control ----------------------------------------------------
     def play_url(self, url, listitem=None):
         media = _lookup_media(url)
+        was_video = self.url is not None and not self.audio_only
+        audio = bool(media.get("audio", False))
+        if was_video and audio and self.stale_video_window_on_lane_switch:
+            # Lane switch with the video player still the active one: Kodi's
+            # window cleanup misses it (see the flag's comment) — 12005 stays
+            # on top until someone closes it.
+            self._window_left_stale = True
         self.url = str(url)
         self.listitem = listitem
-        self.audio_only = bool(media.get("audio", False))
+        self.audio_only = audio
         self.clock = SimulatedPlayback(media["duration"], rate=DEFAULT_RATE)
         self.clock.play()
+        if not audio:
+            # Kodi activates the fullscreen video window for a video item.
+            _windows.activate(WINDOW_FULLSCREEN_VIDEO)
         if self.start_latency > 0:
             def _go():
                 time.sleep(self.start_latency)
@@ -258,6 +392,11 @@ class _Engine:
         self.url = None
         self.listitem = None
         self.audio_only = False
+        # Kodi's PlaybackCleanup: leaving fullscreen video when it is the
+        # active window — unless the stale-switch race left it behind.
+        if _windows.active == WINDOW_FULLSCREEN_VIDEO and not self._window_left_stale:
+            _windows.previous()
+        self._window_left_stale = False
         pl = PlayList._instance
         if pl:
             pl._position = -1
@@ -292,17 +431,23 @@ class Player:
     def __init__(self):
         _engine.register(self)
 
-    def play(self, item=None, listitem=None, windowed=False, playlist=None, startpos=-1):
-        if playlist is not None:
-            pl = playlist if isinstance(playlist, PlayList) else PlayList._instance
+    def play(self, item=None, listitem=None, windowed=False, startpos=-1):
+        """Kodi's xbmc.Player.play(item, listitem=None, windowed=False, startpos=-1).
+
+        ``item`` may be a URL string or a PlayList (Kodi's ``playPlaylist``:
+        the item at ``startpos`` is played — the receiver relies on that for
+        the music-queue lane).
+        """
+        if item is None:
+            self.stop()
+            return
+        if isinstance(item, PlayList):
+            pl = item
             pos = int(startpos)
             if not (0 <= pos < pl.size()):
                 pos = 0
             pl._position = pos - 1  # advance_playlist() below brings it to pos
             _engine.advance_playlist()
-            return
-        if item is None:
-            self.stop()
             return
         _engine.play_url(item, listitem)
 

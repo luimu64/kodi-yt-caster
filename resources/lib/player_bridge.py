@@ -241,6 +241,7 @@ class KodiPlayerBridge:
                             self._sync_current_from_kodi()
                 except Exception as exc:
                     logger.warning("position_loop player poll failed: %s", exc)
+                self._repair_fullscreen_windows()
 
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
@@ -544,6 +545,13 @@ class KodiPlayerBridge:
             )
             if audio_mode:
                 playable_url = info["audio_url"]
+                # Lane switch video -> audio: close the video player ourselves
+                # before handing Kodi the audio play. Kodi's own cleanup only
+                # leaves fullscreen video when the video player is already gone
+                # (PlaybackCleanup), so a video still closing at this instant
+                # leaves the VideoFullScreen window rendering its last frame on
+                # top of the GUI while the audio plays underneath.
+                self._stop_video_player_for_audio()
 
             list_item = xbmcgui.ListItem(info.get("title", "YouTube Video"))
             if audio_mode:
@@ -799,24 +807,109 @@ class KodiPlayerBridge:
         except Exception:
             pass
 
+    def _stop_video_player_for_audio(self) -> None:
+        """Stop the video player before handing Kodi an audio-lane play.
+
+        Kodi only leaves the fullscreen video window when its own
+        PlaybackCleanup runs with the video player already gone; when the video
+        is still closing as the audio starts, that cleanup is skipped and the
+        VideoFullScreen window keeps rendering the video's last frame on top of
+        the GUI while the audio plays underneath. Stopping the video player
+        first makes the lane switch deterministic.
+        """
+        if not (KODI_AVAILABLE and self._kodi_player):
+            return
+        try:
+            if not self._kodi_player.isPlayingVideo():
+                return
+        except Exception:
+            return
+        logger.info("Lane switch to audio: stopping the video player first")
+        try:
+            self._kodi_player.stop()
+        except Exception:
+            logger.debug("video stop before audio failed", exc_info=True)
+            return
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                if not self._kodi_player.isPlayingVideo():
+                    break
+            except Exception:
+                break
+            time.sleep(0.1)
+
+    @staticmethod
+    def _visualisation_is_active() -> bool:
+        try:
+            return bool(xbmc.getCondVisibility("Window.IsActive(visualisation)"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _fullscreen_video_window_active() -> bool:
+        try:
+            return bool(xbmc.getCondVisibility("Window.IsActive(fullscreenvideo)"))
+        except Exception:
+            return False
+
     def _activate_visualizer(self) -> None:
-        """Route fullscreen video player to the music/visualisation window."""
+        """Route the GUI to the music/visualisation window (12006).
+
+        ActivateWindow is REFUSED while a modal dialog is up — and Kodi shows
+        its Busy dialog exactly during playback start, which is when this runs.
+        Firing it once and assuming success is why the visualiser sometimes
+        never appeared (the fullscreen video window stayed on top instead), so
+        verify the window is actually active and retry until it is.
+        """
         if not (KODI_AVAILABLE and xbmc):
             return
 
         def _run() -> None:
-            for _ in range(20):  # wait up to ~10s for playback start
+            deadline = time.monotonic() + 12.0  # wait for playback start + retries
+            while time.monotonic() < deadline:
                 try:
                     if self._kodi_player and self._kodi_player.isPlayingAudio():
                         # 12006 = music visualisation window (12005 is the
                         # fullscreen VIDEO window — that showed a frozen
                         # frame over the GUI).
                         xbmc.executebuiltin("ActivateWindow(12006)")
-                        return
+                        if self._visualisation_is_active():
+                            logger.info("Visualisation window active")
+                            return
+                        logger.info("ActivateWindow(12006) did not take (modal dialog?) — retrying")
                 except Exception:
                     pass
                 time.sleep(0.5)
+            logger.warning("Visualisation window never became active")
         threading.Thread(target=_run, daemon=True, name="VizActivator").start()
+
+    def _repair_fullscreen_windows(self) -> None:
+        """Keep the GUI window honest about what is playing.
+
+        The lane transition can leave Kodi showing the fullscreen video window
+        (last frame) while only the audio player runs — the audio player never
+        activates the visualisation window on its own (Kodi only requests
+        fullscreen for the first file of a music-playlist session), and the
+        window cleanup can be skipped when the video was still closing. When
+        that stale state is detected, put the visualisation window back on top.
+        """
+        if not (KODI_AVAILABLE and xbmc) or not self._kodi_player:
+            return
+        try:
+            if not self._kodi_player.isPlayingAudio():
+                return
+            if self._kodi_player.isPlayingVideo():
+                return  # a video is genuinely on screen
+            if not self._fullscreen_video_window_active():
+                return
+        except Exception:
+            return
+        logger.info("Stale fullscreen video window while audio plays — activating visualisation")
+        try:
+            xbmc.executebuiltin("ActivateWindow(12006)")
+        except Exception:
+            pass
 
     def _is_paused(self) -> bool:
         # xbmc.Player.isPlaying() returns True WHILE PAUSED, so it cannot
