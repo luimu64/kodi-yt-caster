@@ -98,6 +98,10 @@ def log(msg, level=LOG_INFO):
 
 def _reset():
     _engine.reset()
+    # The music playlist singleton outlives the engine: without clearing it a
+    # previous scenario's queue keeps auto-advancing into the next scenario.
+    if PlayList._instance is not None:
+        PlayList._instance.clear()
     while not RESET_REQUESTS.empty():
         try:
             RESET_REQUESTS.get_nowait()

@@ -8,7 +8,11 @@ playlist and playback carries sound.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +23,64 @@ logger = logging.getLogger("ytlounge.manifest_server")
 _MANIFESTS: Dict[str, str] = {}
 _LOCK = threading.Lock()
 _SERVER: Optional["ManifestServer"] = None
+
+# Out-of-process front end (http_child.py): the port Kodi talks to. Kodi STATs
+# the stopped item against it and blocks its player-stop handling on the answer,
+# while this addon's Python shares kodi.bin's interpreter with ~a dozen other
+# addons — a stall over there (observed 39s) stops an in-process server from
+# answering and freezes playback state. See http_child.py.
+_CHILD_PROC = None
+_CHILD_PORT: Optional[int] = None
+_CHILD_LOCK = threading.Lock()
+_SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+def _ensure_server():
+    """Start the in-process server (the child forwards dynamic paths to it)."""
+    global _SERVER
+    if _SERVER is None:
+        _SERVER = ManifestServer()
+        _SERVER.start()
+        logger.info("Manifest server listening on port %s", _SERVER.port)
+    return _SERVER
+
+
+def start_child() -> Optional[int]:
+    """Start the out-of-process HTTP front end; None if it could not start."""
+    global _CHILD_PROC, _CHILD_PORT
+    with _CHILD_LOCK:
+        if _CHILD_PORT:
+            return _CHILD_PORT
+        python = _SYSTEM_PYTHON if os.path.exists(_SYSTEM_PYTHON) else sys.executable
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "http_child.py")
+        try:
+            parent_port = _ensure_server().port
+            proc = subprocess.Popen(
+                [python, script, str(parent_port)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            line = proc.stdout.readline()
+            port = int(line.split()[1])
+            _CHILD_PROC, _CHILD_PORT = proc, port
+            logger.info("Out-of-process HTTP front end on port %s", port)
+            with _LOCK:
+                for name, body in list(_MANIFESTS.items()):
+                    _push_to_child(name, body)
+        except Exception:
+            logger.warning("HTTP front end failed to start; serving in-process",
+                           exc_info=True)
+            _CHILD_PROC, _CHILD_PORT = None, None
+        return _CHILD_PORT
+
+
+def _push_to_child(name: str, body: str) -> None:
+    if _CHILD_PROC is None or _CHILD_PROC.stdin is None:
+        return
+    try:
+        _CHILD_PROC.stdin.write(json.dumps({"name": name, "body": body}) + "\n")
+        _CHILD_PROC.stdin.flush()
+    except Exception:
+        logger.warning("HTTP front end gone; claiming in-process", exc_info=True)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -175,32 +237,53 @@ def fetch_manifest(url: str) -> str:
         return _MANIFESTS.get(name, "")
 
 
+def _child_alive() -> bool:
+    return bool(_CHILD_PORT) and _CHILD_PROC is not None and _CHILD_PROC.poll() is None
+
+
+def _public_port() -> Optional[int]:
+    """Port Kodi (and the plugin) should talk to: the front end, else in-process.
+
+    A dead front end must fall back immediately — handing Kodi a port nobody
+    serves would stop manifest fetches (and playback) altogether.
+    """
+    global _CHILD_PORT
+    if _child_alive():
+        return _CHILD_PORT
+    if _CHILD_PORT:
+        logger.warning("HTTP front end exited; falling back to the in-process server")
+        _CHILD_PORT = None
+    return _ensure_server().port
+
+
 def server_url_for(name: str) -> str:
     """Public helper: URL for a name without publishing manifest content."""
     global _SERVER
     if _SERVER is None:
-        publish("__warm__", "")  # boot the server
+        publish("__warm__", "")  # boot the servers
         with _LOCK:
             _MANIFESTS.pop("__warm__", None)
-    assert _SERVER is not None
-    return _SERVER.url_for(name)
+    if _CHILD_PORT is None:
+        start_child()   # the out-of-process front end owns the public port
+    return f"http://127.0.0.1:{_public_port() or _SERVER.port}/{name}"
 
 
 def publish(name: str, body: str) -> str:
     """Store a manifest and return its http URL, starting the server on first use."""
-    global _SERVER
-    if _SERVER is None:
-        _SERVER = ManifestServer()
-        _SERVER.start()
-        logger.info("Manifest server listening on port %s", _SERVER.port)
+    _ensure_server()
+    if _CHILD_PORT is None:
+        start_child()
     with _LOCK:
         _MANIFESTS.pop(name, None)
         while len(_MANIFESTS) >= 50:
             _MANIFESTS.pop(next(iter(_MANIFESTS)))
         _MANIFESTS[name] = body
-    return _SERVER.url_for(name)
+    _push_to_child(name, body)
+    return f"http://127.0.0.1:{_public_port()}/{name}"
 
 
 def server_port() -> Optional[int]:
-    """Port of the running manifest server (None if not started)."""
+    """Port that serves manifests (the out-of-process front end when it is up)."""
+    if _child_alive():
+        return _CHILD_PORT
     return _SERVER.port if _SERVER is not None else None
