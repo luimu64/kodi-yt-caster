@@ -9,12 +9,24 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .manifest_server import publish
 from . import ytdlp_inproc as inproc
 
 logger = logging.getLogger("ytlounge.ytdlp")
+
+# Loudness-normalization hook, set by service.py. Given a video id it returns
+# the localhost URL of a rendered normalized audio playlist, or None. When it
+# returns a URL, the master's default audio rendition points at our re-encoded
+# track instead of YouTube's — that is what normalizes a video-lane cast.
+_AUDIO_URI_PROVIDER: Optional[Callable[[str], Optional[str]]] = None
+
+
+def set_audio_uri_provider(fn: Optional[Callable[[str], Optional[str]]]) -> None:
+    global _AUDIO_URI_PROVIDER
+    _AUDIO_URI_PROVIDER = fn
+
 
 # ponytail: simple binary search ladder; bundled binary -> PATH -> common locations
 POSSIBLE_BIN_NAMES = ["yt-dlp", "yt-dlp.exe"]
@@ -167,8 +179,20 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
         is_default = "YES" if a is default_track else "NO"
         lang = str(a.get("language") or "").replace("-", "").replace("_", "") or "und"
         autoselect = "YES" if a is default_track else "NO"
+        uri = str(a["url"])
+        # Normalized audio for the default rendition only: the alternate tracks
+        # (dubs) keep YouTube's originals, matching the track the OSD shows as
+        # selected. See resources/lib/audio_norm.py.
+        if a is default_track and _AUDIO_URI_PROVIDER is not None:
+            try:
+                local = _AUDIO_URI_PROVIDER(video_id)
+            except Exception:
+                local = None
+                logger.debug("audio uri provider failed for %s", video_id, exc_info=True)
+            if local:
+                uri = local
         lines.append(
-            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",LANGUAGE="{lang}",DEFAULT={is_default},AUTOSELECT={autoselect},URI="{a["url"]}"'
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="{name}",LANGUAGE="{lang}",DEFAULT={is_default},AUTOSELECT={autoselect},URI="{uri}"'
         )
 
     # Sort video streams from highest to lowest resolution/bitrate

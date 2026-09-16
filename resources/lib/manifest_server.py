@@ -50,11 +50,18 @@ class _Handler(BaseHTTPRequestHandler):
         """
         started = time.monotonic()
         name = self.path.lstrip("/").split("?")[0]
+        # Kodi STATs the item it just stopped with a HEAD, and that call blocks
+        # its stop handling; log arrivals so a stall is attributable.
+        logger.info("HEAD %s", self.path)
+        # One request per connection: a pooled keep-alive connection would make
+        # this STAT queue behind whatever that thread is still doing.
+        self.close_connection = True
         if name.startswith("preload/") or name.startswith("resolve/"):
             # Dynamic endpoints: answer 200 with no length (STAT only needs the
             # headers; never trigger the fetch work for a HEAD).
             self.send_response(200)
             self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
             self.end_headers()
         else:
             body = self._manifest_body()
@@ -64,6 +71,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/vnd.apple.mpegurl")
                 self.send_header("Content-Length", str(len(body.encode("utf-8"))))
+                self.send_header("Connection", "close")
                 self.end_headers()
         elapsed = time.monotonic() - started
         if elapsed > 2.0:
@@ -75,6 +83,11 @@ class _Handler(BaseHTTPRequestHandler):
         if name.startswith("preload/"):
             from . import preloader
             preloader.handle_request(self, name[len("preload/"):])
+            self._log_if_slow(started)
+            return
+        if name.startswith("audio_norm/"):
+            from . import audio_norm
+            audio_norm.handle_request(self, name[len("audio_norm/"):])
             self._log_if_slow(started)
             return
         if name.startswith("resolve/"):
