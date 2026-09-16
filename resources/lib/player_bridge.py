@@ -12,6 +12,66 @@ from . import preloader
 
 logger = logging.getLogger("ytlounge.player")
 
+
+class PlayGate:
+    """Shared gate ensuring at most ONE stream resolve/start is in flight.
+
+    Module-level singleton: every command source (YouTube `cl`, YouTube
+    Music `m`, Kodi-UI queue picks, auto-advance, plugin resolves) funnels
+    through the same gate object, so a setPlaylist burst from one app can
+    never overlap a resolve from the other. The 2026-09-14 lag incident:
+    three concurrent yt-dlp subprocess launches on a 4-core Pi starved the
+    service process holding the manifest server's GIL, Kodi's curl timed
+    out STATing the localhost master for 20s+ and the player stalled.
+    A newer request BUMPS (release-and-preempt) an older one instead of
+    queueing blindly: the older work is worthless once a newer gen exists.
+    Yields the gate during the actual player.play() handoff so Kodi's own
+    demuxer open (which can call back into us) cannot self-deadlock.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._owner_gen = 0       # gen currently inside the gate (0 = idle)
+        self._requested_gen = 0   # highest play gen seen (supersede signal)
+        self._video_id: Optional[str] = None
+
+    def bump(self, gen: int) -> None:
+        """Announce a new play request generation (call before acquiring)."""
+        with self._cond:
+            if gen > self._requested_gen:
+                self._requested_gen = gen
+            self._cond.notify_all()
+
+    def acquire(self, gen: int, video_id: str, timeout: float = 90.0) -> bool:
+        """Block until this request is the newest one AND the gate is free.
+
+        Returns False if superseded by a newer generation while waiting.
+        """
+        with self._cond:
+            if gen > self._requested_gen:
+                self._requested_gen = gen
+            deadline = time.monotonic() + timeout
+            while self._owner_gen and self._owner_gen != gen:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning("PlayGate: wait timeout for gen=%s (%s)", gen, video_id)
+                    return False
+                self._cond.wait(timeout=min(remaining, 5.0))
+                if gen < self._requested_gen:
+                    return False  # superseded while waiting
+            self._owner_gen = gen
+            self._video_id = video_id
+            return True
+
+    def release(self, gen: int) -> None:
+        with self._cond:
+            if self._owner_gen == gen:
+                self._owner_gen = 0
+                self._video_id = None
+            self._cond.notify_all()
+
+PLAY_GATE = PlayGate()
+
 try:
     import xbmc
     import xbmcgui
@@ -80,6 +140,7 @@ class KodiPlayerBridge:
         # whose getTime() stops advancing.
         self._last_poll_time: Optional[int] = None
         self._stall_polls = 0
+        self._last_stall_time: Optional[int] = None
 
         if KODI_AVAILABLE:
             self._kodi_player = self._create_kodi_player()
@@ -147,14 +208,39 @@ class KodiPlayerBridge:
         while not self._monitor_stop.is_set():
             time.sleep(2.0)
             self._poll_pause_state()
-            if KODI_AVAILABLE and self._kodi_player and self.current_video_id:
+            # Track-change watchdog: on LibreELEC Kodi 21 the xbmc.Player
+            # callbacks (onPlayBackStarted etc.) are never delivered to this
+            # service process (verified on device — zero callbacks of any
+            # kind, ever). During a Kodi-native playlist auto-advance the
+            # bridge state stays PLAYING, so the `state != PLAYING` branch
+            # never fires and _sync_current_from_kodi() never adopts the new
+            # track — the phone keeps reporting the OLD video forever.
+            #
+            # Signal source (verified live via YTCAST-PROBE2 on Kodi 21.3
+            # LibreELEC): while playing, getPlayingFile() returns the FINAL
+            # resolved googlevideo URL (no video id), but the info label
+            # "Player.FileNameAndPath" still carries the plugin:// URL with
+            # ?play=<video_id>. Poll that label and adopt on change.
+            if KODI_AVAILABLE and self._kodi_player:
                 try:
                     if self._kodi_player.isPlaying():
+                        playing_url = None
+                        try:
+                            playing_url = xbmc.getInfoLabel("Player.FileNameAndPath")  # type: ignore[union-attr]
+                        except Exception:
+                            playing_url = None
+                        if playing_url and "play=" in playing_url:
+                            kodi_vid = playing_url.split("play=")[-1].split("&")[0]
+                            if kodi_vid and self.current_video_id and kodi_vid != self.current_video_id:
+                                logger.info(
+                                    "Track-change watchdog: Kodi playing %s, bridge at %s — adopting",
+                                    kodi_vid, self.current_video_id)
+                                self._sync_current_from_kodi(playing_url)
                         if self.state != PlayerState.PLAYING and not self._is_paused():
                             self.state = PlayerState.PLAYING
                             self._sync_current_from_kodi()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("position_loop player poll failed: %s", exc)
 
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
@@ -221,15 +307,24 @@ class KodiPlayerBridge:
             self._stall_polls += 1
         else:
             self._stall_polls = 0
+            self._last_stall_time = None
         self._last_poll_time = cur
         if self._stall_polls >= 2:
+            self._last_stall_time = cur
             if self.state != PlayerState.PAUSED:
                 logger.info("Pause detected via time-stall (t=%s x%s polls)", cur, self._stall_polls)
                 self._on_playback_paused()
         elif self._stall_polls == 0 and self.state == PlayerState.PAUSED:
             # Clock moving again while we believe paused: TV-side resume.
-            logger.info("Resume detected via time advance (t=%s)", cur)
-            self._on_playback_resumed()
+            # Require real progress (>= 2s past the stall timestamp): right
+            # after a pause command the Kodi audio engine is still draining
+            # its buffer and the clock can advance a beat before the pause
+            # bites — treating that as "resumed" flipped the bridge back to
+            # PLAYING and the phone spammed pause again (field flap).
+            base = self._last_stall_time
+            if base is None or cur >= base + 2:
+                logger.info("Resume detected via time advance (t=%s)", cur)
+                self._on_playback_resumed()
 
     def _resync_index(self) -> None:
         """Re-derive current_index from current_video_id after queue edits."""
@@ -285,6 +380,7 @@ class KodiPlayerBridge:
                 self._requested_id = target_id
                 self.pending_seek = current_time if current_time > 0 else None
                 self._play_gen += 1
+                PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
                 threading.Thread(target=self._play_video, args=(target_id, self._play_gen, self.current_theme), daemon=True).start()
 
     def update_playlist(self, data: Dict[str, Any]) -> None:
@@ -301,6 +397,7 @@ class KodiPlayerBridge:
             self.current_video_id = video_id
             self.pending_seek = seek_time if seek_time > 0 else None
             self._play_gen += 1
+            PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
             self._resync_index_locked()
             threading.Thread(target=self._play_video, args=(video_id, self._play_gen, theme), daemon=True).start()
 
@@ -358,6 +455,22 @@ class KodiPlayerBridge:
 
     def _play_video(self, video_id: str, gen: int, theme: Optional[str] = None) -> None:
         logger.info("TIMING %s: _play_video start (gen=%s)", video_id, gen)
+        # Shared gate: announce, then wait until we are the newest request AND
+        # no other stream is resolving/starting (covers YT + YT Music together).
+        PLAY_GATE.bump(gen)
+        if not PLAY_GATE.acquire(gen, video_id):
+            logger.info("Play request for %s superseded pre-resolve (gen=%s), dropping", video_id, gen)
+            with self._lock:
+                if gen == self._play_gen:
+                    self._requested_id = None
+            return
+        logger.info("TIMING %s: play gate acquired (gen=%s)", video_id, gen)
+        try:
+            self._play_video_locked(video_id, gen, theme)
+        finally:
+            PLAY_GATE.release(gen)
+
+    def _play_video_locked(self, video_id: str, gen: int, theme: Optional[str] = None) -> None:
         self._notify("YouTube Cast", "Loading video…")
         try:
             info = self.resolver.resolve(video_id)
@@ -757,6 +870,7 @@ class KodiPlayerBridge:
     def stop(self) -> None:
         with self._lock:
             self._play_gen += 1
+            PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
             self._active_gen = self._play_gen
             self._requested_id = None
             self.current_duration = 0
@@ -786,8 +900,13 @@ class KodiPlayerBridge:
         if KODI_AVAILABLE and self._kodi_player:
             try:
                 # isPlaying() is True while paused too, so getTime() works in
-                # both states. Gating on it returned 0 for paused audio and
-                # froze the phone's position display.
+                # both states (gating unconditionally returned 0 for paused
+                # audio and froze the phone's position display). But in the
+                # not-yet-loaded / just-stopped window getTime() raises
+                # "Kodi is not playing any media file" (visible in kodi.log
+                # as EXCEPTION lines), so only gate on the cover-state here.
+                if not self._kodi_player.isPlaying():
+                    return 0
                 return int(self._kodi_player.getTime())
             except Exception:
                 return 0
@@ -908,22 +1027,32 @@ class KodiPlayerBridge:
                 except Exception:
                     pass
 
-    def _sync_current_from_kodi(self) -> bool:
+    def _sync_current_from_kodi(self, playing_url: Optional[str] = None) -> bool:
         """Align bridge state with what Kodi is actually playing.
 
         Returns True if the playing item differs from current_video_id.
+
+        playing_url: optional pre-fetched URL (probe callers pass the
+        info-label value here — on Kodi 21 getPlayingFile() returns the final
+        googlevideo URL without the video id, so it cannot parse a vid).
         """
         if not (KODI_AVAILABLE and self._kodi_player):
             return False
-        try:
-            playing_file = self._kodi_player.getPlayingFile()
-        except Exception:
-            return False
-        if not playing_file or "play=" not in playing_file:
+        if playing_url is None:
+            try:
+                playing_url = xbmc.getInfoLabel("Player.FileNameAndPath")
+            except Exception:
+                playing_url = None
+            if not playing_url:
+                try:
+                    playing_url = self._kodi_player.getPlayingFile()
+                except Exception:
+                    return False
+        if not playing_url or "play=" not in playing_url:
             return False
         import urllib.parse
         try:
-            qs = urllib.parse.urlparse(playing_file).query
+            qs = urllib.parse.urlparse(playing_url).query
             vid = dict(urllib.parse.parse_qsl(qs)).get("play")
         except Exception:
             return False
@@ -937,6 +1066,7 @@ class KodiPlayerBridge:
             if self.playlist and vid in self.playlist:
                 self.current_index = self.playlist.index(vid)
             self._play_gen += 1
+            PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
             self._active_gen = self._play_gen
         # Duration unknown until resolve; refresh it (and the preload chain)
         # in the background without blocking the state reports below.
@@ -1071,6 +1201,7 @@ class KodiPlayerBridge:
                     self._requested_id = next_id
                     logger.info("Auto-advancing to next video: %s", next_id)
                     self._play_gen += 1
+                    PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
                     threading.Thread(target=self._play_video, args=(next_id, self._play_gen, self.current_theme), daemon=True).start()
                 else:
                     logger.debug("Ended after manual skip to %s; Kodi already playing it",
