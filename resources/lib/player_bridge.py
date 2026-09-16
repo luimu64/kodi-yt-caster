@@ -72,6 +72,10 @@ class PlayGate:
 
 PLAY_GATE = PlayGate()
 
+# Preload proxying: serve media segments from this process's localhost server.
+# OFF on purpose — see the comment at its use site in _play_video_locked.
+PRELOAD_PROXY_ENABLED = False
+
 try:
     import xbmc
     import xbmcgui
@@ -212,8 +216,13 @@ class KodiPlayerBridge:
         self._monitor_stop.set()
 
     def _position_loop(self) -> None:
+        last_wake = time.monotonic()
         while not self._monitor_stop.is_set():
             time.sleep(2.0)
+            drift = time.monotonic() - last_wake - 2.0
+            last_wake = time.monotonic()
+            if drift > 5.0:
+                self._dump_thread_stacks(drift)
             self._poll_pause_state()
             # Track-change watchdog: on LibreELEC Kodi 21 the xbmc.Player
             # callbacks (onPlayBackStarted etc.) are never delivered to this
@@ -482,6 +491,10 @@ class KodiPlayerBridge:
                 delay = self._transition_remaining()
                 if delay > 0:
                     time.sleep(min(delay, 12.0))
+                if not PRELOAD_PROXY_ENABLED:
+                    # Proxy disabled: nothing will serve these segments, so
+                    # don't burn the CPU (and the interpreter) fetching them.
+                    return
                 preloader.preload(next_id, info)
             except Exception:
                 logger.debug("Prefetch of %s failed", next_id, exc_info=True)
@@ -534,7 +547,15 @@ class KodiPlayerBridge:
         # If the next-item preload already cached this stream's prefix, play
         # through the local proxy: instant startup, seamless remote splice.
         try:
-            proxied = preloader.proxy_url(video_id, info)
+            # Preload proxying is deliberately OFF: serving segment traffic from
+            # this process let our HTTP server block on a slow remote fetch while
+            # Kodi's post-stop STAT (a HEAD to the same server) waited behind it.
+            # A stalled STAT delays OnPlayBackStopped/PlaybackCleanup, and that is
+            # what left a stopped video's last frame on screen with the next item
+            # never starting. The video lane now plays the localhost master
+            # manifest (a few hundred bytes, static) and Kodi fetches the media
+            # straight from the CDN.
+            proxied = preloader.proxy_url(video_id, info) if PRELOAD_PROXY_ENABLED else None
         except Exception:
             proxied = None
         if proxied:
@@ -932,6 +953,25 @@ class KodiPlayerBridge:
                 time.sleep(0.5)
             logger.warning("Visualisation window never became active")
         threading.Thread(target=_run, daemon=True, name="VizActivator").start()
+
+    @staticmethod
+    def _dump_thread_stacks(drift: float) -> None:
+        """Log every thread stack when this process was starved of the GIL.
+
+        A starved interpreter makes the localhost manifest server stop
+        answering; Kodi's post-stop STAT then times out, the video player never
+        finishes closing, PlaybackCleanup never starts the pending item, and the
+        stopped video's last frame stays on screen. This dump names the hog.
+        """
+        try:
+            import sys
+            import traceback
+            logger.warning("Monitor loop starved %.1fs - thread stacks:", drift)
+            for tid, frame in sys._current_frames().items():
+                logger.warning("thread %s:\n%s", tid,
+                               "".join(traceback.format_stack(frame)[-5:]))
+        except Exception:
+            pass
 
     def _repair_fullscreen_windows(self) -> None:
         """Keep the GUI window honest about what is playing.
