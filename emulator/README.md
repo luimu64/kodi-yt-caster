@@ -53,6 +53,13 @@ listener needs ~62s of backoff; scenarios drive `on_token_expired` directly).
 3. `KodiPlayerBridge._fetch_title_sync` → instant fake titles (no oEmbed network).
 4. `ytdlp_downloader.download_ytdlp` → no-op (fake binary pre-placed in the
    stub profile instead).
+5. `audio_norm.set_test_runner` + `audio_norm.fetch_ffmpeg` (scenario-armed, see
+   `scenarios/test_audio_norm.py`): replaces the ffmpeg subprocess and the
+   120 MB binary download. A real render is 30 s+ of CPU per track on a Pi and
+   needs the network, so the runner returns a canned ebur128 summary for the
+   measurement pass and writes the artifact files for the encode/segment
+   passes. Arm it BEFORE the scenario boots — the service kicks an ffmpeg
+   download during bootstrap.
 
 ## Notes for scenario authors
 

@@ -268,6 +268,16 @@ def server_url_for(name: str) -> str:
     return f"http://127.0.0.1:{_public_port() or _SERVER.port}/{name}"
 
 
+def public_base_url() -> str:
+    """Base URL of the port Kodi talks to (the front end, else in-process).
+
+    Generated playlists must address their segments on that same origin: Kodi
+    fetches the master from this port, so the media it references has to live
+    here too (the front end forwards those paths to this process).
+    """
+    return f"http://127.0.0.1:{_public_port() or _ensure_server().port}/"
+
+
 def publish(name: str, body: str) -> str:
     """Store a manifest and return its http URL, starting the server on first use."""
     _ensure_server()

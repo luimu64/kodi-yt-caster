@@ -41,6 +41,7 @@ from resources.lib.lounge.session import LoungeSession
 from resources.lib.lounge.listener import CommandDispatcher, LoungeListener
 from resources.lib.player_bridge import KodiPlayerBridge
 from resources.lib.resolver import VideoResolver
+from resources.lib import audio_norm
 from resources.lib.audio_norm import AudioNormalizer
 from resources.lib.ytdlp_bridge import YtDlpBridge, find_ytdlp_binary
 from resources.lib.ytdlp_downloader import ensure_ytdlp, download_ytdlp
@@ -302,6 +303,9 @@ def run_service() -> None:
                 notify=_notify_normalizer,
             )
             components["normalizer"] = normalizer
+            # The manifest server serves /audio_norm/ artifacts from this
+            # instance (module-level handle: the request runs on an HTTP thread).
+            audio_norm.set_instance(normalizer)
             if normalizer.enabled:
                 normalizer.start()
                 # ffmpeg is required for any of this and is not shipped in the

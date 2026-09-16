@@ -67,16 +67,25 @@ class Handler(BaseHTTPRequestHandler):
         logger.debug(fmt % args)
 
     def _forward(self):
-        """Proxy /resolve, /preload, ... to the parent's in-process server."""
+        """Proxy /resolve, /preload, /audio_norm, ... to the parent's server."""
         url = f"http://127.0.0.1:{PARENT_PORT}{self.path}"
         try:
             req = urllib.request.Request(url, method=self.command)
+            # Byte ranges must survive the hop: a normalized audio track is a
+            # single file served with Range support, and Kodi seeks in it.
+            rng = self.headers.get("Range") if self.headers else None
+            if rng:
+                req.add_header("Range", rng)
             with urllib.request.urlopen(req, timeout=120) as resp:
                 body = resp.read()
                 self.send_response(resp.status)
                 ctype = resp.headers.get("Content-Type", "application/json")
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
+                for header in ("Content-Range", "Accept-Ranges"):
+                    value = resp.headers.get(header)
+                    if value:
+                        self.send_header(header, value)
                 self.send_header("Connection", "close")
                 self.end_headers()
                 if self.command != "HEAD":
@@ -98,7 +107,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _local(self):
         name = self.path.lstrip("/").split("?")[0]
-        if name.startswith("preload/") or name.startswith("resolve/"):
+        if (name.startswith("preload/") or name.startswith("resolve/")
+                or name.startswith("audio_norm/")):
             self._forward()
             return
         started = time.monotonic()

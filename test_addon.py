@@ -457,6 +457,205 @@ def test_pause_and_resume_reporting():
     assert any(a[0] == "nowPlaying" and a[1]["state"] == "1" for a in actions)
 
 
+def test_audio_normalization_ebur128_parsing():
+    """Integrated loudness + true peak come out of ffmpeg's ebur128 summary."""
+    from resources.lib.audio_norm import parse_ebur128
+
+    sample = """
+[Parsed_ebur128_0 @ 0x55a8138280] Summary:
+
+  Integrated loudness:
+    I:         -13.7 LUFS
+    Threshold: -23.7 LUFS
+
+  Loudness range:
+    LRA:         5.0 LU
+    Threshold: -33.2 LUFS
+    LRA low:   -15.8 LUFS
+    LRA high:  -10.8 LUFS
+
+  True peak:
+    Peak:       -0.4 dBFS
+"""
+    assert parse_ebur128(sample) == (-13.7, -0.4)
+    # No summary at all (filter never ran, ffmpeg died): skip, do not guess.
+    assert parse_ebur128("") is None
+    assert parse_ebur128("[hls] Opening 'https://x/y.m3u8' for reading") is None
+
+
+def test_audio_normalization_gain_math():
+    """Gain is target-relative, peak-guarded and boost-capped."""
+    from resources.lib.audio_norm import compute_gain_db
+
+    # Ample headroom: the cut is applied in full.
+    assert compute_gain_db(-10.0, -3.0, target_lufs=-14.0) == -4.0
+    # Modern YouTube master (-13.7 LUFS): a small trim, but its true peak is
+    # already at -0.4 dBTP, so the guard binds first (-1.0 - (-0.4) = -0.6).
+    assert compute_gain_db(-13.7, -0.4, target_lufs=-14.0) == -0.6
+    # A quiet upload is boosted only as far as its headroom allows
+    # (-1.0 - (-6.0) = 5 dB), not all the way to the target.
+    assert compute_gain_db(-24.0, -6.0, target_lufs=-14.0, max_gain_db=12.0) == 5.0
+    # Very quiet with lots of headroom: the boost cap binds (no noise lift).
+    assert compute_gain_db(-40.0, -20.0, target_lufs=-14.0, max_gain_db=12.0) == 12.0
+    # Garbage measurement is not a reason to change anything.
+    assert compute_gain_db(None, None) == 0.0
+
+
+def test_audio_normalization_artifact_paths():
+    """Only the generated artifact names are servable — no path traversal."""
+    import tempfile
+    from resources.lib.audio_norm import AudioNormalizer
+
+    with tempfile.TemporaryDirectory() as cache:
+        norm = AudioNormalizer(cache_dir=cache)
+        os.makedirs(os.path.join(cache, "abc"), exist_ok=True)
+        with open(os.path.join(cache, "abc", "audio.m3u8"), "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\nseg0000.ts\n")
+        assert norm.file_path("abc", "audio.m3u8") is not None
+        assert norm.file_path("abc", "../../etc/passwd") is None
+        assert norm.file_path("abc", "..%2fpasswd") is None
+        assert norm.file_path("..", "audio.m3u8") is None
+        # meta.json is not a playlist: not in the allowlist of servable names.
+        assert norm.file_path("abc", "meta.json") is None
+        # Playlist without the progressive track is not a usable artifact.
+        assert norm.has_artifact("abc") is False
+
+        # Playlist segment URLs are absolute on the origin Kodi talks to.
+        body = norm.playlist_body("abc", "http://127.0.0.1:1234/")
+        assert "http://127.0.0.1:1234/audio_norm/abc/seg0000.ts" in body
+
+
+def test_audio_normalization_range_parsing():
+    from resources.lib.audio_norm import _parse_range
+
+    assert _parse_range("bytes=0-99", 1000) == (0, 99)
+    assert _parse_range("bytes=100-", 1000) == (100, 999)
+    assert _parse_range("bytes=-100", 1000) == (900, 999)
+    assert _parse_range("bytes=4000-", 1000) is None
+    assert _parse_range("nonsense", 1000) is None
+
+
+def test_audio_normalization_master_retarget():
+    """A video-lane master hands its DEFAULT audio rendition to the normalized
+    track once it exists; alternate (dub) renditions stay on YouTube."""
+    from resources.lib import manifest_server as manifest_server_mod
+    from resources.lib.resolver import VideoResolver
+
+    class _Norm:
+        enabled = True
+
+        def has_artifact(self, video_id):
+            return True
+
+        def progressive_url(self, video_id):
+            return f"http://127.0.0.1:9/audio_norm/{video_id}/norm.m4a"
+
+        def local_playlist_url(self, video_id):
+            return f"http://127.0.0.1:9/audio_norm/{video_id}/audio.m3u8"
+
+        def request(self, *args, **kwargs):
+            raise AssertionError("artifact exists: must not queue a render")
+
+    body = "\n".join([
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Original",LANGUAGE="en",'
+        'DEFAULT=YES,AUTOSELECT=YES,URI="https://remote.example/audio.m3u8"',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Bengali",LANGUAGE="bn",'
+        'DEFAULT=NO,AUTOSELECT=NO,URI="https://remote.example/dub.m3u8"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO="audio"',
+        "https://remote.example/video.m3u8",
+    ])
+    url = manifest_server_mod.publish("yt_retarget1.m3u8", body)
+    resolver = VideoResolver(bridge=object(), normalizer=_Norm())
+    info = {
+        "id": "retarget1",
+        "stream_type": "hls_master",
+        "playable_url": url,
+        "audio_url": "https://remote.example/audio.m4a",
+        "duration": 60,
+    }
+
+    out = resolver._with_audio("retarget1", info)
+    assert out["audio_normalized"] is True
+    assert out["audio_url"] == "http://127.0.0.1:9/audio_norm/retarget1/norm.m4a"
+
+    patched = manifest_server_mod.fetch_manifest(url)
+    assert 'URI="http://127.0.0.1:9/audio_norm/retarget1/audio.m3u8"' in patched
+    assert "dub.m3u8" in patched                 # dubs untouched
+    assert patched.count("/audio_norm/") == 1    # only the default rendition
+    # Idempotent: nothing to change on a second resolve.
+    assert resolver._retarget_master_audio("retarget1", info) is False
+
+
+def test_audio_normalization_never_blocks_resolve():
+    """No artifact yet: the render is queued and the original audio is used."""
+    from resources.lib.resolver import VideoResolver
+
+    queued = []
+
+    class _Norm:
+        enabled = True
+
+        def has_artifact(self, video_id):
+            return False
+
+        def progressive_url(self, video_id):
+            raise AssertionError("must not be consulted without an artifact")
+
+        def request(self, video_id, source_url, duration):
+            queued.append((video_id, source_url, duration))
+            return True
+
+    resolver = VideoResolver(bridge=object(), normalizer=_Norm())
+    info = {
+        "id": "cold1",
+        "stream_type": "dash",
+        "playable_url": "https://remote.example/x.mpd",
+        "audio_url": "https://remote.example/audio.m4a",
+        "duration": 120,
+    }
+    out = resolver._with_audio("cold1", info)
+    assert out is info                      # original info, untouched
+    assert queued == [("cold1", "https://remote.example/audio.m4a", 120)]
+
+
+def test_audio_normalization_disabled_is_inert():
+    """Disabled (or absent normalizer): the resolver is a pass-through."""
+    from resources.lib.resolver import VideoResolver
+
+    class _Off:
+        enabled = False
+
+        def __getattr__(self, name):
+            raise AssertionError(f"disabled normalizer touched: {name}")
+
+    info = {"id": "off1", "audio_url": "https://remote.example/a.m4a", "duration": 10}
+    assert VideoResolver(bridge=object(), normalizer=_Off())._with_audio("off1", info) is info
+    assert VideoResolver(bridge=object())._with_audio("off1", info) is info
+
+
+def test_handoff_pending_gate():
+    """The normalizer holds its ffmpeg child while a handoff is in flight."""
+    player = KodiPlayerBridge(session=LoungeSession("s1", "t1", "d1"))
+    assert player.handoff_pending() is False
+    player._begin_transition(1.0)
+    assert player.handoff_pending() is True
+
+
+def test_audio_normalization_hold_check_is_fault_tolerant():
+    """A throwing hold predicate must not kill the render."""
+    import tempfile
+    from resources.lib.audio_norm import AudioNormalizer
+
+    def _boom():
+        raise RuntimeError("hold check exploded")
+
+    with tempfile.TemporaryDirectory() as cache:
+        norm = AudioNormalizer(cache_dir=cache, hold_check=_boom)
+        assert norm._hold_now() is False
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_frame_parsing_chunked()
@@ -477,4 +676,13 @@ if __name__ == "__main__":
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
     test_pause_and_resume_reporting()
+    test_audio_normalization_ebur128_parsing()
+    test_audio_normalization_gain_math()
+    test_audio_normalization_artifact_paths()
+    test_audio_normalization_range_parsing()
+    test_audio_normalization_master_retarget()
+    test_audio_normalization_never_blocks_resolve()
+    test_audio_normalization_disabled_is_inert()
+    test_handoff_pending_gate()
+    test_audio_normalization_hold_check_is_fault_tolerant()
     print("All unit tests passed successfully.")

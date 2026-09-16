@@ -64,10 +64,10 @@ _PEAK_RE = re.compile(r"^\s*Peak:\s*(-?\d+(?:\.\d+)?)\s*dBFS", re.MULTILINE)
 
 # Injected by the emulator (see emulator/README.md): replaces the ffmpeg
 # subprocess so scenarios stay offline and deterministic.
-_RUNNER: Optional[Callable[..., bool]] = None
+_RUNNER: Optional[Callable[..., Any]] = None
 
 
-def set_test_runner(fn: Optional[Callable[..., bool]]) -> None:
+def set_test_runner(fn: Optional[Callable[..., Any]]) -> None:
     global _RUNNER
     _RUNNER = fn
 
@@ -311,6 +311,14 @@ class AudioNormalizer:
         """
         self._hold_check = fn
 
+    def _hold_now(self) -> bool:
+        """Is a playback handoff in flight? A broken predicate never stops a render."""
+        try:
+            return bool(self._hold_check and self._hold_check())
+        except Exception:
+            logger.debug("hold check failed", exc_info=True)
+            return False
+
     # ------------------------------------------------------------ artifacts
     def dir_for(self, video_id: str) -> str:
         return os.path.join(self.cache_dir, video_id) if self.cache_dir else ""
@@ -420,6 +428,9 @@ class AudioNormalizer:
                     self._render(video_id, source)
             except Exception:
                 logger.warning("Audio normalization failed for %s", video_id, exc_info=True)
+                # Never leave a half-written artifact behind: it would look
+                # like a usable render to the cache trim and to a reader.
+                shutil.rmtree(self.dir_for(video_id) + ".part", ignore_errors=True)
             finally:
                 with self._cv:
                     self._running_id = None
@@ -523,7 +534,12 @@ class AudioNormalizer:
     def _run_capture(self, ffmpeg: str, args: List[str]) -> Optional[str]:
         """Run ffmpeg, holding it with SIGSTOP while a handoff is in flight."""
         if _RUNNER is not None:
-            return "" if _RUNNER(ffmpeg, list(args)) else None
+            # Test runner contract: return the ffmpeg stderr text on success
+            # (so a measurement can be stubbed), None/False on failure.
+            result = _RUNNER(ffmpeg, list(args))
+            if result is None or result is False:
+                return None
+            return result if isinstance(result, str) else ""
         try:
             proc = subprocess.Popen(
                 args,
@@ -541,7 +557,7 @@ class AudioNormalizer:
                     _, err = proc.communicate(timeout=0.5)
                     break
                 except subprocess.TimeoutExpired:
-                    desired = bool(self._hold_check and self._hold_check())
+                    desired = self._hold_now()
                     if desired and not held:
                         _signal(proc, signal.SIGSTOP)
                         held = True
@@ -711,7 +727,17 @@ def handle_request(handler, path: str) -> None:
 
 
 def _base_url(handler) -> str:
-    return f"http://127.0.0.1:{handler.server.server_address[1]}/"
+    """Origin Kodi talks to — the out-of-process front end when it is up.
+
+    The playlist is fetched from that port, so its segment URLs must use the
+    same origin (the front end forwards /audio_norm/ back to this process).
+    """
+    try:
+        from .manifest_server import public_base_url
+
+        return public_base_url()
+    except Exception:
+        return f"http://127.0.0.1:{handler.server.server_address[1]}/"
 
 
 def _serve_file(handler, path: str, name: str) -> None:
