@@ -444,6 +444,15 @@ class KodiPlayerBridge:
     def _transition_remaining(self) -> float:
         return max(0.0, self._transition_until - time.monotonic())
 
+    def handoff_pending(self) -> bool:
+        """True while a playback handoff is in flight.
+
+        Public because the audio normalizer holds its ffmpeg child while this
+        is set: heavy work in this process starves the localhost server Kodi
+        STATs the outgoing file against, which stalls the handoff itself.
+        """
+        return self._transition_remaining() > 0.0
+
     def _kick_prefetch(self) -> None:
         """Resolve the next queue item in the background (populates the resolver cache)."""
         with self._lock:

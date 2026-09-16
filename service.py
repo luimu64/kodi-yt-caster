@@ -41,6 +41,7 @@ from resources.lib.lounge.session import LoungeSession
 from resources.lib.lounge.listener import CommandDispatcher, LoungeListener
 from resources.lib.player_bridge import KodiPlayerBridge
 from resources.lib.resolver import VideoResolver
+from resources.lib.audio_norm import AudioNormalizer
 from resources.lib.ytdlp_bridge import YtDlpBridge, find_ytdlp_binary
 from resources.lib.ytdlp_downloader import ensure_ytdlp, download_ytdlp
 from resources.lib.ui.pairing_dialog import PairingDialog
@@ -116,6 +117,17 @@ def _profile_dirs() -> list:
     return dirs
 
 
+def _notify_normalizer(title: str, message: str, error: bool = False) -> None:
+    """Kodi notification from the normalization worker (never raises)."""
+    try:
+        if KODI_AVAILABLE and xbmcgui:
+            icon = xbmcgui.NOTIFICATION_ERROR if error else xbmcgui.NOTIFICATION_INFO
+            xbmcgui.Dialog().notification(title, message, icon, 5000)
+        log_kodi(f"{title}: {message}", 1)
+    except Exception:
+        pass
+
+
 def run_service() -> None:
     # Check if triggered as script action (e.g. RunScript for manual update)
     if len(sys.argv) > 1 and sys.argv[1] in ("update_ytdlp", "--update-ytdlp"):
@@ -147,6 +159,18 @@ def run_service() -> None:
     max_resolution = get_setting("max_resolution", "auto")
     music_visualizer = get_setting("music_visualizer", "auto")
     enable_discovery = get_setting_bool("enable_discovery", True)
+
+    # Loudness normalization (resources/lib/audio_norm.py). Read lazily through
+    # this closure so a settings change is picked up without a service restart.
+    def audio_settings() -> dict:
+        return {
+            "audio_normalize": get_setting_bool("audio_normalize", True),
+            "audio_norm_target": get_setting("audio_norm_target", "-14"),
+            "audio_norm_max_gain": get_setting("audio_norm_max_gain", "12"),
+            "audio_norm_max_minutes": get_setting("audio_norm_max_minutes", "20"),
+            "ffmpeg_path": get_setting("ffmpeg_path", ""),
+        }
+
     try:
         dial_port = int(get_setting("dial_port", "8008") or 8008)
     except (TypeError, ValueError):
@@ -179,7 +203,10 @@ def run_service() -> None:
         ssdp = components.get("ssdp")
         listener_cl = components.get("listener_cl")
         listener_m = components.get("listener_m")
+        normalizer = components.get("normalizer")
         try:
+            if normalizer:
+                normalizer.stop()
             if dial:
                 dial.stop()
             if ssdp:
@@ -262,7 +289,31 @@ def run_service() -> None:
             # Initialize resolver and player
             ytdlp_bin = find_ytdlp_binary(custom_ytdlp)
             bridge = YtDlpBridge(binary_path=ytdlp_bin, cookies_path=custom_cookies or None)
-            resolver = VideoResolver(bridge=bridge)
+
+            # Loudness normalization: one background worker plus a per-video
+            # artifact cache. The resolver feeds it every resolved item and
+            # swaps in the rendered audio on the next resolve; the video lane's
+            # generated master gets its audio rendition retargeted in place.
+            profile = _profile_dirs()[0]
+            normalizer = AudioNormalizer(
+                settings=audio_settings,
+                cache_dir=os.path.join(profile, "audio_norm"),
+                fetch_dir=os.path.join(profile, "bin"),
+                notify=_notify_normalizer,
+            )
+            components["normalizer"] = normalizer
+            if normalizer.enabled:
+                normalizer.start()
+                # ffmpeg is required for any of this and is not shipped in the
+                # repo (Kodi on LibreELEC has no ffmpeg CLI): fetch it once, in
+                # the background, so the first cast can already be normalized.
+                if normalizer.ffmpeg_path() is None:
+                    log_kodi("Audio normalization: fetching ffmpeg in the background", 1)
+                    normalizer.ensure_ffmpeg()
+            else:
+                log_kodi("Audio normalization disabled in addon settings", 1)
+
+            resolver = VideoResolver(bridge=bridge, normalizer=normalizer)
             player = KodiPlayerBridge(
                 session=sessions,
                 resolver=resolver,
@@ -271,6 +322,7 @@ def run_service() -> None:
                 music_visualizer=music_visualizer,
             )
             player.start_monitor()
+            normalizer.set_hold_check(player.handoff_pending)
 
             # Let plugin invocations resolve queue items against our warm caches.
             from resources.lib import manifest_server

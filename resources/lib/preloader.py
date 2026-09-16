@@ -138,6 +138,16 @@ def _abs(base_url: str, url: str) -> str:
     return urllib.parse.urljoin(base_url, url)
 
 
+def _is_normalized_audio_uri(url: str) -> bool:
+    """True for the loudness-normalized audio rendition served by this addon.
+
+    Such a URI is already local (the manifest server serves it straight from the
+    rendered artifact), so the master rewrite leaves it untouched: proxying it
+    through /preload would only add a hop and pin its segments in memory.
+    """
+    return "/audio_norm/" in url
+
+
 def rewrite_master(body: str, video_id: str) -> Tuple[str, List[str]]:
     """Rewrite a master playlist's media-playlist URLs (variant lines and
     EXT-X-MEDIA URI= attributes) to local /preload/<vid>/<vkey> URLs.
@@ -158,6 +168,9 @@ def rewrite_master(body: str, video_id: str) -> Tuple[str, List[str]]:
             u = rest.split('"', 2)
             if len(u) >= 2:
                 remote = _abs("", u[1])
+                if _is_normalized_audio_uri(remote):
+                    out.append(line)
+                    continue
                 urls.append(remote)
                 out.append(pre + "URI=" + '"' + _local(remote) + '"' + u[2] if len(u) > 2 else pre + "URI=" + '"' + _local(remote) + '"')
                 continue

@@ -89,6 +89,38 @@ def action_update_ytdlp() -> None:
         print(f"Error updating yt-dlp: {e}", file=sys.stderr)
 
 
+def action_fetch_ffmpeg() -> None:
+    """Download the static ffmpeg build used for audio normalization."""
+    from resources.lib.audio_norm import fetch_ffmpeg
+
+    def notify(title: str, message: str, error: bool = False) -> None:
+        if KODI_AVAILABLE and xbmcgui:
+            icon = xbmcgui.NOTIFICATION_ERROR if error else xbmcgui.NOTIFICATION_INFO
+            xbmcgui.Dialog().notification(title, message, icon, 5000)
+        print(f"{title}: {message}", file=sys.stderr)
+
+    profile = _profile_dir()
+    existing = os.path.join(profile, "bin", "ffmpeg")
+    if os.path.exists(existing):
+        notify("YouTube Cast", "ffmpeg is already installed")
+        return
+    notify("YouTube Cast", "Downloading ffmpeg (about 120 MB)…")
+    result = fetch_ffmpeg(os.path.join(profile, "bin"), notify=notify)
+    if result:
+        notify("YouTube Cast", "Audio normalization is ready")
+    elif not KODI_AVAILABLE:
+        print("ffmpeg download failed", file=sys.stderr)
+
+
+def _profile_dir() -> str:
+    try:
+        import xbmcaddon
+        import xbmcvfs
+        return xbmcvfs.translatePath(xbmcaddon.Addon().getAddonInfo("profile"))
+    except Exception:
+        return ADDON_ROOT
+
+
 def main() -> None:
     action = sys.argv[1] if len(sys.argv) > 1 else "show_pairing"
 

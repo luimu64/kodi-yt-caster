@@ -87,6 +87,45 @@
                     </constraints>
                     <control type="spinner" format="string"/>
                 </setting>
+                <setting id="audio_normalize" type="boolean" label="30044" help="30045">
+                    <default>true</default>
+                    <control type="toggle"/>
+                </setting>
+                <setting id="audio_norm_target" type="integer" label="30046" help="30047">
+                    <default>-14</default>
+                    <constraints>
+                        <minimum>-30</minimum>
+                        <step>1</step>
+                        <maximum>-6</maximum>
+                    </constraints>
+                    <control type="slider" format="integer"/>
+                </setting>
+                <setting id="audio_norm_max_gain" type="integer" label="30048" help="30049">
+                    <default>12</default>
+                    <constraints>
+                        <minimum>0</minimum>
+                        <step>1</step>
+                        <maximum>24</maximum>
+                    </constraints>
+                    <control type="slider" format="integer"/>
+                </setting>
+                <setting id="audio_norm_max_minutes" type="integer" label="30050" help="30051">
+                    <default>20</default>
+                    <constraints>
+                        <minimum>1</minimum>
+                        <step>5</step>
+                        <maximum>180</maximum>
+                    </constraints>
+                    <control type="slider" format="integer"/>
+                </setting>
+                <setting id="fetch_ffmpeg_btn" type="action" label="30052" help="30053">
+                    <level>0</level>
+                    <data>RunScript(plugin.service.ytlounge-cast,fetch_ffmpeg)</data>
+                    <control type="button" format="action"/>
+                </setting>
+                <setting id="ffmpeg_path" type="string" label="30054" help="30055">
+                    <control type="edit" format="string"/>
+                </setting>
                 <setting id="ytdlp_path" type="string" label="30011">
                     <control type="edit" format="string"/>
                 </setting>

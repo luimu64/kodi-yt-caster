@@ -169,3 +169,51 @@ msgstr "Always (all music)"
 msgctxt "#30043"
 msgid "Never"
 msgstr "Never"
+
+msgctxt "#30044"
+msgid "Normalize loudness of casts"
+msgstr "Normalize loudness of casts"
+
+msgctxt "#30045"
+msgid "Match every cast to the same loudness so quiet and loud videos stop jumping. The audio track is re-rendered in the background (needs ffmpeg, downloaded once); a track plays with its original audio until its render is ready"
+msgstr "Match every cast to the same loudness so quiet and loud videos stop jumping. The audio track is re-rendered in the background (needs ffmpeg, downloaded once); a track plays with its original audio until its render is ready"
+
+msgctxt "#30046"
+msgid "Target loudness (LUFS)"
+msgstr "Target loudness (LUFS)"
+
+msgctxt "#30047"
+msgid "Integrated loudness every cast is matched to. -14 LUFS is the YouTube/Spotify streaming level; lower numbers are quieter"
+msgstr "Integrated loudness every cast is matched to. -14 LUFS is the YouTube/Spotify streaming level; lower numbers are quieter"
+
+msgctxt "#30048"
+msgid "Maximum boost (dB)"
+msgstr "Maximum boost (dB)"
+
+msgctxt "#30049"
+msgid "Cap on how far a quiet track is raised, so noise floors and near-silence are not amplified into hiss. Cuts are always applied in full"
+msgstr "Cap on how far a quiet track is raised, so noise floors and near-silence are not amplified into hiss. Cuts are always applied in full"
+
+msgctxt "#30050"
+msgid "Skip items longer than (minutes)"
+msgstr "Skip items longer than (minutes)"
+
+msgctxt "#30051"
+msgid "Rendering costs roughly real-time/7 on a Pi 4, so very long items are played unnormalized"
+msgstr "Rendering costs roughly real-time/7 on a Pi 4, so very long items are played unnormalized"
+
+msgctxt "#30052"
+msgid "Download ffmpeg now (audio normalization)"
+msgstr "Download ffmpeg now (audio normalization)"
+
+msgctxt "#30053"
+msgid "Fetch the static ffmpeg build used for loudness measurement and re-encoding (~120 MB, one time)"
+msgstr "Fetch the static ffmpeg build used for loudness measurement and re-encoding (~120 MB, one time)"
+
+msgctxt "#30054"
+msgid "Custom ffmpeg path"
+msgstr "Custom ffmpeg path"
+
+msgctxt "#30055"
+msgid "Leave empty to use the binary downloaded into the addon profile. Set this to use an ffmpeg already on the device"
+msgstr "Leave empty to use the binary downloaded into the addon profile. Set this to use an ffmpeg already on the device"
