@@ -542,10 +542,9 @@ class AudioNormalizer:
             return result if isinstance(result, str) else ""
         try:
             proc = subprocess.Popen(
-                args,
+                _spawn_args(args),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                preexec_fn=_lower_priority,
             )
         except Exception:
             logger.warning("could not start ffmpeg", exc_info=True)
@@ -642,11 +641,19 @@ class AudioNormalizer:
         return path if os.path.isfile(path) else None
 
 
-def _lower_priority() -> None:
-    try:
-        os.nice(10)
-    except Exception:
-        pass
+def _spawn_args(args: List[str]) -> List[str]:
+    """Prefix the ffmpeg command with ``nice`` when it is available.
+
+    Priority is lowered through the nice BINARY, never ``preexec_fn``: Kodi runs
+    addons inside a subinterpreter and CPython refuses there
+    ("preexec_fn not supported within subinterpreters"), which killed every
+    render on the device. Without nice the job still runs — the SIGSTOP hold
+    around playback handoffs is what actually protects playback.
+    """
+    nice = shutil.which("nice")
+    if nice:
+        return [nice, "-n", "10"] + args
+    return args
 
 
 def _user_notifier(fn: Optional[Callable[..., None]]) -> Optional[Callable[..., None]]:

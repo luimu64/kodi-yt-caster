@@ -2,6 +2,7 @@
 """One runnable check for YouTube Lounge Cast Receiver."""
 
 import os
+import shutil
 import time
 import unittest
 from resources.lib.lounge.session import parse_frames, LoungeSession
@@ -751,6 +752,49 @@ def test_audio_normalization_hold_check_is_fault_tolerant():
         assert norm._hold_now() is False
 
 
+def test_audio_normalization_spawns_without_preexec():
+    """Regression: Kodi runs addons in a subinterpreter, where CPython refuses
+    Popen(preexec_fn=...) — that killed every render on the device with
+    "preexec_fn not supported within subinterpreters". Priority must be lowered
+    through the nice binary instead."""
+    import tempfile
+    from resources.lib import audio_norm
+
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return (b"", b"  Integrated loudness:\n    I: -14.0 LUFS\n  True peak:\n    Peak: -1.0 dBFS\n")
+
+        def poll(self):
+            return 0
+
+    def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["kwargs"] = dict(kwargs)
+        return _FakeProc()
+
+    real_popen = audio_norm.subprocess.Popen
+    audio_norm.subprocess.Popen = _fake_popen
+    try:
+        with tempfile.TemporaryDirectory() as cache:
+            normalizer = audio_norm.AudioNormalizer(cache_dir=cache)
+            stderr = normalizer._run_capture(
+                "/usr/bin/ffmpeg", ["/usr/bin/ffmpeg", "-i", "source.m4a"])
+    finally:
+        audio_norm.subprocess.Popen = real_popen
+
+    assert "preexec_fn" not in captured["kwargs"], "preexec_fn breaks in Kodi's subinterpreters"
+    command = captured["cmd"]
+    assert command[-1] == "source.m4a" and command[-2] == "-i"
+    assert "/usr/bin/ffmpeg" in command
+    if shutil.which("nice"):
+        assert command[0].endswith("nice") and command[1:3] == ["-n", "10"], command
+    assert stderr is not None and "I: -14.0 LUFS" in stderr
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_frame_parsing_chunked()
@@ -781,4 +825,5 @@ if __name__ == "__main__":
     test_audio_normalization_disabled_is_inert()
     test_handoff_pending_gate()
     test_audio_normalization_hold_check_is_fault_tolerant()
+    test_audio_normalization_spawns_without_preexec()
     print("All unit tests passed successfully.")
