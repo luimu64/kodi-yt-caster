@@ -434,6 +434,101 @@ def test_sync_current_from_kodi_refresh_dispatches_duration():
         pb.KODI_AVAILABLE = orig_kodi_avail
 
 
+def test_track_change_watchdog_adopts_on_kodi_native_advance():
+    """Regression: on LibreELEC Kodi 21 xbmc.Player callbacks never fire in the
+    service process, and during a Kodi-native auto-advance the bridge state
+    stays PLAYING — so the pre-existing adoption path (state != PLAYING)
+    never ran and the phone kept reporting the old video forever.
+
+    Signal verified on device (YTCAST-PROBE2): getPlayingFile() returns the
+    resolved googlevideo URL (no video id); the info label
+    "Player.FileNameAndPath" carries plugin://...?play=<video_id>. The
+    watchdog must read that label and adopt."""
+    session = LoungeSession("s1", "t1", "d1")
+    actions = []
+    session.post_action = lambda sc, data: actions.append((sc, data))
+
+    class MockResolveBridge:
+        def resolve(self, video_id):
+            return {
+                "id": video_id,
+                "title": f"Title {video_id}",
+                "duration": 315,
+                "playable_url": f"http://example.com/{video_id}",
+            }
+
+    import resources.lib.player_bridge as pb
+    scraper = {"plugin_url": "plugin://plugin.service.ytlounge-cast/?play=v_old"}
+
+    class FakeXbmc:
+        @staticmethod
+        def getInfoLabel(key):
+            if key == "Player.FileNameAndPath":
+                return scraper["plugin_url"]
+            return ""
+
+    class FakeKodiPlayer:
+        """Real-device model: no callbacks, getPlayingFile returns googlevideo URL."""
+        def isPlaying(self):
+            return True
+        def getPlayingFile(self):
+            return "https://rr3---sn.googlevideo.com/videoplayback?id=o-ABC"
+        def getTime(self):
+            return 3.0
+        def getTotalTime(self):
+            return 315.0
+
+    resolver = VideoResolver(bridge=MockResolveBridge())  # type: ignore[arg-type]
+    player = KodiPlayerBridge(session=session, resolver=resolver)
+    player._kodi_player = FakeKodiPlayer()  # type: ignore[assignment]
+    player.current_video_id = "v_old"
+    player.current_duration = 315
+    player.playlist = ["v_old", "v_new"]
+    player.current_index = 0
+    player.state = PlayerState.PLAYING  # stale: stays PLAYING across native advance
+
+    orig_avail = pb.KODI_AVAILABLE
+    orig_xbmc = pb.xbmc
+    pb.KODI_AVAILABLE = True
+    pb.xbmc = FakeXbmc
+    try:
+        # Kodi auto-advanced natively: info label now shows the next item.
+        scraper["plugin_url"] = "plugin://plugin.service.ytlounge-cast/?play=v_new"
+
+        class OnePass(Exception):
+            pass
+
+        orig_time_sleep = pb.time.sleep
+        first = [True]
+
+        def sleeper(_s):
+            if first[0]:
+                first[0] = False
+                return
+            raise OnePass()
+
+        pb.time.sleep = sleeper
+        try:
+            try:
+                player._position_loop()
+            except OnePass:
+                pass
+        finally:
+            pb.time.sleep = orig_time_sleep
+
+        assert player.current_video_id == "v_new", player.current_video_id
+        assert player.current_index == 1
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if any(a[0] == "nowPlaying" and a[1].get("videoId") == "v_new" for a in actions):
+                break
+            time.sleep(0.05)
+        assert any(a[0] == "nowPlaying" and a[1]["videoId"] == "v_new" for a in actions), actions
+    finally:
+        pb.KODI_AVAILABLE = orig_avail
+        pb.xbmc = orig_xbmc
+
+
 def test_pause_and_resume_reporting():
     session = LoungeSession("s1", "t1", "d1")
     actions = []
@@ -476,5 +571,6 @@ if __name__ == "__main__":
     test_ofs_increment_thread_safe()
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
+    test_track_change_watchdog_adopts_on_kodi_native_advance()
     test_pause_and_resume_reporting()
     print("All unit tests passed successfully.")

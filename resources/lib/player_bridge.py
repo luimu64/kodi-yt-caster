@@ -208,14 +208,39 @@ class KodiPlayerBridge:
         while not self._monitor_stop.is_set():
             time.sleep(2.0)
             self._poll_pause_state()
-            if KODI_AVAILABLE and self._kodi_player and self.current_video_id:
+            # Track-change watchdog: on LibreELEC Kodi 21 the xbmc.Player
+            # callbacks (onPlayBackStarted etc.) are never delivered to this
+            # service process (verified on device — zero callbacks of any
+            # kind, ever). During a Kodi-native playlist auto-advance the
+            # bridge state stays PLAYING, so the `state != PLAYING` branch
+            # never fires and _sync_current_from_kodi() never adopts the new
+            # track — the phone keeps reporting the OLD video forever.
+            #
+            # Signal source (verified live via YTCAST-PROBE2 on Kodi 21.3
+            # LibreELEC): while playing, getPlayingFile() returns the FINAL
+            # resolved googlevideo URL (no video id), but the info label
+            # "Player.FileNameAndPath" still carries the plugin:// URL with
+            # ?play=<video_id>. Poll that label and adopt on change.
+            if KODI_AVAILABLE and self._kodi_player:
                 try:
                     if self._kodi_player.isPlaying():
+                        playing_url = None
+                        try:
+                            playing_url = xbmc.getInfoLabel("Player.FileNameAndPath")  # type: ignore[union-attr]
+                        except Exception:
+                            playing_url = None
+                        if playing_url and "play=" in playing_url:
+                            kodi_vid = playing_url.split("play=")[-1].split("&")[0]
+                            if kodi_vid and self.current_video_id and kodi_vid != self.current_video_id:
+                                logger.info(
+                                    "Track-change watchdog: Kodi playing %s, bridge at %s — adopting",
+                                    kodi_vid, self.current_video_id)
+                                self._sync_current_from_kodi(playing_url)
                         if self.state != PlayerState.PLAYING and not self._is_paused():
                             self.state = PlayerState.PLAYING
                             self._sync_current_from_kodi()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("position_loop player poll failed: %s", exc)
 
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
@@ -1002,22 +1027,32 @@ class KodiPlayerBridge:
                 except Exception:
                     pass
 
-    def _sync_current_from_kodi(self) -> bool:
+    def _sync_current_from_kodi(self, playing_url: Optional[str] = None) -> bool:
         """Align bridge state with what Kodi is actually playing.
 
         Returns True if the playing item differs from current_video_id.
+
+        playing_url: optional pre-fetched URL (probe callers pass the
+        info-label value here — on Kodi 21 getPlayingFile() returns the final
+        googlevideo URL without the video id, so it cannot parse a vid).
         """
         if not (KODI_AVAILABLE and self._kodi_player):
             return False
-        try:
-            playing_file = self._kodi_player.getPlayingFile()
-        except Exception:
-            return False
-        if not playing_file or "play=" not in playing_file:
+        if playing_url is None:
+            try:
+                playing_url = xbmc.getInfoLabel("Player.FileNameAndPath")
+            except Exception:
+                playing_url = None
+            if not playing_url:
+                try:
+                    playing_url = self._kodi_player.getPlayingFile()
+                except Exception:
+                    return False
+        if not playing_url or "play=" not in playing_url:
             return False
         import urllib.parse
         try:
-            qs = urllib.parse.urlparse(playing_file).query
+            qs = urllib.parse.urlparse(playing_url).query
             vid = dict(urllib.parse.parse_qsl(qs)).get("play")
         except Exception:
             return False
