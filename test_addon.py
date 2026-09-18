@@ -152,6 +152,112 @@ def test_ytdlp_downloader_metadata():
     assert dest.endswith(fn)
 
 
+def test_ytdlp_asset_prefers_importable_zipapp():
+    """Regression: the aarch64 asset used to be the 38MB PyInstaller build, which
+    resources/lib/ytdlp_inproc cannot import (zipimport needs a zipapp) — so the
+    in-process resolver never engaged and every resolve paid a subprocess spawn
+    (measured on a Pi 4: 4.7s vs 1.9s cold, 1.4s warm)."""
+    from resources.lib import ytdlp_downloader as dl
+
+    real_system, real_machine = dl.platform.system, dl.platform.machine
+    real_which, real_exe = dl.shutil.which, dl.sys.executable
+    try:
+        dl.platform.system = lambda: "Linux"
+        dl.platform.machine = lambda: "aarch64"
+        dl.shutil.which = lambda name: "/usr/bin/python3" if name == "python3" else None
+        assert dl.get_platform_asset_name() == ("yt-dlp", "yt-dlp"), "zipapp must be preferred where an interpreter exists"
+        assert dl.preferred_asset_is_zipapp()
+
+        # No interpreter: the native build is the only thing that can run.
+        dl.shutil.which = lambda name: None
+        dl.sys.executable = "/usr/bin/kodi"
+        assert dl.get_platform_asset_name() == ("yt-dlp_linux_aarch64", "yt-dlp")
+        assert not dl.preferred_asset_is_zipapp()
+    finally:
+        dl.platform.system, dl.platform.machine = real_system, real_machine
+        dl.shutil.which, dl.sys.executable = real_which, real_exe
+
+
+def test_ytdlp_reinstall_detects_non_importable_binary():
+    """A pre-zipapp install (ELF) must be recognised as stale and replaced once."""
+    import tempfile
+    import zipfile as _zipfile
+    from resources.lib import ytdlp_downloader as dl
+
+    with tempfile.TemporaryDirectory() as d:
+        elf = os.path.join(d, "yt-dlp")
+        with open(elf, "wb") as f:
+            f.write(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 4096)   # not a zip
+        zipapp = os.path.join(d, "yt-dlp-zip")
+        with _zipfile.ZipFile(zipapp, "w") as z:
+            z.writestr("yt_dlp/__init__.py", "")
+
+        real_pref = dl.preferred_asset_is_zipapp
+        try:
+            dl.preferred_asset_is_zipapp = lambda: True
+            assert dl.needs_reinstall(elf), "ELF install must be upgraded to the zipapp"
+            assert not dl.needs_reinstall(zipapp), "an existing zipapp is current"
+            assert not dl.needs_reinstall(os.path.join(d, "absent")), "missing file is not a reinstall"
+
+            # When the native build is the preferred asset, an ELF is current.
+            dl.preferred_asset_is_zipapp = lambda: False
+            assert not dl.needs_reinstall(elf)
+        finally:
+            dl.preferred_asset_is_zipapp = real_pref
+
+
+def test_ytdlp_download_keeps_old_binary_when_probe_fails():
+    """A downloaded binary that does not run (e.g. zipapp with no interpreter)
+    must be rejected, never installed over a working yt-dlp."""
+    import tempfile
+    import urllib.request as _urlrequest
+    from resources.lib import ytdlp_downloader as dl
+
+    class _Resp:
+        headers = {"Content-Length": str(2 * 1024 * 1024)}
+
+        def __init__(self):
+            self._left = 2 * 1024 * 1024
+
+        def read(self, n=-1):
+            if self._left <= 0:
+                return b""
+            chunk = b"\x00" * min(n, self._left)
+            self._left -= len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with tempfile.TemporaryDirectory() as d:
+        dest = os.path.join(d, "yt-dlp")
+        with open(dest, "wb") as f:
+            f.write(b"OLD-WORKING-BINARY")
+
+        real_urlopen = _urlrequest.urlopen
+        real_dest = dl.get_binary_destination
+        try:
+            _urlrequest.urlopen = lambda *a, **k: _Resp()
+            dl.get_binary_destination = lambda: dest
+            try:
+                dl.download_ytdlp(force=True, show_ui=False)
+                raise AssertionError("probe failure must raise")
+            except AssertionError:
+                raise
+            except Exception:
+                pass
+        finally:
+            _urlrequest.urlopen = real_urlopen
+            dl.get_binary_destination = real_dest
+
+        with open(dest, "rb") as f:
+            assert f.read() == b"OLD-WORKING-BINARY", "failed candidate must not replace the working binary"
+        assert os.listdir(d) == ["yt-dlp"], f"temp download left behind: {os.listdir(d)}"
+
+
 def test_hls_master_generation():
     from resources.lib.ytdlp_bridge import build_hls_master_manifest
     mock_formats = [
@@ -805,6 +911,9 @@ if __name__ == "__main__":
     test_player_bridge_index_resync()
     test_play_generation_supersedes()
     test_ytdlp_downloader_metadata()
+    test_ytdlp_asset_prefers_importable_zipapp()
+    test_ytdlp_reinstall_detects_non_importable_binary()
+    test_ytdlp_download_keeps_old_binary_when_probe_fails()
     test_hls_master_generation()
     test_youtube_music_session()
     test_dial_and_ssdp_discovery()

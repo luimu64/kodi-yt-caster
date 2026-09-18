@@ -6,6 +6,7 @@ import logging
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,6 +31,46 @@ except ImportError:
 GITHUB_RELEASES_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
 
 
+def python_for_zipapp() -> Optional[str]:
+    """Interpreter able to run the universal yt-dlp zipapp, if one exists."""
+    for name in ("python3", "python"):
+        path = shutil.which(name)
+        if path:
+            return path
+    exe = sys.executable or ""
+    if os.path.basename(exe).lower().startswith("python"):
+        return exe
+    return None
+
+
+def is_importable_zipapp(path: Optional[str]) -> bool:
+    """True when `path` is a zipapp resources/lib/ytdlp_inproc can import."""
+    try:
+        import zipfile
+
+        return bool(path) and os.path.isfile(path) and zipfile.is_zipfile(path)
+    except Exception:
+        return False
+
+
+def preferred_asset_is_zipapp() -> bool:
+    asset_name, _ = get_platform_asset_name()
+    return asset_name == "yt-dlp"
+
+
+def needs_reinstall(path: str) -> bool:
+    """True when the on-disk binary should be replaced by the preferred asset.
+
+    An install predating the zipapp preference holds a PyInstaller ELF: it runs
+    fine as a subprocess, so nothing looks broken, but the in-process resolver
+    cannot import it and every resolve pays a full interpreter spawn (~2.6s on a
+    Pi 4). Re-download once; a zipapp download that fails leaves the ELF usable.
+    """
+    if not os.path.isfile(path):
+        return False
+    return preferred_asset_is_zipapp() and not is_importable_zipapp(path)
+
+
 def get_platform_asset_name() -> Tuple[str, str]:
     """Return (asset_name_on_github, local_filename)."""
     sys_name = platform.system().lower()
@@ -38,10 +79,19 @@ def get_platform_asset_name() -> Tuple[str, str]:
     if "windows" in sys_name:
         return "yt-dlp.exe", "yt-dlp.exe"
 
+    # Everywhere else prefer the universal python zipapp (2.9MB) over the
+    # platform PyInstaller build (38MB): only the zipapp is importable in-process
+    # (resources/lib/ytdlp_inproc), and that is what turns a ~4.7s subprocess
+    # resolve into ~1.9s cold / ~1.4s warm on Pi-class hardware. Fall back to the
+    # native build only where no interpreter exists to run the zipapp.
     if "darwin" in sys_name:
+        if python_for_zipapp():
+            return "yt-dlp", "yt-dlp"
         return "yt-dlp_macos", "yt-dlp"
 
     # Linux / Android / BSD
+    if python_for_zipapp():
+        return "yt-dlp", "yt-dlp"
     if machine in ("aarch64", "arm64"):
         return "yt-dlp_linux_aarch64", "yt-dlp"
     elif machine in ("armv7l", "armv6l", "armhf"):
@@ -77,7 +127,13 @@ def download_ytdlp(force: bool = False, show_ui: bool = True) -> str:
     """Download or update yt-dlp binary."""
     dest_path = get_binary_destination()
     if os.path.isfile(dest_path) and not force:
-        return dest_path
+        if needs_reinstall(dest_path):
+            logger.info(
+                "Existing yt-dlp at %s is not importable in-process (pre-zipapp install); "
+                "replacing with the universal zipapp", dest_path)
+            force = True
+        else:
+            return dest_path
 
     asset_name, _ = get_platform_asset_name()
     download_url = f"{GITHUB_RELEASES_URL}/{asset_name}"
@@ -133,6 +189,23 @@ def download_ytdlp(force: bool = False, show_ui: bool = True) -> str:
             raise RuntimeError(f"Downloaded yt-dlp looks truncated ({downloaded} bytes)")
 
         os.chmod(tmp_path, 0o755)
+
+        # Verify the new binary runs BEFORE replacing the old one: a zipapp whose
+        # interpreter is missing (no /usr/bin/env python3) must not be able to
+        # leave the device with no working yt-dlp at all.
+        try:
+            probe = subprocess.run([tmp_path, "--version"], timeout=120,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ok = probe.returncode == 0 and probe.stdout.strip()
+            logger.info("yt-dlp probe (%s): rc=%s out=%r", asset_name, probe.returncode,
+                        probe.stdout[:40])
+        except Exception as e:
+            ok = False
+            logger.warning("yt-dlp probe failed: %s", e)
+        if not ok:
+            os.remove(tmp_path)
+            raise RuntimeError(f"downloaded {asset_name} does not run on this device")
+
         # Atomic replace: never a window with no yt-dlp on disk.
         os.replace(tmp_path, dest_path)
 
@@ -166,14 +239,15 @@ def ensure_ytdlp() -> Optional[str]:
     dest = get_binary_destination()
     # Gate on file presence, not the exec bit: on noexec userdata mounts
     # os.access(X_OK) is always False and we would re-download on every boot.
-    if os.path.isfile(dest):
+    if os.path.isfile(dest) and not needs_reinstall(dest):
         return dest
 
-    # Check if existing system binary exists
-    for name in ("yt-dlp", "yt-dlp.exe"):
-        sys_path = shutil.which(name)
-        if sys_path:
-            return sys_path
+    # System binary: only when there is nothing to upgrade on our own path.
+    if not os.path.isfile(dest):
+        for name in ("yt-dlp", "yt-dlp.exe"):
+            sys_path = shutil.which(name)
+            if sys_path:
+                return sys_path
 
     # Otherwise download it automatically on install / first run.
     # Back off for an hour after a failure so a broken network does not

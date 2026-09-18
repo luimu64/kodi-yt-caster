@@ -46,7 +46,8 @@ state-based with deadlines (`harness.wait_until`), never thread-ordering.
   fake titles, no-op downloader). Don't add more without strong reason.
 - Keep scenarios deterministic: no real network, no sleeps > 5 s except
   documented retry windows. Live-network checks belong in `test_perf_live.py`
-  and are never a gate.
+  (dev box) and `protolab/perf_probe.py` (on the target device — see
+  `protolab/PERF.md`), and are never a gate.
 - `emulator/` is never packaged (build.sh copies an explicit file list;
   verified: 0 entries in the zip).
 

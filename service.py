@@ -42,6 +42,7 @@ from resources.lib.lounge.listener import CommandDispatcher, LoungeListener
 from resources.lib.player_bridge import KodiPlayerBridge
 from resources.lib.resolver import VideoResolver
 from resources.lib import audio_norm
+from resources.lib import ytdlp_inproc
 from resources.lib.audio_norm import AudioNormalizer
 from resources.lib.ytdlp_bridge import YtDlpBridge, find_ytdlp_binary
 from resources.lib.ytdlp_downloader import ensure_ytdlp, download_ytdlp
@@ -226,7 +227,13 @@ def run_service() -> None:
             if stopping.is_set():
                 return
             # Ensure yt-dlp binary is installed on first run / service start
-            ensure_ytdlp()
+            ytdlp_path = ensure_ytdlp()
+            if ytdlp_path:
+                # Warm the in-process resolver off the boot path: importing
+                # yt-dlp + constructing YoutubeDL measures ~4s on a Pi 4, and a
+                # cold first cast is exactly the latency the inproc path removes.
+                threading.Thread(target=ytdlp_inproc.try_init, args=(ytdlp_path,),
+                                 name="YtDlpPrewarm", daemon=True).start()
 
             session_data = store.load()
             # Ensure valid screen_id and lounge_token for YouTube video
