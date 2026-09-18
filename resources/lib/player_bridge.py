@@ -560,28 +560,34 @@ class KodiPlayerBridge:
             return self.current_video_id == video_id
 
     def _climb_playback_ok(self) -> bool:
-        """True when Kodi is playing and the clock is genuinely moving.
+        """True when a real VIDEO-lane item is playing and its clock is moving.
 
         Deliberately conservative: climbing while the first rung is still
         opening makes inputstream.adaptive re-select before the picture is up,
         which reads as a stutter — exactly what the ladder exists to avoid.
+
+        The lane is decided by ``_music_lane_playing()``, NOT by
+        ``isPlayingVideo()``: on this device Kodi reports an audio-only
+        music-queue item as video while only its audio decoder runs, and a climb
+        started on that misreport would widen a master nobody is fetching.
         """
         if not (KODI_AVAILABLE and self._kodi_player):
             return False
         try:
             if not self._kodi_player.isPlaying():
                 return False
-            if self._kodi_player.isPlayingVideo() is False:
-                # Audio lane is up under this bridge: not our climb's business.
-                return False
         except Exception:
             return False
-        return True
+        return not self._music_lane_playing()
 
     def _start_climb(self) -> None:
-        """Start the armed climber (called once playback is confirmed)."""
+        """Start the armed climber (called once playback is confirmed).
+
+        Idempotent and one-shot per item: a climber that has already exited is
+        never restarted, because the monitor loop calls this on every poll.
+        """
         climber = self._climber
-        if climber is None or climber.running():
+        if climber is None or climber.running() or climber.finished:
             return
         climber.start()
 

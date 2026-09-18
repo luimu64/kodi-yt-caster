@@ -81,6 +81,12 @@ class QualityClimber:
         self.stop_event = stop_event or threading.Event()
         self._start_index = start_index
         self._thread: Optional[threading.Thread] = None
+        # Set once the climb has exited for ANY reason (reached the top, was
+        # superseded, playback stalled, budget exhausted). Callers must not
+        # restart a finished climber: the monitor loop re-asserts the climb on
+        # every poll, so without this a completed item would spawn a dead climb
+        # thread every couple of seconds for the rest of the video.
+        self.finished = False
         # Observable for tests and logs.
         self.published: list = []
 
@@ -176,6 +182,8 @@ class QualityClimber:
             self._climb()
         except Exception:
             logger.debug("quality climb for %s failed", self.video_id, exc_info=True)
+        finally:
+            self.finished = True
 
     def _climb(self) -> None:
         if self.ladder is None or self.rewriter is None:

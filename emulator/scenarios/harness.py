@@ -140,6 +140,15 @@ class Scenario:
 
     def __enter__(self):
         kodi_stub.reset()
+        # Per-scenario observation window: the manifest publish log is
+        # module-level and would otherwise carry the previous scenario's
+        # revisions into this one, making every "was this narrowed?" assertion
+        # read another scenario's history.
+        try:
+            from resources.lib import manifest_server
+            manifest_server.clear_publish_log()
+        except Exception:
+            pass
         xbmc.MEDIA.update({
             # Lane fidelity: the receiver's video stream is a VIDEO item, the
             # music-queue item is an AUDIO one (the stub's isPlayingAudio /

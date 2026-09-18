@@ -276,6 +276,38 @@ def test_threaded_climb_reaches_the_top():
     print("  test_threaded_climb_reaches_the_top OK")
 
 
+def test_finished_climber_is_never_restarted():
+    """A completed climb must not be restarted by the monitor loop.
+
+    The bridge re-asserts the climb on every poll, so without the ``finished``
+    flag a finished item spawns a fresh dead climb thread every couple of
+    seconds for the rest of the video.
+    """
+    fx = _make()
+    fx.climber.initial_body()
+    # Drive the ladder to the top by hand, then run the climb to completion.
+    while not fx.ladder.at_top():
+        if fx.ladder.advance() is None:
+            break
+        fx.climber._publish_current()
+    stop, t = _drain_clock(fx)
+    try:
+        fx.climber.start()
+        deadline = time.monotonic() + 10.0
+        while not fx.climber.finished and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert fx.climber.finished, "climb never reported completion"
+    finally:
+        stop.set()
+        t.join(timeout=5.0)
+    assert fx.climber.running() is False
+    # The contract the bridge's start path relies on: exit is recorded, so the
+    # monitor loop's every-poll re-assert cannot spawn a dead climb again.
+    assert fx.climber.finished is True
+    assert fx.ladder.at_top(), "a completed climb leaves the ladder at the top"
+    print("  test_finished_climber_is_never_restarted OK")
+
+
 def main():
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in fns:

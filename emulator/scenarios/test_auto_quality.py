@@ -170,6 +170,26 @@ def test_superseded_climb_stops_publishing():
         print("  test_superseded_climb_stops_publishing OK")
 
 
+def test_completed_climb_is_not_restarted_by_the_monitor_loop():
+    """After the climb finishes, no further revisions may appear.
+
+    The monitor loop re-asserts the climb on EVERY poll, so a climber that is
+    not marked finished would be restarted every couple of seconds for the rest
+    of the video. Asserting the revision count is frozen after settling is what
+    catches that respawn churn.
+    """
+    with Scenario() as s:
+        s.phone.set_playlist("h1", ["h1"], current_time=0)
+        s.wait_until(lambda: "h1" in (s.playing_file() or ""), what="h1 playing")
+        _wait(lambda: _climb_from_narrowed("h1")[-1:] == [3], 25.0, "full quality")
+        frozen = len(_revisions("h1"))
+        time.sleep(6.0)  # several monitor-loop polls
+        assert len(_revisions("h1")) == frozen, (
+            f"the monitor loop kept republishing after the climb finished: "
+            f"{len(_revisions('h1'))} vs {frozen}")
+        print("  test_completed_climb_is_not_restarted_by_the_monitor_loop OK")
+
+
 def main():
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in fns:
