@@ -55,7 +55,6 @@ class SessionState:
     volume: int = 100
     cpn: str = "kodi"
     version: int = 0
-    last_event_id: Optional[str] = None
 
     def snapshot(self) -> SessionState:
         """Return an immutable copy of the state.
@@ -152,11 +151,13 @@ StopEvent = StopVideoEvent
 
 @dataclass(frozen=True)
 class NextEvent(Event):
+    video_id: Optional[str] = None
     source: str = "phone"
 
 
 @dataclass(frozen=True)
 class PreviousEvent(Event):
+    video_id: Optional[str] = None
     source: str = "phone"
 
 
@@ -338,10 +339,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
     Logs exactly one line per accepted reduction:
       `state v<N> <event> -> <changed field groups> (<source>)`
     """
-    # 0. Deduplication by event_id if present
-    if event.event_id and state.last_event_id == event.event_id:
-        return state
-
     # 1. SetPlaylistEvent
     if isinstance(event, SetPlaylistEvent):
         new_playlist = tuple(event.video_ids) if event.video_ids else ((event.video_id,) if event.video_id else ())
@@ -379,7 +376,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=new_cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -404,7 +400,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -443,7 +438,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=new_cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -467,7 +461,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -491,7 +484,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -515,7 +507,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -539,7 +530,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=new_vol,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -562,7 +552,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -571,6 +560,8 @@ def reduce(state: SessionState, event: Event) -> SessionState:
     # 9. NextEvent
     if isinstance(event, NextEvent):
         if not state.playlist:
+            return state
+        if event.video_id is not None and event.video_id == state.current_video_id:
             return state
         next_idx = state.current_index + 1
         if next_idx >= len(state.playlist):
@@ -590,7 +581,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=new_cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -599,6 +589,8 @@ def reduce(state: SessionState, event: Event) -> SessionState:
     # 10. PreviousEvent
     if isinstance(event, PreviousEvent):
         if not state.playlist or state.current_index <= 0:
+            return state
+        if event.video_id is not None and event.video_id == state.current_video_id:
             return state
         prev_idx = state.current_index - 1
         prev_vid = state.playlist[prev_idx]
@@ -616,7 +608,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=new_cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -642,7 +633,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=new_cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -685,7 +675,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=new_vol_val,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -708,7 +697,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
@@ -731,8 +719,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
                     volume=state.volume,
                     cpn=state.cpn,
                     version=state.version + 1,
-                    last_event_id=event.event_id,
-                )
+                        )
                 changed = _diff_field_groups(state, new_state)
                 logger.info(format_reduction_log(new_state.version, event, changed, event.source))
                 return new_state
@@ -753,8 +740,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
                 volume=state.volume,
                 cpn=state.cpn,
                 version=state.version + 1,
-                last_event_id=event.event_id,
-            )
+                )
             changed = _diff_field_groups(state, new_state)
             logger.info(format_reduction_log(new_state.version, event, changed, event.source))
             return new_state
@@ -781,8 +767,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
                 volume=state.volume,
                 cpn="cpn_" + next_vid,
                 version=state.version + 1,
-                last_event_id=event.event_id,
-            )
+                )
         else:
             new_state = SessionState(
                 playlist=state.playlist,
@@ -796,8 +781,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
                 volume=state.volume,
                 cpn=state.cpn,
                 version=state.version + 1,
-                last_event_id=event.event_id,
-            )
+                )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))
         return new_state
@@ -818,7 +802,6 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             volume=state.volume,
             cpn=state.cpn,
             version=state.version + 1,
-            last_event_id=event.event_id,
         )
         changed = _diff_field_groups(state, new_state)
         logger.info(format_reduction_log(new_state.version, event, changed, event.source))

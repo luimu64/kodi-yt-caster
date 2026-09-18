@@ -130,6 +130,17 @@ def test_persistence():
         os.remove(test_file)
 
 
+def test_session_state_module():
+    """Run all unit tests in tests/test_session_state.py as part of test_addon.py."""
+    import unittest
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromName("tests.test_session_state")
+    runner = unittest.TextTestRunner(verbosity=0)
+    result = runner.run(suite)
+    assert result.wasSuccessful(), f"test_session_state failed: {result.errors + result.failures}"
+
+
+
 def test_resolver_cache():
     mock_bridge = MockYtDlpBridge()
     resolver = VideoResolver(bridge=mock_bridge)

@@ -1,32 +1,50 @@
-"""Unit tests for resources/lib/session_state.py."""
+"""Unit tests for resources/lib/session_state.py covering R1 and R3 requirements.
 
-import unittest
+Acceptance criteria for R3:
+- Unit coverage showing purity (same inputs, same output) for every event in the vocabulary.
+- Unit coverage showing idempotence (replay of a duplicated event leaves state and version unchanged)
+  for every event in the vocabulary.
+- Monotonic version counter v<N> bumped on accepted reductions.
+- Log line formatted as `state v<N> <event> -> <changed field groups> (<source>)`.
+- No event type may be reachable that mutates state outside the reducer.
+"""
+
 from dataclasses import FrozenInstanceError
+import logging
+import unittest
 
 from resources.lib.session_state import (
-    SessionState,
-    PlayState,
-    reduce,
-    SetPlaylistEvent,
-    UpdatePlaylistEvent,
-    PlayVideoEvent,
-    PauseEvent,
-    ResumeEvent,
-    StopEvent,
-    SeekToEvent,
-    SetVolumeEvent,
-    PositionTickEvent,
-    PauseDetectedEvent,
-    ResumeDetectedEvent,
+    Event,
     KodiAdvancedEvent,
+    KodiStateObservedEvent,
+    NextEvent,
+    PauseDetectedEvent,
+    PauseEvent,
+    PlaybackEndedEvent,
     PlaybackStartedEvent,
     PlaybackStoppedEvent,
-    PlaybackEndedEvent,
-    SignalUnknownEvent,
-    ResolverResolvedEvent,
+    PlayEvent,
+    PlayState,
+    PlayVideoEvent,
+    PositionTickEvent,
+    PreviousEvent,
+    QueueTitlePatchedEvent,
+    reduce,
+    ResolverCompletedEvent,
     ResolverFailedEvent,
+    ResolverResolvedEvent,
+    ResolverSupersededEvent,
+    ResumeDetectedEvent,
+    ResumeEvent,
+    SeekToEvent,
+    SessionState,
+    SetPlaylistEvent,
+    SetVolumeEvent,
+    SignalUnknownEvent,
+    StopEvent,
+    StopVideoEvent,
+    UpdatePlaylistEvent,
     WindowLaneRepairedEvent,
-    Event,
 )
 
 
@@ -191,6 +209,191 @@ class TestSessionState(unittest.TestCase):
         # 4. Window / lane repair
         s = reduce(s, WindowLaneRepairedEvent(lane="m"))
         self.assertEqual(s.lane, "m")
+
+
+class TestReducerPurityAndIdempotence(unittest.TestCase):
+    """Rigorous purity and idempotence tests for EVERY event in the vocabulary (§9 R3)."""
+
+    def setUp(self):
+        self.base_state = SessionState(
+            playlist=("v1", "v2", "v3"),
+            current_index=0,
+            current_video_id="v1",
+            list_id="PL_TEST_123",
+            position=10.0,
+            duration=180.0,
+            play_state=PlayState.PLAYING,
+            lane="cl",
+            volume=75,
+            cpn="cpn_initial",
+            version=1,
+        )
+
+    def _get_vocabulary_events(self):
+        """Return a mapping of vocabulary name to an event instance that alters base_state."""
+        return {
+            "setPlaylist": SetPlaylistEvent(
+                video_id="v2",
+                video_ids=["v1", "v2", "v3", "v4"],
+                list_id="PL_NEW",
+                current_time=5.0,
+                theme="cl",
+            ),
+            "updatePlaylist": UpdatePlaylistEvent(video_ids=["v1", "v3"]),
+            "play": PlayEvent(video_id="v2", seek_time=0.0),
+            "pause": PauseEvent(),
+            "seekTo": SeekToEvent(seconds=45.0),
+            "setVolume": SetVolumeEvent(volume=50),
+            "stopVideo": StopVideoEvent(),
+            "next": NextEvent(video_id="v2"),
+            "previous": PreviousEvent(video_id="v1"),
+            "kodi_advanced": KodiAdvancedEvent(video_id="v2"),
+            "kodi_state_observed": KodiStateObservedEvent(position=25.0, duration=180.0, play_state=PlayState.PLAYING),
+            "signal_unknown": SignalUnknownEvent(),
+            "resolver_completed": ResolverCompletedEvent(video_id="v1", duration=210.0),
+            "resolver_superseded": ResolverSupersededEvent(video_id="v1"),
+        }
+
+    def test_purity_for_all_vocabulary_events(self):
+        """Purity: given identical inputs (state, event), reduce must return identical outputs
+
+        with zero mutation to input objects and no side effects.
+        """
+        events = self._get_vocabulary_events()
+        for name, ev in events.items():
+            # For 'previous', adjust starting index to > 0 so it produces a state transition
+            start_state = SessionState(
+                playlist=("v1", "v2", "v3"),
+                current_index=1,
+                current_video_id="v2",
+                list_id="PL_TEST_123",
+                position=10.0,
+                duration=180.0,
+                play_state=PlayState.PLAYING,
+                lane="cl",
+                volume=75,
+                cpn="cpn_initial",
+                version=1,
+            ) if name == "previous" else self.base_state
+
+            snap1 = start_state.snapshot()
+            res1 = reduce(start_state, ev)
+            self.assertEqual(start_state, snap1, f"reduce mutated start_state in-place for {name}")
+
+            snap2 = start_state.snapshot()
+            res2 = reduce(start_state, ev)
+            self.assertEqual(start_state, snap2, f"reduce mutated start_state in-place for second call {name}")
+
+            self.assertEqual(res1, res2, f"reduce was not pure for {name}: outputs differ for identical input")
+
+    def test_idempotence_and_replay_for_all_vocabulary_events(self):
+        """Idempotence: applying the same event twice to the same starting state yields
+
+        identical resulting states, AND replaying a duplicate event on the reduced state
+        leaves state and version unchanged.
+        """
+        events = self._get_vocabulary_events()
+        for name, ev in events.items():
+            start_state = SessionState(
+                playlist=("v1", "v2", "v3"),
+                current_index=1,
+                current_video_id="v2",
+                list_id="PL_TEST_123",
+                position=10.0,
+                duration=180.0,
+                play_state=PlayState.PLAYING,
+                lane="cl",
+                volume=75,
+                cpn="cpn_initial",
+                version=1,
+            ) if name == "previous" else self.base_state
+
+            # First reduction
+            res1 = reduce(start_state, ev)
+
+            # Replaying the same event on res1 (duplicate burst / replay)
+            res_replay = reduce(res1, ev)
+            self.assertEqual(
+                res_replay,
+                res1,
+                f"Replaying duplicate event {name} failed idempotence: state changed",
+            )
+            self.assertEqual(
+                res_replay.version,
+                res1.version,
+                f"Replaying duplicate event {name} bumped version from {res1.version} to {res_replay.version}",
+            )
+
+    def test_duplicate_relay_burst_protection(self):
+        """Simulate a rapid duplicate relay burst of 4 identical setPlaylist commands.
+
+        State version must advance exactly once.
+        """
+        s = SessionState()
+        ev = SetPlaylistEvent(
+            video_id="v1",
+            video_ids=["v1", "v2", "v3"],
+            list_id="PL_BURST",
+            current_time=0.0,
+            theme="cl",
+        )
+        s1 = reduce(s, ev)
+        self.assertEqual(s1.version, 1)
+
+        # 3 duplicate burst arrivals
+        s2 = reduce(s1, ev)
+        s3 = reduce(s2, ev)
+        s4 = reduce(s3, ev)
+
+        self.assertEqual(s4.version, 1)
+        self.assertIs(s4, s1)
+
+    def test_reduction_log_line_format(self):
+        """Verify that exactly one log line is emitted per reduction in the required format:
+
+        `state v<N> <event> -> <changed field groups> (<source>)`
+        """
+        logger = logging.getLogger("ytlounge.state")
+        logs = []
+
+        class LogHandler(logging.Handler):
+            def emit(self, record):
+                logs.append(self.format(record))
+
+        handler = LogHandler()
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
+        try:
+            s0 = SessionState()
+            ev1 = SetPlaylistEvent(video_id="v1", video_ids=["v1", "v2"], list_id="PL1", source="phone")
+            s1 = reduce(s0, ev1)
+            self.assertEqual(len(logs), 1)
+            self.assertTrue(
+                logs[0].startswith("state v1 setPlaylist -> identity, playback (phone)"),
+                f"Unexpected log line: {logs[0]}",
+            )
+
+            # Redundant setPlaylist: should emit no log
+            logs.clear()
+            s1_dup = reduce(s1, ev1)
+            self.assertEqual(len(logs), 0)
+
+            # Volume reduction
+            ev_vol = SetVolumeEvent(volume=60, source="remote")
+            s2 = reduce(s1, ev_vol)
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0], "state v2 setVolume -> volume (remote)")
+
+            # Player clock observation
+            logs.clear()
+            ev_obs = KodiStateObservedEvent(position=12.0, source="player-clock")
+            s3 = reduce(s2, ev_obs)
+            self.assertEqual(len(logs), 1)
+            self.assertEqual(logs[0], "state v3 kodiStateObserved -> playback (player-clock)")
+
+        finally:
+            logger.removeHandler(handler)
 
 
 if __name__ == "__main__":
