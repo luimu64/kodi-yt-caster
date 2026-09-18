@@ -183,6 +183,24 @@ def getCondVisibility(cond):
     return False
 
 
+def getInfoLabel(label):
+    """Kodi info labels.
+
+    ``Player.FileNameAndPath`` carries the URL the player was handed — including
+    ``plugin://<addon-id>/?play=<id>`` for music-queue items. Device-verified:
+    that label is the receiver's ONLY track-change signal on Kodi 21, because
+    ``getPlayingFile()`` returns the final resolved CDN URL (no video id), so a
+    ``?play=`` parse there never matches and the watchdog stays silent.
+    """
+    label = str(label)
+    url = _engine.url or ""
+    if label == "Player.FileNameAndPath":
+        return url
+    if label == "Player.Title":
+        return url.rsplit("/", 1)[-1] if url else ""
+    return ""
+
+
 def executeJSONRPC(rpc):
     try:
         call = json.loads(rpc)
@@ -228,15 +246,30 @@ class PlayList:
     """The ONE music playlist (xbmc.PlayList(PLAYLIST_MUSIC)).
 
     Kodi snapshots ListItem labels at add() time — we copy the label.
+
+    ``xbmc.PlayList(PLAYLIST_MUSIC)`` hands back the SAME live playlist object
+    on every call; constructing one must never disturb its contents. The
+    receiver builds the queue, plays it, and later re-opens the playlist to
+    patch upcoming labels — if a "new" PlayList came back empty (or replaced
+    the object the engine is advancing), the queue would silently vanish
+    mid-playback, which is not something Kodi does.
     """
     _instance = None
     _lock = threading.RLock()
 
+    def __new__(cls, playlist_type=PLAYLIST_MUSIC):
+        inst = cls._instance
+        if inst is None:
+            inst = super().__new__(cls)
+            inst._type = playlist_type
+            inst._items = []   # (url, label_snapshotted, listitem_ref)
+            inst._position = -1
+            cls._instance = inst
+        return inst
+
     def __init__(self, playlist_type=PLAYLIST_MUSIC):
-        self._type = playlist_type
-        if playlist_type == PLAYLIST_MUSIC:
-            PlayList._instance = self  # same underlying playlist every call
-        self.clear()
+        # Deliberately empty: re-obtaining the playlist is not a reset.
+        pass
 
     def clear(self):
         with self._lock:
@@ -312,6 +345,14 @@ class _Engine:
         # play avoids it — that is what the receiver has to do.
         self.stale_video_window_on_lane_switch = True
         self._window_left_stale = False
+        # Device-verified lane-switch race: when Kodi switches from a video item
+        # to an audio one, the outgoing VIDEO player is still closing while the
+        # next item already plays — kodi.log shows 'Saving file state for video
+        # item <old>' after the new item started, and a receiver that decides
+        # the lane once at that instant sees isPlayingVideo() == True and gives
+        # up. Scenarios set a lag (seconds) to model it; 0 disables it.
+        self.video_teardown_lag = 0.0
+        self._video_teardown_until = 0.0
         self._alive = threading.Event()
         self._alive.set()
         self._pump = threading.Thread(target=self._run, name="SimPlayerPump", daemon=True)
@@ -351,6 +392,8 @@ class _Engine:
     def reset(self):
         self.start_latency = 0.0
         self.stale_video_window_on_lane_switch = True
+        self.video_teardown_lag = 0.0
+        self._video_teardown_until = 0.0
         self._window_left_stale = False
         self.set_stopped()
         self.players.clear()
@@ -369,18 +412,37 @@ class _Engine:
         media = _lookup_media(url)
         was_video = self.url is not None and not self.audio_only
         audio = bool(media.get("audio", False))
-        if was_video and audio and self.stale_video_window_on_lane_switch:
-            # Lane switch with the video player still the active one: Kodi's
-            # window cleanup misses it (see the flag's comment) — 12005 stays
-            # on top until someone closes it.
-            self._window_left_stale = True
+        if was_video and audio:
+            if self.stale_video_window_on_lane_switch:
+                # Lane switch with the video player still the active one: Kodi's
+                # window cleanup misses it (see the flag's comment) — 12005 stays
+                # on top until someone closes it.
+                self._window_left_stale = True
+            else:
+                # Device-verified (probe on Kodi 21.3 / LibreELEC, video -> audio
+                # switch): Kodi closes the fullscreen video window itself, leaves
+                # nothing in its place, and the audio item activates no window at
+                # all — the GUI is left on whatever sat underneath (Home). The
+                # receiver has to request the music window explicitly.
+                if _windows.active == WINDOW_FULLSCREEN_VIDEO:
+                    _windows.previous()
+            if self.video_teardown_lag > 0:
+                # ...but the outgoing video PLAYER lingers: isPlayingVideo()
+                # keeps reporting True for a while even though the audio item is
+                # already playing (device: 'Saving file state for video item').
+                self._video_teardown_until = time.monotonic() + self.video_teardown_lag
         self.url = str(url)
         self.listitem = listitem
         self.audio_only = audio
         self.clock = SimulatedPlayback(media["duration"], rate=DEFAULT_RATE)
         self.clock.play()
         if not audio:
-            # Kodi activates the fullscreen video window for a video item.
+            # Kodi activates the fullscreen video window for a video item, and
+            # the music window goes away with it (device-verified: a music video
+            # starting Deinits MusicVisualisation.xml, and the later video->audio
+            # switch leaves Home on screen, not the visualiser underneath).
+            if WINDOW_VISUALISATION in _windows.history:
+                _windows.history = [w for w in _windows.history if w != WINDOW_VISUALISATION]
             _windows.activate(WINDOW_FULLSCREEN_VIDEO)
         if self.start_latency > 0:
             def _go():
@@ -393,6 +455,9 @@ class _Engine:
     def set_stopped(self):
         if self.clock:
             self.clock.stop()
+        # The outgoing video player's lingering mode cannot survive a stop —
+        # this is what makes the receiver's own re-open land on the audio lane.
+        self._video_teardown_until = 0.0
         self.url = None
         self.listitem = None
         self.audio_only = False
@@ -478,9 +543,18 @@ class Player:
         return _engine.url is not None and _engine.clock is not None and _engine.clock.state != "stopped"
 
     def isPlayingAudio(self):
+        if self.isPlaying() and _engine._video_teardown_until > time.monotonic():
+            # Device-verified: the item opened in the outgoing video player's
+            # mode reports NOT-audio as well, even though only its audio decoder
+            # runs (isPlayingAudio() False, isPlayingVideo() True).
+            return False
         return self.isPlaying() and _engine.audio_only
 
     def isPlayingVideo(self):
+        if self.isPlaying() and _engine._video_teardown_until > time.monotonic():
+            # The outgoing video player is still closing (device lane-switch
+            # race) even though the next item is already playing.
+            return True
         return self.isPlaying() and not _engine.audio_only
 
     def getTime(self):
