@@ -5,6 +5,7 @@ import os
 import shutil
 import time
 import unittest
+from typing import Any, Dict
 from resources.lib.lounge.session import parse_frames, LoungeSession
 from resources.lib.lounge.client import BASE_URL
 from resources.lib.persistence import SessionStore
@@ -77,10 +78,54 @@ def test_persistence():
     reloaded = store.load()
     assert reloaded["screen_id"] == "s123"
     assert reloaded["lounge_token"] == "tok456"
+
+    # Session record tests: back-compat loading old blob with no session fields yields nulls
+    empty_sess = store.load_session()
+    for field in ("list_id", "playlist", "current_index", "current_video_id", "position", "cpn", "theme"):
+        assert empty_sess[field] is None, f"Expected {field} to be None"
+
+    # Save and round-trip populated session record
+    record = {
+        "list_id": "PLtest123",
+        "playlist": ["v1", "v2"],
+        "current_index": 0,
+        "current_video_id": "v1",
+        "position": 12.34,
+        "cpn": "cpn_test",
+        "theme": "cl",
+    }
+    store.save_session(record, debounce=False)
+    loaded_sess = store.load_session()
+    for field in ("list_id", "playlist", "current_index", "current_video_id", "position", "cpn", "theme"):
+        assert loaded_sess[field] == record[field]
+
+    # Debounce verification
+    writes = 0
+    orig_save = store._save_raw_locked
+
+    def counted_save(data: Dict[str, Any]) -> None:
+        nonlocal writes
+        writes += 1
+        orig_save(data)
+
+    store._save_raw_locked = counted_save
+    store.debounce_interval = 0.1
+    for i in range(10):
+        rec = dict(record)
+        rec["position"] = float(i)
+        store.save_session(rec, debounce=True)
+    assert writes == 0
+    time.sleep(0.2)
+    assert writes == 1
+    assert store.load_session()["position"] == 9.0
+    store._save_raw_locked = orig_save
+
     store.clear()
     cleared = store.load()
     assert "screen_id" not in cleared
     assert cleared["device_id"] == dev_id
+    cleared_sess = store.load_session()
+    assert cleared_sess["list_id"] is None
     if os.path.exists(test_file):
         os.remove(test_file)
 
