@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from .manifest_server import publish
 from . import ytdlp_inproc as inproc
+from .quality import pick_audio_ladder
 
 logger = logging.getLogger("ytlounge.ytdlp")
 
@@ -207,10 +208,69 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
     return publish(name, "\n".join(lines))
 
 
+def build_hls_master_manifest_for_auto_quality(
+    formats: List[Dict[str, Any]], video_id: str, max_resolution: str = "auto",
+) -> Optional[Dict[str, Any]]:
+    """Publish the full master and describe its ladder for auto-quality play.
+
+    Returns None when there is no video ladder to climb (audio-only upload, or a
+    single rendition), in which case the caller plays the master unchanged.
+    The master is published in FULL first, so a failure anywhere in the ladder
+    path still leaves a complete, playable manifest behind.
+    """
+    from .quality import MasterRewriter, QualityLadder
+
+    url = build_hls_master_manifest(formats, video_id)
+    if not url:
+        return None
+    from .manifest_server import fetch_manifest
+
+    body = fetch_manifest(url)
+    if not body:
+        return None
+
+    ladder = QualityLadder(video_id, _hls_video_formats(formats), max_resolution)
+    rewriter = MasterRewriter(body)
+    if ladder.rung_count() < 2 or rewriter.stream_count < 2:
+        return None
+    # The generator emits best-first and the rewriter counts from the tail, so
+    # the two orderings must agree before any rewriting is allowed to happen.
+    if ladder.rung_count() != rewriter.stream_count:
+        logger.warning(
+            "auto-quality: ladder/rewriter size mismatch for %s (%s rungs vs %s streams); "
+            "playing the full master", video_id, ladder.rung_count(), rewriter.stream_count)
+        return None
+    return {
+        "url": url,
+        "ladder": ladder,
+        "rewriter": rewriter,
+    }
+
+
+def _hls_video_formats(formats: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The HLS video renditions of a format list, matching the generator's view."""
+    out: List[Dict[str, Any]] = []
+    for f in formats:
+        f_url = f.get("url", "")
+        proto = str(f.get("protocol") or "")
+        if not ("manifest/hls_playlist" in f_url or proto == "m3u8_native"
+                or ".m3u8" in f_url or "m3u8" in proto):
+            continue
+        vcodec = str(f.get("vcodec") or "")
+        res = str(f.get("resolution") or "")
+        note = str(f.get("format_note") or "").lower()
+        if vcodec == "none" or "audio" in res or "audio" in note:
+            continue
+        out.append(f)
+    return out
+
+
 class YtDlpBridge:
-    def __init__(self, binary_path: Optional[str] = None, cookies_path: Optional[str] = None):
+    def __init__(self, binary_path: Optional[str] = None, cookies_path: Optional[str] = None,
+                 max_resolution: str = "auto"):
         self.binary_path = binary_path or find_ytdlp_binary()
         self.cookies_path = cookies_path
+        self.max_resolution = max_resolution
         self._cache: Dict[str, tuple] = {}  # video_id -> (monotonic_ts, info)
 
     def resolve(self, video_id: str, prefetch: bool = False) -> Dict[str, Any]:
@@ -354,11 +414,18 @@ class YtDlpBridge:
             stream_type = "progressive"
 
         # 2. Fall back to the multi-rendition HLS master playlist (resolution switching in the Kodi OSD)
+        ladder_info: Optional[Dict[str, Any]] = None
         if not playable_url:
-            master_path = build_hls_master_manifest(formats, video_id)
-            if master_path:
-                playable_url = master_path
+            ladder_info = build_hls_master_manifest_for_auto_quality(
+                formats, video_id, self.max_resolution)
+            if ladder_info:
+                playable_url = ladder_info["url"]
                 stream_type = "hls_master"
+            else:
+                master_path = build_hls_master_manifest(formats, video_id)
+                if master_path:
+                    playable_url = master_path
+                    stream_type = "hls_master"
 
         # 2. Look for single HLS playlist fallback
         if not playable_url:
@@ -392,7 +459,10 @@ class YtDlpBridge:
         if not playable_url:
             playable_url = data.get("url")
 
-        return {
+        # Auto-quality ladder (video lane only): the ordered renditions and the
+        # rewriter able to narrow the published master to a prefix of them. The
+        # player bridge climbs this in the background after playback starts.
+        out: Dict[str, Any] = {
             "id": video_id,
             "title": title,
             "duration": duration,
@@ -404,4 +474,11 @@ class YtDlpBridge:
             "max_video_tbr": max_video_tbr,
             "artist": data.get("artist") or data.get("uploader") or "",
             "album": data.get("album") or "",
+            "audio_ladder": pick_audio_ladder(formats),
         }
+        if ladder_info is not None:
+            out["quality_ladder"] = ladder_info["ladder"]
+            out["master_rewriter"] = ladder_info["rewriter"]
+            out["master_url"] = ladder_info["url"]
+        return out
+
