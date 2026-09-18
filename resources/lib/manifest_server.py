@@ -24,6 +24,33 @@ _MANIFESTS: Dict[str, str] = {}
 _LOCK = threading.Lock()
 _SERVER: Optional["ManifestServer"] = None
 
+# Publication history: (monotonic_ts, name, body) for every publish() call.
+# Auto quality works by REPUBLISHING a master under the same name, so "what did
+# Kodi see, in what order" is only observable through this log — a scenario that
+# reads the current body cannot tell a narrowed first revision from a full one
+# that was never narrowed at all.
+_PUBLISH_LOG: list = []
+PUBLISH_LOG_LIMIT = 200
+
+
+def publish_log() -> list:
+    """Snapshot of (ts, name, body) for every manifest publication so far."""
+    with _LOCK:
+        return list(_PUBLISH_LOG)
+
+
+def clear_publish_log() -> None:
+    with _LOCK:
+        _PUBLISH_LOG.clear()
+
+
+def _record_publish(name: str, body: str) -> None:
+    with _LOCK:
+        _PUBLISH_LOG.append((time.monotonic(), name, body))
+        while len(_PUBLISH_LOG) > PUBLISH_LOG_LIMIT:
+            _PUBLISH_LOG.pop(0)
+
+
 # Out-of-process front end (http_child.py): the port Kodi talks to. Kodi STATs
 # the stopped item against it and blocks its player-stop handling on the answer,
 # while this addon's Python shares kodi.bin's interpreter with ~a dozen other
@@ -288,6 +315,7 @@ def publish(name: str, body: str) -> str:
         while len(_MANIFESTS) >= 50:
             _MANIFESTS.pop(next(iter(_MANIFESTS)))
         _MANIFESTS[name] = body
+    _record_publish(name, body)
     _push_to_child(name, body)
     return f"http://127.0.0.1:{_public_port()}/{name}"
 

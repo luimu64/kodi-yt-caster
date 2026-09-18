@@ -39,8 +39,15 @@ def _fake_bridge_resolve(self, video_id):
     ``is_static_art`` is True except for ids prefixed "v" — scenarios use that
     to cast a real music video (video lane) next to a still-art track (audio
     lane) in the same queue.
+
+    Ids prefixed with "h" get an HLS master carrying a real QUALITY LADDER, so
+    auto-quality scenarios can exercise the climb without yt-dlp or a CDN. The
+    master body is published through the real manifest server, which is what the
+    climber republishes to.
     """
     _CALLS["resolve"].append(video_id)
+    if video_id.startswith("h"):
+        return _fake_hls_resolve(video_id)
     return {
         "id": video_id,
         "title": f"Title of {video_id}",
@@ -53,6 +60,63 @@ def _fake_bridge_resolve(self, video_id):
         "max_video_tbr": 0.0,
         "artist": "Artist",
         "album": "Album",
+    }
+
+
+from resources.lib.quality import MasterRewriter, QualityLadder  # noqa: E402
+
+
+def _ladder_formats():
+    return [
+        {"height": h, "vcodec": "avc1.4D401F", "tbr": float(200 + h * 2),
+         "format_id": str(h), "url": f"http://x/h-{h}/index.m3u8",
+         "protocol": "m3u8_native", "acodec": "none", "resolution": f"x{h}"}
+        for h in (144, 720, 1080)
+    ]
+
+
+def _fake_hls_master(video_id):
+    """The master the addon would generate for a 3-rendition HLS video."""
+    ladder = QualityLadder(video_id, _ladder_formats())
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:3",
+        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="en",'
+        f'DEFAULT=YES,AUTOSELECT=YES,URI="http://x/{video_id}/a.m3u8"',
+    ]
+    for f in reversed(ladder.rungs):  # best-first, like the real generator
+        h = f["height"]
+        lines.append(
+            f'#EXT-X-STREAM-INF:BANDWIDTH={int(f["tbr"] * 1000)},RESOLUTION=x{h},'
+            f'CODECS="{f["vcodec"]}",AUDIO="audio"')
+        lines.append(f["url"])
+    return "\n".join(lines) + "\n", ladder
+
+
+def _fake_hls_resolve(video_id):
+    """Resolve an "h"-prefixed id to an HLS master plus its quality ladder."""
+    from resources.lib.manifest_server import fetch_manifest, publish, server_url_for
+
+    body, ladder = _fake_hls_master(video_id)
+    name = f"yt_{video_id}.m3u8"
+    url = publish(name, body)
+    rewriter = MasterRewriter(fetch_manifest(url) or body)
+    return {
+        "id": video_id,
+        "title": f"Title of {video_id}",
+        "duration": 180,
+        "thumbnail": f"http://127.0.0.1:9/thumb-{video_id}.jpg",
+        "playable_url": url,
+        "master_url": url,
+        "stream_type": "hls_master",
+        "audio_url": f"http://audio.example/{video_id}/audio.m4a",
+        "is_static_art": False,
+        "max_video_tbr": 2000.0,
+        "artist": "Artist",
+        "album": "Album",
+        "quality_ladder": ladder,
+        "master_rewriter": rewriter,
+        "audio_ladder": [],
     }
 
 
@@ -82,6 +146,9 @@ class Scenario:
             # isPlayingVideo and the window model key off this).
             "http://video.example/": {"duration": 8.0, "audio": False},
             "http://audio.example/": {"duration": 8.0, "audio": True},
+            # Auto-quality HLS masters are served from the addon's own localhost
+            # server under this path; they are video items.
+            "http://127.0.0.1:": {"duration": 8.0, "audio": False},
             # Kodi plays music-queue items through the plugin entry, which
             # hands Kodi the audio URL for every queue item.
             "plugin://plugin.service.ytlounge-cast/": {"duration": 8.0, "audio": True},
@@ -95,6 +162,7 @@ class Scenario:
             "music_visualizer": "never",
             "stream_selection": "manual-osd",
             "max_resolution": "auto",
+            "quality_mode": "auto",
             "dial_port": "0",
             "ytdlp_path": "",
         }
@@ -119,6 +187,21 @@ class Scenario:
         import resources.lib.ytdlp_downloader as downloader
         self._orig_download = downloader.download_ytdlp
         downloader.download_ytdlp = lambda *a, **k: None
+
+        # No scenario may reach the network for ffmpeg. The normalizer is ON by
+        # default and fetches a ~120 MB static build on its first disabled-and-
+        # enabled boot, so a scenario that resolves an item without an existing
+        # artifact would start a real download mid-suite. Pre-place a fake
+        # binary AND stub the fetch: the stub alone is not enough, because the
+        # fetcher is also called from the normalizer's worker thread.
+        import resources.lib.audio_norm as audio_norm
+        self._orig_fetch_ffmpeg = audio_norm.fetch_ffmpeg
+        audio_norm.fetch_ffmpeg = lambda *a, **k: None
+        fake_ffmpeg = os.path.join(xbmcaddon.profile_dir(), "bin", "ffmpeg")
+        os.makedirs(os.path.dirname(fake_ffmpeg), exist_ok=True)
+        with open(fake_ffmpeg, "w") as f:
+            f.write("#!/bin/fake\n")
+        os.chmod(fake_ffmpeg, 0o755)
 
         # mock Lounge + BASE_URL redirect (import-time resolved constants)
         self.lounge = MockLoungeServer().start()
@@ -227,6 +310,8 @@ class Scenario:
         # restore patched symbols
         import resources.lib.ytdlp_downloader as downloader
         downloader.download_ytdlp = self._orig_download
+        import resources.lib.audio_norm as audio_norm
+        audio_norm.fetch_ffmpeg = self._orig_fetch_ffmpeg
         import resources.lib.persistence as persistence
         # FALLBACK_STORE_PATH intentionally left; SessionStore instances are short-lived
         return False

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 from .resolver import VideoResolver
 from .lounge.session import LoungeSession
 from . import preloader
+from .quality_climb import QualityClimber, climb_supported
 
 logger = logging.getLogger("ytlounge.player")
 
@@ -108,6 +109,7 @@ class KodiPlayerBridge:
         stream_selection_type: str = "manual-osd",
         max_resolution: str = "auto",
         music_visualizer: str = "auto",
+        quality_mode: str = "auto",
     ):
         if isinstance(session, list):
             self.sessions = session
@@ -118,6 +120,12 @@ class KodiPlayerBridge:
         self.stream_selection_type = stream_selection_type
         self.max_resolution = max_resolution
         self.music_visualizer = music_visualizer
+        # Playback quality strategy. Separate from the user's max_resolution
+        # ceiling: "auto" starts on the cheapest rendition and climbs, the other
+        # values hand quality control back to the user (OSD picker / IA's own
+        # adaptive switching).
+        self.quality_mode = quality_mode
+        self._climber: Optional[QualityClimber] = None
         self.playlist: List[str] = []
         self.current_index: int = 0
         self.current_video_id: Optional[str] = None
@@ -276,6 +284,11 @@ class KodiPlayerBridge:
                         if self.state != PlayerState.PLAYING and not self._is_paused():
                             self.state = PlayerState.PLAYING
                             self._sync_current_from_kodi()
+                        # Auto quality fallback: on this Kodi build the player
+                        # callbacks are never delivered to the service process
+                        # (verified on device), so onPlayBackStarted cannot be
+                        # the only trigger for the climb.
+                        self._start_climb()
                 except Exception as exc:
                     logger.warning("position_loop player poll failed: %s", exc)
                 self._repair_fullscreen_windows()
@@ -490,6 +503,98 @@ class KodiPlayerBridge:
         """
         return self._transition_remaining() > 0.0
 
+    # ------------------------------------------------------- auto quality
+    def _prepare_climber(self, video_id: str, info: Dict[str, Any]) -> Optional[QualityClimber]:
+        """Publish the cheap first revision and arm the climber (video lane).
+
+        Returns the climber to start once playback is confirmed, or None when
+        auto quality is off, the item has no ladder, or this is the audio lane.
+        Never raises: any failure leaves the full master in place, so the worst
+        case is normal (full-quality-first) playback.
+        """
+        self._stop_climber()
+        try:
+            if self.quality_mode != "auto":
+                return None
+            if info.get("stream_type") != "hls_master":
+                return None
+            if not climb_supported(info):
+                return None
+            ladder = info.get("quality_ladder")
+            rewriter = info.get("master_rewriter")
+            master_url = info.get("master_url") or info.get("playable_url")
+
+            def _publish(body: str) -> None:
+                from .manifest_server import publish
+                publish(self._master_name(master_url), body)
+
+            climber = QualityClimber(
+                video_id, ladder, rewriter,
+                publish=_publish,
+                handoff_free=lambda: not self.handoff_pending(),
+                is_current=lambda: self._climb_target_current(video_id),
+                playing_ok=self._climb_playback_ok,
+            )
+            if climber.initial_body() is None:
+                return None
+            logger.info(
+                "Auto quality %s: starting on the cheapest rendition of %s (mode=auto)",
+                video_id, ladder.summary())
+            self._climber = climber
+            return climber
+        except Exception:
+            logger.debug("auto quality prep failed for %s", video_id, exc_info=True)
+            return None
+
+    @staticmethod
+    def _master_name(master_url: str) -> str:
+        """Manifest name to republish: the last path segment of the master URL."""
+        name = str(master_url or "").rsplit("/", 1)[-1]
+        if "?" in name:
+            name = name.split("?")[0]
+        return name
+
+    def _climb_target_current(self, video_id: str) -> bool:
+        """True while this climber's item is still the one being played."""
+        with self._lock:
+            return self.current_video_id == video_id
+
+    def _climb_playback_ok(self) -> bool:
+        """True when Kodi is playing and the clock is genuinely moving.
+
+        Deliberately conservative: climbing while the first rung is still
+        opening makes inputstream.adaptive re-select before the picture is up,
+        which reads as a stutter — exactly what the ladder exists to avoid.
+        """
+        if not (KODI_AVAILABLE and self._kodi_player):
+            return False
+        try:
+            if not self._kodi_player.isPlaying():
+                return False
+            if self._kodi_player.isPlayingVideo() is False:
+                # Audio lane is up under this bridge: not our climb's business.
+                return False
+        except Exception:
+            return False
+        return True
+
+    def _start_climb(self) -> None:
+        """Start the armed climber (called once playback is confirmed)."""
+        climber = self._climber
+        if climber is None or climber.running():
+            return
+        climber.start()
+
+    def _stop_climber(self) -> None:
+        """Cancel any in-flight climb and drop the reference."""
+        climber = self._climber
+        self._climber = None
+        if climber is not None:
+            try:
+                climber.stop()
+            except Exception:
+                pass
+
     def _kick_prefetch(self) -> None:
         """Resolve the next queue item in the background (populates the resolver cache)."""
         with self._lock:
@@ -597,6 +702,13 @@ class KodiPlayerBridge:
             proxied = None
         if proxied:
             playable_url = proxied
+
+        # Auto quality (video lane only): publish a master exposing just the
+        # cheapest rendition so the picture is on screen in ~1s, and keep the
+        # climber ready to widen it once playback is confirmed. This runs BEFORE
+        # player.play by design — the manifest Kodi opens must already be the
+        # small one, or the first fetch would be the full-resolution variant.
+        climber = self._prepare_climber(video_id, info)
 
         with self._lock:
             if gen != self._play_gen:
@@ -1205,6 +1317,7 @@ class KodiPlayerBridge:
                 pass
 
     def stop(self) -> None:
+        self._stop_climber()
         with self._lock:
             self._play_gen += 1
             PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
@@ -1339,6 +1452,11 @@ class KodiPlayerBridge:
         # auto-advance or manual selection), in which case current_video_id
         # still points at the phone's last cast and the phone desyncs.
         self._sync_current_from_kodi()
+
+        # Auto quality: the rung is on screen, so it is safe to widen the
+        # master. Started here (not at play time) so the first fetch is small.
+        if self.state == PlayerState.PLAYING:
+            self._start_climb()
 
         if self.current_video_id:
             for s in self.sessions:

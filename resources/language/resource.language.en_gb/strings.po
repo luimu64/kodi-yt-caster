@@ -217,3 +217,23 @@ msgstr "Custom ffmpeg path"
 msgctxt "#30055"
 msgid "Leave empty to use the binary downloaded into the addon profile. Set this to use an ffmpeg already on the device"
 msgstr "Leave empty to use the binary downloaded into the addon profile. Set this to use an ffmpeg already on the device"
+
+msgctxt "#30056"
+msgid "Playback quality mode"
+msgstr "Playback quality mode"
+
+msgctxt "#30057"
+msgid "Auto starts every cast on the lowest quality and upgrades to the best available in the background, so playback begins within about a second. Adaptive lets the player pick quality from the measured bandwidth. Manual leaves the choice to you in the player's quality menu"
+msgstr "Auto starts every cast on the lowest quality and upgrades to the best available in the background, so playback begins within about a second. Adaptive lets the player pick quality from the measured bandwidth. Manual leaves the choice to you in the player's quality menu"
+
+msgctxt "#30058"
+msgid "Auto (start low, upgrade invisibly)"
+msgstr "Auto (start low, upgrade invisibly)"
+
+msgctxt "#30059"
+msgid "Adaptive (player picks from bandwidth)"
+msgstr "Adaptive (player picks from bandwidth)"
+
+msgctxt "#30060"
+msgid "Manual (choose from player quality menu)"
+msgstr "Manual (choose from player quality menu)"

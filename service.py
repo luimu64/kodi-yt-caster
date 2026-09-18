@@ -160,6 +160,7 @@ def run_service() -> None:
     stream_selection = get_setting("stream_selection", "manual-osd")
     max_resolution = get_setting("max_resolution", "auto")
     music_visualizer = get_setting("music_visualizer", "auto")
+    quality_mode = get_setting("quality_mode", "auto") or "auto"
     enable_discovery = get_setting_bool("enable_discovery", True)
 
     # Loudness normalization (resources/lib/audio_norm.py). Read lazily through
@@ -296,7 +297,10 @@ def run_service() -> None:
 
             # Initialize resolver and player
             ytdlp_bin = find_ytdlp_binary(custom_ytdlp)
-            bridge = YtDlpBridge(binary_path=ytdlp_bin, cookies_path=custom_cookies or None)
+            # The bridge needs the resolution ceiling to build the auto-quality
+            # ladder: it decides which renditions are allowed in the master.
+            bridge = YtDlpBridge(binary_path=ytdlp_bin, cookies_path=custom_cookies or None,
+                                 max_resolution=max_resolution)
 
             # Loudness normalization: one background worker plus a per-video
             # artifact cache. The resolver feeds it every resolved item and
@@ -331,6 +335,7 @@ def run_service() -> None:
                 stream_selection_type=stream_selection,
                 max_resolution=max_resolution,
                 music_visualizer=music_visualizer,
+                quality_mode=quality_mode,
             )
             player.start_monitor()
             normalizer.set_hold_check(player.handoff_pending)
