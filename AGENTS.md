@@ -35,6 +35,13 @@ Add or extend a scenario that fails before the fix and passes after
 A bug fixed without a regression scenario is not fixed. Assertions are
 state-based with deadlines (`harness.wait_until`), never thread-ordering.
 
+## Workspace discipline (kanban workers)
+
+- **Work in the checkout you were given.** Do not clone the repo somewhere else and do not edit any other copy of it — another profile's `home/work/…`, a `/tmp` clone, or a stale snapshot elsewhere on the box. Edits made outside the tree the board handed you are invisible to the board and are treated as **not done**, no matter what the tests said in that other copy.
+- **Commit on the current branch and report the commit sha.** Leave no uncommitted work behind; a card that ends with a dirty tree has not handed anything over.
+- **A "done" claim must be reproducible here.** Run both gates in this checkout and paste their tails. Never report a gate result from a different copy.
+- **One card, one concern.** Touch only the files your card names plus their tests; unrelated edits collide with sibling cards working in the same tree.
+
 ## Hard constraints
 
 - **Do not modify addon runtime code (`service.py`, `resources/lib/*`) to
