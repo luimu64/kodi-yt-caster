@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import sys
 import time
 import unittest
 from typing import Any, Dict
@@ -416,6 +417,49 @@ def test_actions_module():
     import actions
     assert hasattr(actions, "action_show_pairing")
     assert hasattr(actions, "action_update_ytdlp")
+    assert hasattr(actions, "action_fetch_ffmpeg")
+
+
+def test_actions_dispatch_routes_every_settings_button():
+    """Every settings-button action must reach its own handler.
+
+    Regression: "Download ffmpeg" (RunScript(...,fetch_ffmpeg)) had no branch in
+    the dispatcher and fell through to the pairing dialog, so the button opened
+    the TV code popup instead of downloading. An unknown action must now be
+    reported, never silently swapped for a different one.
+    """
+    import actions
+    names = ("action_show_pairing", "action_update_ytdlp", "action_fetch_ffmpeg")
+    originals = {n: getattr(actions, n) for n in names}
+    saved_argv = sys.argv
+    calls = []
+    try:
+        for name in names:
+            setattr(actions, name,
+                    (lambda n: (lambda *a, **k: calls.append(n)))(name))
+        cases = [
+            (["actions.py", "fetch_ffmpeg"], "action_fetch_ffmpeg"),
+            (["actions.py", "update_ytdlp"], "action_update_ytdlp"),
+            (["actions.py", "show_pairing"], "action_show_pairing"),
+            (["actions.py", "reset_pairing"], "action_show_pairing"),
+            (["actions.py"], "action_show_pairing"),
+            (["actions.py", ""], "action_show_pairing"),
+        ]
+        for argv, expected in cases:
+            calls[:] = []
+            sys.argv = argv
+            actions.main()
+            assert calls == [expected], (argv, calls)
+
+        # Unknown action: report it, do not open the pairing dialog.
+        calls[:] = []
+        sys.argv = ["actions.py", "definitely_not_an_action"]
+        actions.main()
+        assert calls == [], calls
+    finally:
+        sys.argv = saved_argv
+        for name, fn in originals.items():
+            setattr(actions, name, fn)
 
 
 def test_kodi_queue_mode_ended_no_self_advance():

@@ -121,18 +121,37 @@ def _profile_dir() -> str:
         return ADDON_ROOT
 
 
-def main() -> None:
-    action = sys.argv[1] if len(sys.argv) > 1 else "show_pairing"
+def _unknown_action(action: str) -> None:
+    """An unrecognised action must never silently run a different one.
 
-    if action in ("show_pairing", "--show-pairing", "pair"):
+    A settings button whose id is missing from the dispatch below used to fall
+    through to show_pairing, so the "Download ffmpeg" button opened the pairing
+    code dialog instead of downloading. Log it and tell the user instead.
+    """
+    message = f"Unknown action: {action!r}"
+    if KODI_AVAILABLE and xbmc and xbmcgui:
+        try:
+            xbmc.log(f"[plugin.service.ytlounge-cast] {message}", 3)
+            xbmcgui.Dialog().notification(
+                "YouTube Cast", message, xbmcgui.NOTIFICATION_ERROR, 5000)
+        except Exception:
+            pass
+    print(message, file=sys.stderr)
+
+
+def main() -> None:
+    action = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    if action in ("", "show_pairing", "--show-pairing", "pair"):
         action_show_pairing(reset=False)
     elif action in ("reset_pairing", "--reset-pairing", "relink"):
         action_show_pairing(reset=True)
     elif action in ("update_ytdlp", "--update-ytdlp", "update"):
         action_update_ytdlp()
+    elif action in ("fetch_ffmpeg", "--fetch-ffmpeg"):
+        action_fetch_ffmpeg()
     else:
-        # Default action when triggered without arguments
-        action_show_pairing(reset=False)
+        _unknown_action(action)
 
 
 if __name__ == "__main__":
