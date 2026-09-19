@@ -3,7 +3,7 @@ id: TASK_AUTO_0001
 state: in_progress
 phase: done
 created_at: 2026-09-19T07:35:57.678Z
-updated_at: 2026-09-19T09:57:55.451Z
+updated_at: 2026-09-19T09:58:41.309Z
 title: Implement refactor described within docs/STATE-TRANSFER-REFACTOR.md
 ---
 
@@ -20,7 +20,7 @@ Implement refactor described within docs/STATE-TRANSFER-REFACTOR.md
 - [x] P01 TASK_0001 a1  Establish SessionState as the single in-process state owner — extract an immutable snapshot data class
 - [x] P02 TASK_0002 a1  Implement event reduction for all state changes — pure idempotent reducer and reduction logging
 - [x] P03 TASK_0003 a1  Convert player and window management to derived projections — remove timer repair loops
-- [ ] P04 TASK_0004 a2:failed  Publish outbound state batches by snapshot version — diff against last published state with monotonic ofs
+- [ ] P04 TASK_0004 a3:failed  Publish outbound state batches by snapshot version — diff against last published state with monotonic ofs
 - [ ] P05  Support multiple channel subscribers on a single model — independent ofs sequences and sockets
 - [ ] P06  Persist the durable session record — save playlist, position, and playback cpn across restarts
 - [ ] P07  Derive currentIndex at publication time — compute index from stored queue instead of carrying field
