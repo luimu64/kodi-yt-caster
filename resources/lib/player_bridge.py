@@ -1270,6 +1270,13 @@ class KodiPlayerBridge:
         return False
 
     def pause(self) -> None:
+        # Nothing loaded (stopped/never started) -> pausing is a no-op. A
+        # fire-and-forget pause applied here would claim PAUSED on an empty
+        # player, a state the phone cannot map and the reconciler would have to
+        # undo (R6/R8: no asserting a state no source supports).
+        if not self.current_video_id or self.owner.play_state == PlayerState.STOPPED:
+            logger.info("pause ignored: nothing loaded (state=%s)", self.owner.play_state)
+            return
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             # pause() TOGGLES: guard so pause-while-paused does not resume.
             if not self._is_paused():

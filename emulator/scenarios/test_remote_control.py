@@ -77,6 +77,29 @@ def test_volume():
         assert r, "volume must clamp to 100"
 
 
+def test_pause_after_stop_is_a_noop():
+    """Regression (found by the R-matrix soak): a fire-and-forget pause on a
+    stopped/empty player must not publish PAUSED with an item still set — that
+    state has no source and the phone cannot map it (C2/R6/R8)."""
+    with Scenario() as s:
+        _cast(s)
+        s.phone.stop()
+        s.wait_until(lambda: s.playing_file() is None, what="stopped")
+        s.lounge.wait_for_report("onStateChange", lambda r: r.get("state") == "0", timeout=15)
+        import time
+        time.sleep(0.5)
+        s.phone.pause()  # nothing is loaded
+        time.sleep(1.0)
+        snap = s.snapshot()
+        assert snap is not None
+        assert snap.play_state != 2, (
+            f"pause on a stopped player produced PAUSED (state={snap.play_state})")
+        # And no report may claim PAUSED either.
+        reps = [r for r in s.lounge.REPORTS
+                if r["sc"] == "nowPlaying" and r.get("state") == "2"]
+        assert not reps, reps[-1]
+
+
 def test_stop_while_resolving():
     from resources.lib.resolver import VideoResolver
     orig = VideoResolver.resolve

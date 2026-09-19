@@ -232,7 +232,12 @@ R10 (independent; schedule when a quick win is wanted)
    `resources/lib/lounge/vocabulary.py` with a `vocabulary: 7/10 (missing: …)` line logged per
    session; `onAdStateChange`/`onAdPlaying` emit the known "no ad" on item/playback changes;
    `autoplayUpNext` is derived from the stored queue and omitted when there is no next item).
-8. **Reliability matrix** — the acceptance gate, only meaningful after the rest.
+8. **Reliability matrix** — the acceptance gate, only meaningful after the rest. ✅
+   `emulator/scenarios/test_reliability_matrix.py`: a convergence assertion (snapshot == last
+   published == player, no out-of-range index or foreign `listId`, per-channel `ofs` monotonic) run
+   after every quiescent point, plus a fixed-seed soak of 200 mixed interaction sequences. It
+   caught a real bug (a fire-and-forget pause on a stopped player published PAUSED with no source);
+   fixed in `KodiPlayerBridge.pause()` and covered by `test_pause_after_stop_is_a_noop`.
 
 ### What not to do
 
@@ -337,6 +342,12 @@ Rules land on `feat/state-single-owner`, each with both gates green at its commi
   (we resolve locally, no ad is ever injected — a fact, not a guess); `autoplayUpNext` is derived
   from the stored queue and omitted for the last item. Unit tests `test_r10_*` and
   `emulator/scenarios/test_vocabulary_coverage.py`. Both gates green.
+- **Reliability matrix** — `emulator/scenarios/test_reliability_matrix.py` (convergence assertion +
+  fixed-seed 200-sequence soak). Harness gained `snapshot()`, `last_published()` and
+  `player_state()` helpers (plus a bridge-capture hook) so a scenario can assert against the R1
+  snapshot. The strict assertion found `pause()` on a stopped player publishing PAUSED; fixed in
+  `player_bridge.pause()` (no-op when nothing is loaded) with regression scenario
+  `test_remote_control.test_pause_after_stop_is_a_noop`. Both gates green.
 
 **R7 landed with two regression fixes that are part of it**, both in the projection path:
 

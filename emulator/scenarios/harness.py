@@ -143,6 +143,18 @@ class Scenario:
                 service._emu_sessions[session.theme] = session
             listener_mod.LoungeListener.__init__ = _init
 
+        # Capture the single player bridge so scenarios can assert convergence
+        # against the R1 snapshot (harness-side only; no addon code changes).
+        import resources.lib.player_bridge as pb_mod
+        if not getattr(pb_mod, "_emu_wrapped", False):
+            pb_mod._emu_wrapped = True
+            _orig_pb_init = pb_mod.KodiPlayerBridge.__init__
+
+            def _pb_init(self, *a, **kw):
+                _orig_pb_init(self, *a, **kw)
+                service._emu_player = self
+            pb_mod.KodiPlayerBridge.__init__ = _pb_init
+
         self.service = service
         _CALLS["resolve"].clear()
         self.service_thread = threading.Thread(target=service.run_service, daemon=True, name="ServiceMain")
@@ -168,6 +180,31 @@ class Scenario:
         if video_id is None:
             return len(_CALLS["resolve"])
         return _CALLS["resolve"].count(video_id)
+
+    def snapshot(self):
+        """The receiver's current SessionState snapshot (R1), or None."""
+        player = getattr(self.service, "_emu_player", None)
+        return player.owner.snapshot() if player is not None else None
+
+    def last_published(self, theme="cl"):
+        """The last snapshot a channel published, or None."""
+        sess = getattr(self.service, "_emu_sessions", {}).get(theme)
+        return sess._last_published if sess is not None else None
+
+    def player_state(self):
+        """The simulated Kodi player's observed facts."""
+        try:
+            p = xbmc.Player()
+            return {
+                "file": p.getPlayingFile(),
+                "time": p.getTime(),
+                "total": p.getTotalTime(),
+                "playing": p.isPlaying(),
+                "audio": p.isPlayingAudio(),
+                "video": p.isPlayingVideo(),
+            }
+        except Exception:
+            return {}
 
     def sid_for_theme(self, theme):
         """Mock-Lounge session id served by the listener for a theme.
