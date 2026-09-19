@@ -228,7 +228,10 @@ R10 (independent; schedule when a quick win is wanted)
    fact has one source (the `?play=` info label) and a momentary unreadable label no longer
    contradicts the phone; with no item at all it publishes `SignalUnknownEvent` (UNKNOWN,
    recoverable) instead of guessing).
-7. **R10** — vocabulary coverage, independently schedulable.
+7. **R10** — vocabulary coverage, independently schedulable. ✅ (declared table in
+   `resources/lib/lounge/vocabulary.py` with a `vocabulary: 7/10 (missing: …)` line logged per
+   session; `onAdStateChange`/`onAdPlaying` emit the known "no ad" on item/playback changes;
+   `autoplayUpNext` is derived from the stored queue and omitted when there is no next item).
 8. **Reliability matrix** — the acceptance gate, only meaningful after the rest.
 
 ### What not to do
@@ -327,6 +330,13 @@ Rules land on `feat/state-single-owner`, each with both gates green at its commi
   channel. `lane` is already a snapshot field, so no second state exists per channel. Tests:
   `test_r9_*` unit assertions (one batch per channel, identical identity, independent monotonic
   `ofs`) and `emulator/scenarios/test_one_model_n_channels.py`. Both gates green.
+- **R10** (declare the vocabulary, log the gaps) — `resources/lib/lounge/vocabulary.py` declares
+  the ten official families (payload fields, implemented?, reason when not) and logs
+  `vocabulary: 7/10 (missing: onSubtitlesTrackChanged, onPlaybackSpeedChanged,
+  autoplayModeChanged)` per session. `onAdStateChange`/`onAdPlaying` publish the known "no ad"
+  (we resolve locally, no ad is ever injected — a fact, not a guess); `autoplayUpNext` is derived
+  from the stored queue and omitted for the last item. Unit tests `test_r10_*` and
+  `emulator/scenarios/test_vocabulary_coverage.py`. Both gates green.
 
 **R7 landed with two regression fixes that are part of it**, both in the projection path:
 

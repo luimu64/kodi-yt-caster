@@ -481,23 +481,26 @@ def test_r7_publish_one_batch_per_changed_field_group():
     assert posted == ["onVolumeChanged"], posted
     posted.clear()
 
-    # playback-only change (same play_state) -> nowPlaying, no onStateChange
+    # playback-only change (same play_state) -> nowPlaying, no onStateChange;
+    # R10 adds the ad-state family to a playback change.
     tick = vol.__class__(**{**vol.__dict__, "position": 5.0, "version": 3})
     assert session.publish_snapshot(tick) is True
-    assert posted == ["nowPlaying"], posted
+    assert sorted(posted) == sorted(["nowPlaying", "onAdStateChange"]), posted
     posted.clear()
 
-    # play_state change -> nowPlaying + onStateChange
+    # play_state change -> nowPlaying + onStateChange (+ ad state)
     paused = tick.__class__(**{**tick.__dict__, "play_state": PlayState.PAUSED, "version": 4})
     assert session.publish_snapshot(paused) is True
-    assert sorted(posted) == ["nowPlaying", "onStateChange"], posted
+    assert sorted(posted) == sorted(["nowPlaying", "onStateChange", "onAdStateChange"]), posted
     posted.clear()
 
     # identity change with a playlist -> nowPlaying + nowPlayingPlaylist
+    # (+ ad families; up-next omitted because 'b' is the last item: R6/R10)
     ident = paused.__class__(**{**paused.__dict__, "current_video_id": "b",
                                 "current_index": 1, "version": 5})
     assert session.publish_snapshot(ident) is True
-    assert sorted(posted) == ["nowPlaying", "nowPlayingPlaylist"], posted
+    assert sorted(posted) == sorted(["nowPlaying", "nowPlayingPlaylist",
+                                     "onAdStateChange", "onAdPlaying"]), posted
     posted.clear()
 
     # identical snapshot -> no batch at all
@@ -585,7 +588,9 @@ def test_r7_heartbeat_emits_full_snapshot():
                         duration=180.0, volume=100, lane="cl")
     assert session.publish_snapshot(snap, heartbeat=True) is True
     names = sorted(sc for sc, _ in posted)
-    assert names == ["nowPlaying", "nowPlayingPlaylist", "onVolumeChanged"], posted
+    # R10: the crash-recovery heartbeat carries the full vocabulary we know.
+    assert names == sorted(["nowPlaying", "nowPlayingPlaylist", "autoplayUpNext",
+                            "onAdStateChange", "onVolumeChanged"]), posted
     assert all(hb is True for _, hb in posted), posted
     # "<= 1 Hz" means no more than one heartbeat per second: period >= 1s.
     assert session._heartbeat_interval >= 1.0, session._heartbeat_interval
@@ -891,6 +896,53 @@ def test_r6_unknown_published_when_item_fact_has_no_source():
         pb.KODI_AVAILABLE = orig_kodi
         pb.xbmc = orig_xbmc
         session.close()
+
+def test_r10_vocabulary_declared_and_coverage_logged():
+    """R10: the ten official families are declared, the implemented set is
+    logged with the gaps, and the two newly implemented ones are real."""
+    from resources.lib.lounge import vocabulary
+
+    assert len(vocabulary.VOCABULARY) == 10, vocabulary.VOCABULARY
+    assert len({f.name for f in vocabulary.VOCABULARY}) == 10
+    line = vocabulary.coverage_line()
+    assert line.startswith("vocabulary: "), line
+    assert "missing:" in line and "autoplayModeChanged" in line
+    # Every declared name has a payload spec and, when unimplemented, a reason.
+    for f in vocabulary.VOCABULARY:
+        assert f.payload, f
+        if not f.implemented:
+            assert f.why_not, f
+
+    # The newly implemented families are emittable through the one path.
+    assert vocabulary.is_implemented("onAdStateChange")
+    assert vocabulary.is_implemented("onAdPlaying")
+    assert vocabulary.is_implemented("autoplayUpNext")
+
+def test_r10_up_next_emitted_when_known_omitted_when_not():
+    """R10/R6: autoplayUpNext is derived from the stored queue and omitted when
+    the receiver does not know what comes next (no guess)."""
+    from resources.lib.session_state import SessionState, PlayState
+
+    session = LoungeSession("s1", "t1", "d1")
+    session.sid = "sid-test"
+
+    mid = SessionState(version=1, playlist=("a", "b", "c"), current_video_id="b",
+                       current_index=1, list_id="L1", play_state=PlayState.PLAYING)
+    assert session._build_up_next(mid) == {"videoId": "c", "listId": "L1"}
+
+    last = SessionState(version=2, playlist=("a", "b", "c"), current_video_id="c",
+                        current_index=2, list_id="L1", play_state=PlayState.PLAYING)
+    assert session._build_up_next(last) is None
+
+    # Single item / foreign item at the end -> nothing to advertise.
+    single = SessionState(version=3, playlist=("a",), current_video_id="a",
+                          current_index=0, list_id="L1", play_state=PlayState.PLAYING)
+    assert session._build_up_next(single) is None
+
+    # The ad family is a known "no ad", and the emitted payload is stable.
+    ads = session._build_ad_state()
+    assert ads["adState"] == "0" and ads["isSkippable"] == "false"
+    session.close()
 
 def test_duration_reporting_and_fallback():
     session = LoungeSession("s1", "t1", "d1")
@@ -1420,6 +1472,8 @@ if __name__ == "__main__":
     test_r8_reconcile_emits_one_corrective_event_for_a_drift()
     test_r8_vanished_player_is_a_corrective_stop()
     test_r6_unknown_published_when_item_fact_has_no_source()
+    test_r10_vocabulary_declared_and_coverage_logged()
+    test_r10_up_next_emitted_when_known_omitted_when_not()
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
     test_track_change_watchdog_adopts_on_kodi_native_advance()

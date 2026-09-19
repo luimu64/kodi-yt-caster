@@ -23,6 +23,7 @@ except ImportError:
     from resources.lib.session_state import SessionState, PlayState, StateOwner, _diff_field_groups, published_index
 
 from .client import BASE_URL, DEFAULT_HEADERS, LoungeError, LoungeTokenExpiredError
+from .vocabulary import coverage_line
 
 logger = logging.getLogger("ytlounge.session")
 CMD_PATTERN = re.compile(r"\[(?P<code>\d+),\[\"(?P<cmd>.+?)\"(?:,(?P<data>.*?))?\]\]")
@@ -126,6 +127,9 @@ class LoungeSession:
         )
         self._post_worker = self._publisher_thread  # backwards compat
         self._publisher_thread.start()
+        # R10: declare the outbound vocabulary once per session, so a family we
+        # never emit is a logged fact, not a silent default on the phone.
+        logger.info(coverage_line())
 
     def _random_zx(self) -> str:
         return "".join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -279,6 +283,11 @@ class LoungeSession:
                 actions_to_emit.append(("nowPlaying", self._build_now_playing(snapshot)))
                 if snapshot.playlist:
                     actions_to_emit.append(("nowPlayingPlaylist", self._build_now_playing_playlist(snapshot)))
+                # R10: up-next is derivable from the stored queue — emit it when
+                # we know the next item, omit it (no guess) when we do not.
+                up_next = self._build_up_next(snapshot)
+                if up_next is not None:
+                    actions_to_emit.append(("autoplayUpNext", up_next))
 
             # 2. Playback group
             if "playback" in changed_groups:
@@ -292,6 +301,15 @@ class LoungeSession:
                 )
                 if should_emit_state_change:
                     actions_to_emit.append(("onStateChange", self._build_state_change(snapshot)))
+
+            # R10: the receiver resolves locally (yt-dlp) and never injects ads,
+            # so "no ad" is a known fact, not a guess. Reassert it whenever the
+            # item or the playback changes, so a skip control is backed by a
+            # real family rather than a phone-side default.
+            if "identity" in changed_groups or "playback" in changed_groups:
+                actions_to_emit.append(("onAdStateChange", self._build_ad_state()))
+                if "identity" in changed_groups:
+                    actions_to_emit.append(("onAdPlaying", self._build_ad_state()))
 
             # 3. Volume group
             if "volume" in changed_groups:
@@ -325,6 +343,10 @@ class LoungeSession:
             ]
             if snapshot.playlist:
                 heartbeat_actions.append(("nowPlayingPlaylist", self._build_now_playing_playlist(snapshot)))
+                up_next = self._build_up_next(snapshot)
+                if up_next is not None:
+                    heartbeat_actions.append(("autoplayUpNext", up_next))
+            heartbeat_actions.append(("onAdStateChange", self._build_ad_state()))
             heartbeat_actions.append(("onVolumeChanged", self._build_volume(snapshot)))
 
             action_names = [a[0] for a in heartbeat_actions]
@@ -405,6 +427,35 @@ class LoungeSession:
         return {
             "volume": str(max(0, min(int(snapshot.volume), 100))),
             "muted": "false",
+        }
+
+    def _build_up_next(self, snapshot: SessionState) -> Optional[Dict[str, Any]]:
+        """autoplayUpNext (R10): the queue item after the one playing.
+
+        Derivable from the stored queue, so it is emitted when known. Omitted
+        entirely when there is no next item — the receiver must not guess (R6).
+        """
+        if not snapshot.playlist:
+            return None
+        nxt = published_index(snapshot) + 1
+        if nxt >= len(snapshot.playlist):
+            return None
+        payload: Dict[str, Any] = {"videoId": snapshot.playlist[nxt]}
+        if snapshot.list_id:
+            payload["listId"] = str(snapshot.list_id)
+        return payload
+
+    def _build_ad_state(self) -> Dict[str, Any]:
+        """onAdStateChange / onAdPlaying (R10): no ad is playing.
+
+        Streams are resolved locally by yt-dlp and no ad is ever injected, so
+        this is a known fact. An unknown ad state would be omitted instead.
+        """
+        return {
+            "adState": "0",
+            "adDuration": "0",
+            "adPosition": "0",
+            "isSkippable": "false",
         }
 
     def post_action(self, sc: str, data: Dict[str, Any], heartbeat: bool = False) -> bool:
