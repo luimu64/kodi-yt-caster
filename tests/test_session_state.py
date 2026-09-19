@@ -9,6 +9,11 @@ Acceptance criteria for R3:
 - No event type may be reachable that mutates state outside the reducer.
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from dataclasses import FrozenInstanceError
 import logging
 import unittest
