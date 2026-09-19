@@ -5,9 +5,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from .resolver import VideoResolver
 from .lounge.session import LoungeSession
+from .session_state import (
+    SessionState, StateOwner, SetPlaylistEvent, UpdatePlaylistEvent, PlayEvent,
+    PauseEvent, ResumeEvent, PauseDetectedEvent, ResumeDetectedEvent, SeekToEvent,
+    SetVolumeEvent, StopVideoEvent, NextEvent, PlaybackStartedEvent, KodiAdvancedEvent,
+    PlaybackEndedEvent, ResolverCompletedEvent, KodiStateObservedEvent, SignalUnknownEvent
+)
 from . import preloader
 
 logger = logging.getLogger("ytlounge.player")
@@ -108,6 +114,9 @@ class KodiPlayerBridge:
         stream_selection_type: str = "manual-osd",
         max_resolution: str = "auto",
         music_visualizer: str = "auto",
+        initial_state: Optional["SessionState"] = None,
+        store=None,
+        on_apply=None,
     ):
         if isinstance(session, list):
             self.sessions = session
@@ -118,22 +127,15 @@ class KodiPlayerBridge:
         self.stream_selection_type = stream_selection_type
         self.max_resolution = max_resolution
         self.music_visualizer = music_visualizer
-        self.playlist: List[str] = []
-        self.current_index: int = 0
-        self.current_video_id: Optional[str] = None
-        # Lounge queue identity handed to us by the mobile client in the
-        # setPlaylist command. The phone keys its player model on this
-        # listId: a nowPlaying report whose videoId/currentIndex is not
-        # attached to a listId the client already knows is silently
-        # rejected, which is what made the app keep rendering the old
-        # track (0:00 + replay glyph) after a TV-side advance.
-        self.list_id: str = ""
-        self._current_duration: int = 0
+        # Single in-process owner of the session facts (R1/R3). Reads go through
+        # the read-only properties below; writes go through self.owner.apply().
         self.pending_seek: Optional[float] = None
-        # 'm' when the current item was cast from YouTube Music, 'cl' from
-        # YouTube; None until the first cast.
-        self.current_theme: Optional[str] = None
-        self.state = PlayerState.STOPPED
+        self.store = store
+        self._save_hook = on_apply
+        self.owner = StateOwner(
+            initial_state if initial_state is not None else SessionState(),
+            on_apply=self._save_hook,
+        )
         self._lock = threading.RLock()
         self._play_gen = 0  # monotonic play-request epoch; supersedes stale requests
         self._requested_id: Optional[str] = None  # video the latest play request targets (set at ENQUEUE time)
@@ -179,26 +181,56 @@ class KodiPlayerBridge:
         else:
             self._kodi_player = None
 
+    # --- Session facts: read-only views over the single owner (R1) ---
+    # Every read routes to the owner; the only write path is owner.apply().
+    @property
+    def state(self) -> int:
+        return self.owner.play_state
+
+    @property
+    def playlist(self) -> List[str]:
+        return list(self.owner.playlist)
+
+    @property
+    def current_index(self) -> int:
+        return self.owner.current_index
+
+    @property
+    def current_video_id(self) -> Optional[str]:
+        return self.owner.current_video_id
+
+    @property
+    def list_id(self) -> str:
+        return self.owner.list_id
+
+    @property
+    def current_theme(self) -> Optional[str]:
+        return self.owner.lane
+
+    @property
+    def volume(self) -> int:
+        return self.owner.volume
+
+    @property
+    def position(self) -> float:
+        return self.owner.position
+
     @property
     def current_duration(self) -> int:
-        if self._current_duration <= 0:
+        d = self.owner.duration
+        if d <= 0:
             player = getattr(self, "_kodi_player", None)
             if KODI_AVAILABLE and player:
                 try:
                     if player.isPlaying():
                         total = player.getTotalTime()
                         if total is not None and total > 0:
-                            self._current_duration = max(0, int(total))
+                            # Keep the owner the single source: fold the
+                            # live total into it, not a parallel field.
+                            self.owner.apply(KodiStateObservedEvent(duration=float(total)))
                 except Exception:
                     pass
-        return max(0, self._current_duration)
-
-    @current_duration.setter
-    def current_duration(self, val: Any) -> None:
-        try:
-            self._current_duration = max(0, int(val or 0))
-        except (TypeError, ValueError):
-            self._current_duration = 0
+        return max(0, int(self.owner.duration))
 
     def get_duration(self) -> int:
         """Return total duration in seconds, querying Kodi player if unknown."""
@@ -274,7 +306,7 @@ class KodiPlayerBridge:
                                     kodi_vid, self.current_video_id)
                                 self._sync_current_from_kodi(playing_url)
                         if self.state != PlayerState.PLAYING and not self._is_paused():
-                            self.state = PlayerState.PLAYING
+                            self.owner.apply(ResumeEvent())
                             self._sync_current_from_kodi()
                 except Exception as exc:
                     logger.warning("position_loop player poll failed: %s", exc)
@@ -372,14 +404,10 @@ class KodiPlayerBridge:
                 self._on_playback_resumed()
 
     def _resync_index(self) -> None:
-        """Re-derive current_index from current_video_id after queue edits."""
-        with self._lock:
-            if self.playlist and self.current_video_id in self.playlist:
-                self.current_index = self.playlist.index(self.current_video_id)
-            elif self.playlist:
-                self.current_index = max(0, min(self.current_index, len(self.playlist) - 1))
-            else:
-                self.current_index = 0
+        """Index is owned by the reducer (SetPlaylistEvent / UpdatePlaylistEvent
+        re-derive it), so there is nothing to re-derive here. Kept for call-site
+        compatibility."""
+        pass
 
     def set_playlist(self, data: Dict[str, Any]) -> None:
         """Handle setPlaylist command from YouTube mobile app."""
@@ -391,22 +419,18 @@ class KodiPlayerBridge:
             if list_id:
                 if self.list_id and self.list_id != list_id:
                     logger.info("Lounge listId changed: %s -> %s", self.list_id, list_id)
-                self.list_id = list_id
-
-            if video_ids_str:
-                self.playlist = [v for v in video_ids_str.split(",") if v]
-            elif video_id:
-                self.playlist = [video_id]
-            else:
-                self.playlist = []
-
-            if video_id and video_id in self.playlist:
-                self.current_index = self.playlist.index(video_id)
-            else:
-                self.current_index = 0
-
-            self.current_theme = str(data.get("_theme") or self.current_theme or "")
-            target_id = self.playlist[self.current_index] if self.playlist else video_id
+            # R1: the owner owns list_id, playlist, index and lane. Feed it the
+            # queue; the reducer derives current_index and keeps lane.
+            self.owner.apply(
+                SetPlaylistEvent(
+                    video_id=video_id or None,
+                    video_ids=[v for v in video_ids_str.split(",") if v] or None,
+                    list_id=list_id or None,
+                    current_time=current_time,
+                    theme=data.get("_theme") or None,
+                )
+            )
+            target_id = self.owner.playlist[self.owner.current_index] if self.owner.playlist else video_id
             if target_id:
                 # Dedup: Google relays the same setPlaylist on both Lounge sessions (and resends
                 # on rebind), so the same video can arrive 2-4x in a burst. If we are already
@@ -433,27 +457,24 @@ class KodiPlayerBridge:
         with self._lock:
             video_ids_str = data.get("videoIds", "")
             if video_ids_str:
-                self.playlist = [v for v in video_ids_str.split(",") if v]
-        self._resync_index()
+                self.owner.apply(
+                    UpdatePlaylistEvent(video_ids=[v for v in video_ids_str.split(",") if v])
+                )
 
     def play_video_id(self, video_id: str, seek_time: float = 0.0, theme: Optional[str] = None) -> None:
         with self._lock:
             self._requested_id = video_id
-            self.current_video_id = video_id
+            self.owner.apply(PlayEvent(video_id=video_id, seek_time=seek_time, theme=theme))
             self.pending_seek = seek_time if seek_time > 0 else None
             self._play_gen += 1
             PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
-            self._resync_index_locked()
             threading.Thread(target=self._play_video, args=(video_id, self._play_gen, theme), daemon=True).start()
 
     def _resync_index_locked(self) -> None:
         # caller holds self._lock
-        if self.playlist and self.current_video_id in self.playlist:
-            self.current_index = self.playlist.index(self.current_video_id)
-        elif self.playlist:
-            self.current_index = max(0, min(self.current_index, len(self.playlist) - 1))
-        else:
-            self.current_index = 0
+        # No-op: the reducer (SetPlaylistEvent / PlayEvent) re-derives
+        # current_index; there is no separate index field to patch here.
+        pass
 
     def _notify(self, title: str = "YouTube Cast", message: str = "", error: bool = False) -> None:
         """Show an on-screen notification; safe to call from any thread."""
@@ -602,8 +623,9 @@ class KodiPlayerBridge:
             if gen != self._play_gen:
                 logger.info("Play request for %s superseded, dropping", video_id)
                 return
-            self.current_video_id = video_id
-            self.current_duration = int(info.get("duration", 0))
+            self.owner.apply(
+                ResolverCompletedEvent(video_id=video_id, duration=int(info.get("duration", 0)))
+            )
             self._active_gen = gen
 
         title = info.get("title") or "YouTube Video"
@@ -702,7 +724,7 @@ class KodiPlayerBridge:
                 self._kick_prefetch()
         else:
             self._kodi_queue_mode = False
-            self.state = PlayerState.PLAYING
+            self.owner.apply(PlaybackStartedEvent(video_id=self.current_video_id))
             for s in self.sessions:
                 try:
                     s.report_state_change(self.state, 0, self.current_duration)
@@ -1172,7 +1194,7 @@ class KodiPlayerBridge:
             # pause() TOGGLES: guard so pause-while-paused does not resume.
             if not self._is_paused():
                 self._kodi_player.pause()
-        self.state = PlayerState.PAUSED
+        self.owner.apply(PauseEvent())
         cur_time = self.get_time()
         for s in self.sessions:
             try:
@@ -1194,7 +1216,7 @@ class KodiPlayerBridge:
                 # Stopped/idle: restart the current item where we left off.
                 self.play_video_id(self.current_video_id, self.get_time())
                 return
-        self.state = PlayerState.PLAYING
+        self.owner.apply(ResumeEvent())
         cur_time = self.get_time()
         for s in self.sessions:
             try:
@@ -1210,11 +1232,10 @@ class KodiPlayerBridge:
             PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
             self._active_gen = self._play_gen
             self._requested_id = None
-            self.current_duration = 0
+            self.owner.apply(StopVideoEvent())
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             self._kodi_player.stop()
         else:
-            self.state = PlayerState.STOPPED
             for s in self.sessions:
                 try:
                     s.report_state_change(self.state, 0, 0)
@@ -1227,6 +1248,7 @@ class KodiPlayerBridge:
         else:
             with self._lock:
                 self.pending_seek = seconds
+        self.owner.apply(SeekToEvent(position=seconds))
         for s in self.sessions:
             try:
                 s.report_state_change(self.state, int(seconds), self.current_duration)
@@ -1262,15 +1284,15 @@ class KodiPlayerBridge:
                 data = json.loads(resp)
                 vol = data.get("result", {}).get("volume")
                 if vol is None:
-                    # JSON-RPC error: report last known value rather than a
-                    # fabricated 100.
-                    return getattr(self, "_last_volume", 100)
+                    # JSON-RPC error: report the last known volume (single source
+                    # is the owner now) rather than a fabricated value.
+                    return max(0, min(self.owner.volume, 100))
                 vol = max(0, min(int(vol), 100))
-                self._last_volume = vol
+                self.owner.apply(SetVolumeEvent(volume=vol))
                 return vol
             except Exception:
-                return getattr(self, "_last_volume", 100)
-        return 100
+                return max(0, min(self.owner.volume, 100))
+        return max(0, min(self.owner.volume, 100))
 
     def set_volume(self, volume: int) -> None:
         volume = max(0, min(int(volume), 100))
@@ -1285,7 +1307,7 @@ class KodiPlayerBridge:
                 }))
             except Exception:
                 pass
-        self._last_volume = volume
+        self.owner.apply(SetVolumeEvent(volume=volume))
         # Keep the phone's volume slider in sync.
         for s in self.sessions:
             try:
@@ -1296,7 +1318,9 @@ class KodiPlayerBridge:
     # Callbacks from Kodi player
     def _on_playback_started(self) -> None:
         logger.info("TIMING %s: Kodi onPlayBackStarted fired (video visible)", self.current_video_id)
-        self.state = PlayerState.PLAYING
+        # Kodi told us playback is visible; fold that observation into the owner
+        # (state-only: duration/video were already set by the play thread).
+        self.owner.apply(KodiStateObservedEvent(play_state=PlayerState.PLAYING))
         cur_time = self.get_time()
         with self._lock:
             pending = self.pending_seek
@@ -1398,10 +1422,9 @@ class KodiPlayerBridge:
         logger.info("Queue pick via Kodi UI: %s -> %s", self.current_video_id, vid)
         with self._lock:
             self._requested_id = vid
-            self.current_video_id = vid
-            self.current_duration = 0
-            if self.playlist and vid in self.playlist:
-                self.current_index = self.playlist.index(vid)
+            # Owner owns video id / index / duration: fold the queue-pick
+            # adoption into it (PLAYING, position 0, index re-derived).
+            self.owner.apply(KodiAdvancedEvent(video_id=vid))
             self._play_gen += 1
             PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
             self._active_gen = self._play_gen
@@ -1436,9 +1459,7 @@ class KodiPlayerBridge:
                     if self.current_video_id == vid:
                         duration = int(info.get("duration", 0) or 0)
                         if duration > 0:
-                            self.current_duration = duration
-                        elif self.current_duration <= 0:
-                            _ = self.current_duration
+                            self.owner.apply(ResolverCompletedEvent(video_id=vid, duration=duration))
                         cur_duration = self.current_duration
                         cur_vid = self.current_video_id
                         cur_state = self.state
@@ -1473,24 +1494,26 @@ class KodiPlayerBridge:
         return True
 
     def _on_playback_paused(self) -> None:
-        self.state = PlayerState.PAUSED
+        # TV-side pause (player clock): fold the observation into the owner.
         cur_time = self.get_time()
+        self.owner.apply(PauseDetectedEvent(position=cur_time))
         for s in self.sessions:
             try:
-                s.report_state_change(PlayerState.PAUSED, cur_time, self.current_duration)
+                s.report_state_change(self.state, cur_time, self.current_duration)
                 if self.current_video_id:
-                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PAUSED)
+                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, self.state)
             except Exception:
                 pass
 
     def _on_playback_resumed(self) -> None:
-        self.state = PlayerState.PLAYING
+        # TV-side resume (player clock): fold the observation into the owner.
         cur_time = self.get_time()
+        self.owner.apply(ResumeDetectedEvent(position=cur_time))
         for s in self.sessions:
             try:
-                s.report_state_change(PlayerState.PLAYING, cur_time, self.current_duration)
+                s.report_state_change(self.state, cur_time, self.current_duration)
                 if self.current_video_id:
-                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, PlayerState.PLAYING)
+                    s.report_now_playing(self.current_video_id, cur_time, self.current_duration, self.state)
             except Exception:
                 pass
 
@@ -1502,24 +1525,22 @@ class KodiPlayerBridge:
                 logger.debug("Ignoring stale onPlayBackStopped (active=%s, latest=%s)",
                              self._active_gen, self._play_gen)
                 return
-        self.state = PlayerState.STOPPED
+        self.owner.apply(StopVideoEvent())
         with self._lock:
             self._requested_id = None
-            self.current_duration = 0
         for s in self.sessions:
             try:
-                s.report_state_change(PlayerState.STOPPED, 0, 0)
+                s.report_state_change(self.state, 0, 0)
             except Exception:
                 pass
 
     def _on_playback_ended(self) -> None:
-        self.state = PlayerState.STOPPED
+        self.owner.apply(StopVideoEvent())
         with self._lock:
             self._requested_id = None
-            self.current_duration = 0
         for s in self.sessions:
             try:
-                s.report_state_change(PlayerState.STOPPED, 0, 0)
+                s.report_state_change(self.state, 0, 0)
             except Exception:
                 pass
 
@@ -1550,7 +1571,7 @@ class KodiPlayerBridge:
                         # Kodi's advance and restart the track from 0.
                         logger.debug("Ended in Kodi-queue mode; letting Kodi auto-advance to %s", next_id)
                         return
-                    self.current_index += 1
+                    self.owner.apply(NextEvent(video_id=next_id))
                     self._requested_id = next_id
                     logger.info("Auto-advancing to next video: %s", next_id)
                     self._play_gen += 1

@@ -829,14 +829,21 @@ class StateOwner:
     directly.
     """
 
-    def __init__(self, state: SessionState) -> None:
+    def __init__(self, state: SessionState, on_apply=None) -> None:
         self._state = state
+        self._on_apply = on_apply
 
     def apply(self, event: "Event") -> SessionState:
         """Reduce and store. Returns the new immutable state (idempotent events
         leave version unchanged, per the reducer contract)."""
         new_state = reduce(self._state, event)
         self._state = new_state
+        if self._on_apply is not None:
+            try:
+                self._on_apply(new_state)
+            except Exception:
+                # never let a persistence failure break state reduction
+                pass
         return new_state
 
     # --- canonical read-only accessors (the 9 facts + version) ---

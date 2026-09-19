@@ -29,6 +29,7 @@ except ImportError:
 from typing import Optional
 
 from resources.lib.persistence import SessionStore
+from resources.lib.session_state import SessionState
 from resources.lib.lounge.pairing import (
     generate_screen_id,
     get_lounge_token_batch,

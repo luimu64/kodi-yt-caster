@@ -12,6 +12,14 @@ from resources.lib.persistence import SessionStore
 from resources.lib.resolver import VideoResolver
 from resources.lib.player_bridge import KodiPlayerBridge, PlayerState
 from resources.lib.lounge.listener import CommandDispatcher
+from resources.lib.session_state import SessionState, StateOwner
+from dataclasses import replace
+
+
+def _set_state(player, **kw):
+    """Test fixture: replace the owner's session state with the given fields
+    (no direct field write; mirrors how R2/R3 load/restore a snapshot)."""
+    player.owner = StateOwner(replace(player.owner._state, **kw))
 
 
 class MockYtDlpBridge:
@@ -174,11 +182,8 @@ def test_player_bridge_index_resync():
 
     player.set_playlist({"videoId": "v4", "videoIds": "v1,v2,v3,v4", "currentTime": 0})
     assert player.current_index == 3
-    with player._lock:
-        player.current_video_id = "v4"
     # phone removes v1 and v2 from the queue while v4 plays
     player.update_playlist({"videoIds": "v3,v4"})
-    player._resync_index()
     assert player.current_index == 1  # v4 is now position 1 of [v3, v4]
 
     # and after v4 ends, no advance past the end
@@ -422,8 +427,6 @@ def test_kodi_queue_mode_ended_no_self_advance():
     player.set_playlist({"videoId": "v1", "videoIds": "v1,v2", "currentTime": 0})
     time.sleep(0.3)
     with player._lock:
-        player.current_video_id = "v1"
-        player.current_index = 0
         player._kodi_queue_mode = True
         before = player._play_gen
     player._on_playback_ended()
@@ -432,7 +435,7 @@ def test_kodi_queue_mode_ended_no_self_advance():
         assert player._play_gen == before, "queue mode Ended must not advance itself"
         assert player.current_index == 0
     # Non-queue mode still advances
-    player.state = PlayerState.PLAYING
+    _set_state(player, play_state=PlayerState.PLAYING)
     with player._lock:
         player._kodi_queue_mode = False
     player._on_playback_ended()
@@ -511,20 +514,18 @@ def test_duration_reporting_and_fallback():
     pb.KODI_AVAILABLE = True
 
     try:
-        player.current_duration = 0
+        _set_state(player, duration=0)
         assert player.current_duration == 240
         assert player.get_duration() == 240
 
         # When not playing, fallback is not used
         fake_kp._playing = False
-        player.current_duration = 0
+        _set_state(player, duration=0)
         assert player.current_duration == 0
 
         # Position loop emits both report_now_playing and report_state_change
         fake_kp._playing = True
-        player.state = PlayerState.PLAYING
-        player.current_video_id = "v_loop"
-        player.current_duration = 180
+        _set_state(player, play_state=PlayerState.PLAYING, current_video_id="v_loop", duration=180)
         actions.clear()
 
         # Execute monitoring block logic directly
@@ -576,8 +577,7 @@ def test_sync_current_from_kodi_refresh_dispatches_duration():
     pb.KODI_AVAILABLE = True
 
     try:
-        player.current_video_id = "v_old"
-        player.state = PlayerState.PLAYING
+        _set_state(player, current_video_id="v_old", play_state=PlayerState.PLAYING)
         actions.clear()
 
         changed = player._sync_current_from_kodi()
@@ -644,11 +644,10 @@ def test_track_change_watchdog_adopts_on_kodi_native_advance():
     resolver = VideoResolver(bridge=MockResolveBridge())  # type: ignore[arg-type]
     player = KodiPlayerBridge(session=session, resolver=resolver)
     player._kodi_player = FakeKodiPlayer()  # type: ignore[assignment]
-    player.current_video_id = "v_old"
-    player.current_duration = 315
-    player.playlist = ["v_old", "v_new"]
-    player.current_index = 0
-    player.state = PlayerState.PLAYING  # stale: stays PLAYING across native advance
+    _set_state(player,
+               current_video_id="v_old", duration=315,
+               playlist=("v_old", "v_new"), current_index=0,
+               play_state=PlayerState.PLAYING)  # stale: stays PLAYING across native advance
 
     orig_avail = pb.KODI_AVAILABLE
     orig_xbmc = pb.xbmc
@@ -698,9 +697,7 @@ def test_pause_and_resume_reporting():
     session.post_action = lambda sc, data: actions.append((sc, data))
 
     player = KodiPlayerBridge(session=session)
-    player.current_video_id = "v1"
-    player.current_duration = 120
-    player.state = PlayerState.PLAYING
+    _set_state(player, current_video_id="v1", duration=120, play_state=PlayerState.PLAYING)
 
     actions.clear()
     player.pause()
