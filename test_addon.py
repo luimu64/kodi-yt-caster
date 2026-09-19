@@ -591,6 +591,120 @@ def test_r7_heartbeat_emits_full_snapshot():
     assert session._heartbeat_interval >= 1.0, session._heartbeat_interval
 
 
+def test_r9_one_model_n_channels_same_state_independent_ofs():
+    """R9: a channel is transport, never a second state. Two channels bound to one
+    StateOwner publish exactly one batch each per change, carrying the same
+    listId/index/item, with independently monotonic per-channel ofs."""
+    from resources.lib.session_state import (
+        SessionState, PlayState, StateOwner, SetPlaylistEvent, SetVolumeEvent,
+        PositionTickEvent,
+    )
+    import urllib.parse as _up
+
+    class _Resp:
+        def read(self):
+            return b""
+
+    class _FakeConn:
+        def __init__(self):
+            self.ofs = []
+
+        def request(self, method, path, body=None, headers=None):
+            params = _up.parse_qs(body.decode("utf-8") if isinstance(body, bytes) else body)
+            self.ofs.append(int(params["ofs"][0]))
+
+        def getresponse(self):
+            return _Resp()
+        def close(self):
+            pass
+
+    def _wire(sess):
+        sess.sid = "sid-%s" % sess.theme
+        sess.gsessionid = "gs"
+        conn = _FakeConn()
+        sess._conn = conn
+        sess._conn_host = _up.urlparse(BASE_URL).netloc
+        sess._conn_scheme = _up.urlparse(BASE_URL).scheme or "https"
+        # capture emitted action names per channel without touching the wire
+        posted = []
+        orig_post = sess.post_action
+        def _post(sc, data, heartbeat=False):
+            posted.append((sc, dict(data)))
+            return orig_post(sc, data, heartbeat=heartbeat)
+        sess.post_action = _post
+        return posted, conn
+
+    cl = LoungeSession("sc", "tc", "d1", theme="cl")
+    m = LoungeSession("sm", "tm", "d1", theme="m")
+    owner = StateOwner(SessionState())
+    for s in (cl, m):
+        s.attach_state_owner(owner)
+    cl_posted, cl_conn = _wire(cl)
+    m_posted, m_conn = _wire(m)
+
+    # One shared cast through the single owner wakes both channels.
+    owner.apply(SetPlaylistEvent(video_ids=("a", "b"), video_id="a", list_id="L1",
+                                 theme="cl", source="phone"))
+    snap = owner.snapshot()
+    # First publish is a full snapshot (diff against the version=-1 sentinel).
+    assert cl.publish_snapshot(snap) is True
+    assert m.publish_snapshot(snap) is True
+    cl_posted.clear(); m_posted.clear()
+
+    # A playback-only change -> exactly one batch per channel, identical
+    # item/index/listId on both (one model, N subscribers).
+    owner.apply(PositionTickEvent(position=5.0, duration=180.0, source="clock"))
+    snap = owner.snapshot()
+    assert cl.publish_snapshot(snap) is True
+    assert m.publish_snapshot(snap) is True
+
+    for posted in (cl_posted, m_posted):
+        assert "nowPlaying" in [sc for sc, _ in posted], posted
+        np = next(d for sc, d in posted if sc == "nowPlaying")
+        assert np["listId"] == "L1" and np["videoId"] == "a"
+        assert np["currentIndex"] == "0"
+    # Both channels emitted the identical action set for the same change.
+    assert [sc for sc, _ in cl_posted] == [sc for sc, _ in m_posted]
+
+    # Independent monotonic ofs per channel (no interleaving descents).
+    assert cl_conn.ofs == list(range(1, len(cl_conn.ofs) + 1)), cl_conn.ofs
+    assert m_conn.ofs == list(range(1, len(m_conn.ofs) + 1)), m_conn.ofs
+    assert cl.ofs == m.ofs  # same batch count, own counters
+
+    # A volume-only change -> one batch per channel again.
+    cl_posted.clear(); m_posted.clear()
+    owner.apply(SetVolumeEvent(volume=33, source="phone"))
+    snap = owner.snapshot()
+    assert cl.publish_snapshot(snap) is True
+    assert m.publish_snapshot(snap) is True
+    assert [sc for sc, _ in cl_posted] == ["onVolumeChanged"]
+    assert [sc for sc, _ in m_posted] == ["onVolumeChanged"]
+    cl.close(); m.close()
+
+def test_r9_force_publish_resends_shared_snapshot_without_second_writer():
+    """R9: the connect/getNowPlaying handshakes re-send the one shared snapshot on
+    each channel instead of each channel building its own report."""
+    from resources.lib.session_state import SessionState, StateOwner, PlayState
+
+    session = LoungeSession("s1", "t1", "d1")
+    session.sid = "sid-test"
+    posted = []
+    session.post_action = lambda sc, data, heartbeat=False: posted.append(sc) or True
+
+    owner = StateOwner(SessionState(version=3, current_video_id="a",
+                                    play_state=PlayState.PLAYING, duration=10.0))
+    session.attach_state_owner(owner)
+    # Publish once so the channel is clean.
+    assert session.publish_snapshot(owner.snapshot()) is True
+    posted.clear()
+
+    # A handshake must force a republish of the same snapshot (dirty).
+    session.force_publish()
+    assert session._last_published is None
+    assert session.publish_snapshot(owner.snapshot()) is True
+    assert "nowPlaying" in posted, posted
+    session.close()
+
 def test_duration_reporting_and_fallback():
     session = LoungeSession("s1", "t1", "d1")
     actions = []
@@ -1112,6 +1226,8 @@ if __name__ == "__main__":
     test_r7_superseded_versions_never_posted_and_ofs_monotonic()
     test_r7_failed_post_leaves_state_dirty()
     test_r7_heartbeat_emits_full_snapshot()
+    test_r9_one_model_n_channels_same_state_independent_ofs()
+    test_r9_force_publish_resends_shared_snapshot_without_second_writer()
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
     test_track_change_watchdog_adopts_on_kodi_native_advance()

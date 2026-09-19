@@ -213,7 +213,10 @@ R10 (independent; schedule when a quick win is wanted)
 3. **R4** — projections replace repair loops (biggest deletion; verify against the lane/window
    scenarios *before* removing anything). ✅ `a2da223`
 4. **R7 → R9** — publisher by version, then one model with N channels. This is the change that
-   halves the wire traffic. R7 ✅ `06a1f7a`; R9 next.
+   halves the wire traffic. R7 ✅ `06a1f7a`; R9 ✅ (one snapshot, one publisher per channel; the
+   connect/getNowPlaying fan-out loops in `service.py` and the direct `report_volume` reply in
+   `lounge/listener.py` are gone — a handshake now re-sends the shared snapshot on each channel
+   via `force_publish()`).
 5. **R2, R5** — identity: persist the session record, derive the index at publication. R2 ✅
    `c28bebb`; R5 next.
 6. **R6 → R8** — confidence and reconciliation.
@@ -297,6 +300,15 @@ Rules land on `feat/state-single-owner`, each with both gates green at its commi
   monotonic `ofs`, dirty-on-failure, ≤1 Hz heartbeat). The legacy per-tag coalescing queue and
   its `nowPlaying` exemption are gone; `player_bridge` no longer runs naive report loops.
   Both gates green.
+- **R9** (one model, N subscribers) — the two channels already shared one `StateOwner`; the
+  remaining duplication was the per-channel fan-out loops: `on_connected` and
+  `_handle_get_now_playing` in `service.py` built a `nowPlaying`/`nowPlayingPlaylist` report per
+  session from the player, and `lounge/listener.py` answered `getVolume` with a hand-rolled
+  `report_volume`. All three now go through the single publisher (`LoungeSession.force_publish()`
+  + `KodiPlayerBridge.announce_state()`), so a handshake re-sends the one shared snapshot on each
+  channel. `lane` is already a snapshot field, so no second state exists per channel. Tests:
+  `test_r9_*` unit assertions (one batch per channel, identical identity, independent monotonic
+  `ofs`) and `emulator/scenarios/test_one_model_n_channels.py`. Both gates green.
 
 **R7 landed with two regression fixes that are part of it**, both in the projection path:
 

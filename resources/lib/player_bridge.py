@@ -197,6 +197,19 @@ class KodiPlayerBridge:
             except Exception:
                 pass
 
+    def announce_state(self) -> None:
+        """Ask every channel to re-publish the shared snapshot now (R9).
+
+        The phone needs an immediate report on connect / getNowPlaying, but that
+        is a transport concern: no channel invents its own report, each just
+        re-sends the one in-process state.
+        """
+        for s in self.sessions:
+            try:
+                s.force_publish()
+            except Exception:
+                logger.debug("announce_state failed", exc_info=True)
+
     def apply_projection(self, snapshot: Optional[SessionState] = None) -> None:
         """Sole reconciler for Kodi playlist contents, track ordering, item titles,
         and active GUI window (12005 vs 12006).

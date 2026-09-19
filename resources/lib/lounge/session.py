@@ -192,6 +192,17 @@ class LoungeSession:
         """Wake publication on SessionState.version changes."""
         self._wake_event.set()
 
+    def force_publish(self) -> None:
+        """Re-publish the shared snapshot on this channel on the next cycle.
+
+        Marks the channel dirty (R9): the same absolute state is re-sent without
+        inventing a second report path. Used by the connect and getNowPlaying
+        handshakes, where the phone expects an immediate report but the state
+        itself is unchanged.
+        """
+        self._last_published = None
+        self._wake_event.set()
+
     def flush(self, timeout: float = 1.0) -> None:
         """Wait until any pending dirty state has been published."""
         deadline = time.monotonic() + timeout

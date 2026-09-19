@@ -187,8 +187,10 @@ class LoungeListener(threading.Thread):
                     self.dispatcher.on_set_volume(int(data["volume"]))
             elif name == "getVolume":
                 if self.dispatcher.on_get_volume:
-                    vol = self.dispatcher.on_get_volume()
-                    self.session.report_volume(vol)
+                    self.dispatcher.on_get_volume()
+                    # R9: no hand-rolled reply report — re-send the shared
+                    # snapshot (its onVolumeChanged is the answer) on this channel.
+                    self.session.force_publish()
             elif name == "getNowPlaying":
                 if self.dispatcher.on_get_now_playing:
                     self.dispatcher.on_get_now_playing()

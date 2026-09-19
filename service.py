@@ -375,28 +375,8 @@ def run_service() -> None:
                 PairingDialog("", screen_name).show_notification("YouTube Cast", f"Connected to {client_name}")
                 # Announce our playback state right away: the phone will not push its initial
                 # video (hasInitialPlayback) until the receiver posts a nowPlaying update.
-                for s in sessions:
-                    try:
-                        s.report_now_playing(
-                            player.current_video_id or "",
-                            int(player.get_time()),
-                            player.current_duration,
-                            int(player.state),
-                            current_index=player.current_index,
-                            list_id=player.list_id,
-                        )
-                        if player.playlist or player.current_video_id:
-                            s.report_now_playing_playlist(
-                                player.playlist or ([player.current_video_id] if player.current_video_id else []),
-                                player.current_video_id or "",
-                                player.current_index,
-                                int(player.get_time()),
-                                player.current_duration,
-                                int(player.state),
-                                list_id=player.list_id,
-                            )
-                    except Exception:
-                        logger.debug("nowPlaying announcement failed", exc_info=True)
+                # R9: no per-channel report loop — each channel re-sends the one shared state.
+                player.announce_state()
 
             def on_disconnected(data: dict) -> None:
                 client_name = data.get("name", "Phone")
@@ -416,28 +396,8 @@ def run_service() -> None:
             dispatcher.on_set_volume = player.set_volume
             dispatcher.on_get_volume = player.get_volume
             def _handle_get_now_playing() -> None:
-                for s in sessions:
-                    try:
-                        s.report_now_playing(
-                            player.current_video_id or "",
-                            player.get_time(),
-                            player.current_duration,
-                            player.state,
-                            current_index=player.current_index,
-                            list_id=player.list_id,
-                        )
-                        if player.playlist or player.current_video_id:
-                            s.report_now_playing_playlist(
-                                player.playlist or ([player.current_video_id] if player.current_video_id else []),
-                                player.current_video_id or "",
-                                player.current_index,
-                                player.get_time(),
-                                player.current_duration,
-                                player.state,
-                                list_id=player.list_id,
-                            )
-                    except Exception:
-                        pass
+                # R9: one model, N subscribers — each channel re-sends the shared snapshot.
+                player.announce_state()
 
             dispatcher.on_get_now_playing = _handle_get_now_playing
 
