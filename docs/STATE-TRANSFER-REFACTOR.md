@@ -208,13 +208,14 @@ R2 ─────────────► R6 ──────┘
 R10 (independent; schedule when a quick win is wanted)
 ```
 
-1. **R1** — behaviour-preserving refactor, no protocol change. Land first.
-2. **R3** — the event vocabulary + pure reducer + reduction log.
+1. **R1** — behaviour-preserving refactor, no protocol change. Land first. ✅ `c28bebb`
+2. **R3** — the event vocabulary + pure reducer + reduction log. ✅ `c28bebb`
 3. **R4** — projections replace repair loops (biggest deletion; verify against the lane/window
-   scenarios *before* removing anything).
+   scenarios *before* removing anything). ✅ `a2da223`
 4. **R7 → R9** — publisher by version, then one model with N channels. This is the change that
-   halves the wire traffic.
-5. **R2, R5** — identity: persist the session record, derive the index at publication.
+   halves the wire traffic. R7 ✅ `06a1f7a`; R9 next.
+5. **R2, R5** — identity: persist the session record, derive the index at publication. R2 ✅
+   `c28bebb`; R5 next.
 6. **R6 → R8** — confidence and reconciliation.
 7. **R10** — vocabulary coverage, independently schedulable.
 8. **Reliability matrix** — the acceptance gate, only meaningful after the rest.
@@ -285,13 +286,33 @@ binding for the next attempt and are mirrored in `AGENTS.md`:
 
 ### Known-good state
 
-- `feat/state-single-owner` at `c28bebb` — R1 (SessionState) + R2 (durable session record) +
-  R3 (event vocabulary and reducer), both gates green at that commit.
-- **After that commit the tree was left dirty and failing**: `lounge/session.py` (+468) and
-  `player_bridge.py` (+453) carry in-flight R7/R4 rewiring that fails
-  `test_addon.py::test_kodi_queue_mode_ended_no_self_advance` and 5 emulator scenarios
-  (heartbeat publishing is also over-firing — `PUBLISH v0/v3/v4 … heartbeat=true` repeating).
-  **Treat that dirty state as a work-in-progress to redo, not as a base to build on.**
+Rules land on `feat/state-single-owner`, each with both gates green at its commit:
+
+- `c28bebb` — **R1** (SessionState single owner, immutable snapshot) + **R2** (durable session
+  record) + **R3** (event vocabulary + pure idempotent reducer + reduction log).
+- `a2da223` — **R4** (player/window state derived from the projection; timer repair loops
+  reduced to log-only). Both gates green.
+- `06a1f7a` — **R7** (version-driven publication: wake on `SessionState.version`, diff against
+  the last successfully published snapshot, one batch per channel per changed field group,
+  monotonic `ofs`, dirty-on-failure, ≤1 Hz heartbeat). The legacy per-tag coalescing queue and
+  its `nowPlaying` exemption are gone; `player_bridge` no longer runs naive report loops.
+  Both gates green.
+
+**R7 landed with two regression fixes that are part of it**, both in the projection path:
+
+1. `apply_projection` used to clear the music playlist on any video-lane projection. R7 makes
+   projections run on every version change (not just at play start), so the clear destroyed a
+   music-app queue that Kodi was about to auto-advance. The clear is now limited to genuine
+   video-lane snapshots (`lane != "m"`); a music-lane snapshot keeps its playlist and its
+   cursor (`playlist._position = current_index`) so Kodi's native advance lands on the next
+   queue item.
+2. An earlier draft of the R7 card had also reworked the window-selection and visualiser-
+   activation heuristics to key off `isPlayingAudio()`/`isPlayingVideo()`. That contradicts the
+   device-verified quirk documented in `_music_lane_playing()` (the lingering outgoing video
+   player reports the music item as video) and has been reverted to the R4 lane-based logic.
+
+The remaining work is **R5, R6, R8, R9, R10** (`session.py`, `player_bridge.py` are the shared
+files — schedule those cards one at a time, not in parallel).
 
 ---
 

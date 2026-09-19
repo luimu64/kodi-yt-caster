@@ -216,16 +216,24 @@ class KodiPlayerBridge:
                 return
 
             # 1. Reconcile playlist contents, ordering, and pre-cached titles
-            is_music_lane = (snapshot.lane or "") == "m"
-            if self._kodi_queue_mode or is_music_lane:
+            #    Kodi's music playlist is a projection of the snapshot queue. A
+            #    music-app cast (lane "m") may start on a music video yet still
+            #    need the playlist for Kodi's own auto-advance, so a non-music
+            #    projection must not destroy it. Only clear the music playlist for
+            #    a genuine video-lane snapshot (a video queue advances through the
+            #    bridge, not Kodi's music playlist).
+            if self._kodi_queue_mode or (snapshot.lane or "") == "m":
                 try:
                     playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
                     self._reconcile_playlist(playlist, snapshot)
+                    # Keep Kodi's own playlist cursor on the snapshot's active item
+                    # so its native auto-advance lands on the next queue entry even
+                    # when the active item played on the video lane.
                     if hasattr(playlist, "_position") and snapshot.current_index is not None:
                         playlist._position = snapshot.current_index
                 except Exception as exc:
                     logger.debug("Playlist reconciliation error: %s", exc)
-            else:
+            elif (snapshot.lane or "") != "m":
                 try:
                     playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
                     if playlist.size() > 0:
@@ -261,11 +269,7 @@ class KodiPlayerBridge:
 
             # 3. Reconcile active GUI windows (12005 vs 12006)
             if snapshot.play_state == PlayerState.PLAYING:
-                if self._kodi_player and self._kodi_player.isPlayingAudio():
-                    self._project_music_window()
-                elif self._kodi_player and self._kodi_player.isPlayingVideo():
-                    self._project_video_window()
-                elif (snapshot.lane or "") == "m":
+                if is_music_lane:
                     self._project_music_window()
                 else:
                     self._project_video_window()
@@ -1123,8 +1127,6 @@ class KodiPlayerBridge:
                     try:
                         if (self.owner.lane or "") != "m" or self.owner.play_state != PlayerState.PLAYING:
                             break
-                        if self._kodi_player and self._kodi_player.isPlayingVideo():
-                            break
                         if self._kodi_player and (self._kodi_player.isPlayingAudio()
                                                   or self._music_lane_playing()):
                             if not self._visualisation_is_active():
@@ -1134,7 +1136,6 @@ class KodiPlayerBridge:
                                     logger.info("Visualisation window active")
                                     self._kick_prefetch()
                                     prefetched = True
-                                break
                             else:
                                 logger.info("ActivateWindow(12006) did not take (modal dialog?) — retrying")
                         time.sleep(0.5)
@@ -1379,9 +1380,6 @@ class KodiPlayerBridge:
         if not vid or vid == self.current_video_id:
             return False
         logger.info("Queue pick via Kodi UI: %s -> %s", self.current_video_id, vid)
-        if "plugin://" in playing_url:
-            self._kodi_queue_mode = True
-
         with self._lock:
             self._requested_id = vid
             # Owner owns video id / index / duration: fold the queue-pick
@@ -1390,6 +1388,9 @@ class KodiPlayerBridge:
             self._play_gen += 1
             PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
             self._active_gen = self._play_gen
+
+        if "plugin://" in playing_url:
+            self._lane_repaired_id = None
 
         # Duration unknown until resolve; refresh it (and the preload chain)
         # in the background without blocking the state reports below.

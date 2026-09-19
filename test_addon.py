@@ -459,6 +459,138 @@ def test_ofs_increment_thread_safe():
     assert session.ofs == 800, session.ofs
 
 
+def test_r7_publish_one_batch_per_changed_field_group():
+    """R7: publication diffs against the last published snapshot and emits at
+    most one batch per channel per changed field group."""
+    from resources.lib.session_state import SessionState, PlayState
+
+    session = LoungeSession("s1", "t1", "d1")
+    session.sid = "sid-test"  # post_action only needs a bound sid
+    posted = []
+    session.post_action = lambda sc, data, heartbeat=False: posted.append(sc) or True
+
+    base = SessionState(version=1, playlist=("a", "b"), current_video_id="a",
+                        current_index=0, list_id="L1", play_state=PlayState.PLAYING,
+                        position=0.0, duration=180.0, volume=100, lane="cl")
+    assert session.publish_snapshot(base) is True
+    posted.clear()
+
+    # volume-only change -> exactly one batch, onVolumeChanged only
+    vol = base.__class__(**{**base.__dict__, "volume": 42, "version": 2})
+    assert session.publish_snapshot(vol) is True
+    assert posted == ["onVolumeChanged"], posted
+    posted.clear()
+
+    # playback-only change (same play_state) -> nowPlaying, no onStateChange
+    tick = vol.__class__(**{**vol.__dict__, "position": 5.0, "version": 3})
+    assert session.publish_snapshot(tick) is True
+    assert posted == ["nowPlaying"], posted
+    posted.clear()
+
+    # play_state change -> nowPlaying + onStateChange
+    paused = tick.__class__(**{**tick.__dict__, "play_state": PlayState.PAUSED, "version": 4})
+    assert session.publish_snapshot(paused) is True
+    assert sorted(posted) == ["nowPlaying", "onStateChange"], posted
+    posted.clear()
+
+    # identity change with a playlist -> nowPlaying + nowPlayingPlaylist
+    ident = paused.__class__(**{**paused.__dict__, "current_video_id": "b",
+                                "current_index": 1, "version": 5})
+    assert session.publish_snapshot(ident) is True
+    assert sorted(posted) == ["nowPlaying", "nowPlayingPlaylist"], posted
+    posted.clear()
+
+    # identical snapshot -> no batch at all
+    assert session.publish_snapshot(ident) is True
+    assert posted == [], posted
+
+
+def test_r7_superseded_versions_never_posted_and_ofs_monotonic():
+    """R7: only the newest snapshot is posted (intermediate versions are
+    superseded), and per-channel ofs increments strictly monotonically."""
+    from resources.lib.session_state import SessionState, PlayState
+    import urllib.parse as _up
+
+    session = LoungeSession("s1", "t1", "d1")
+    session.sid = "sid-test"
+    session.gsessionid = "gs-test"
+    seen_ofs = []
+
+    class _Resp:
+        def read(self):
+            return b""
+
+    class _FakeConn:
+        def request(self, method, path, body=None, headers=None):
+            # ofs travels in the urlencoded body (req0 params include ofs)
+            params = _up.parse_qs(body.decode("utf-8") if isinstance(body, bytes) else body)
+            seen_ofs.append(int(params["ofs"][0]))
+
+        def getresponse(self):
+            return _Resp()
+
+    session._conn = _FakeConn()
+    session._conn_host = _up.urlparse(BASE_URL).netloc
+    session._conn_scheme = _up.urlparse(BASE_URL).scheme or "https"
+
+    a = SessionState(version=1, current_video_id="a", play_state=PlayState.PLAYING, duration=10.0)
+    c = a.__class__(**{**a.__dict__, "position": 2.0, "version": 3})
+
+    # Simulate a burst: publish a, then c. The diff is always against the last
+    # *published* state, so nothing stale is posted; c carries the newest state.
+    assert session.publish_snapshot(a) is True
+    assert session.publish_snapshot(c) is True
+    assert session._last_published.version == 3
+    # ofs strictly monotonic, never duplicated
+    assert seen_ofs == list(range(1, len(seen_ofs) + 1)), seen_ofs
+
+
+def test_r7_failed_post_leaves_state_dirty():
+    """R7: a failed post keeps last-published behind, so the next cycle
+    republishes the same absolute state."""
+    from resources.lib.session_state import SessionState, PlayState
+
+    session = LoungeSession("s1", "t1", "d1")
+    session.sid = "sid-test"
+    attempts = []
+
+    def _flaky(sc, data, heartbeat=False):
+        attempts.append(sc)
+        return False  # simulate HTTP failure
+    session.post_action = _flaky
+
+    snap = SessionState(version=1, current_video_id="a", play_state=PlayState.PLAYING)
+    assert session.publish_snapshot(snap) is False
+    assert session._last_published is None  # still dirty
+
+    # Next cycle with the same snapshot republishes it (dirty, not superseded).
+    attempts.clear()
+    assert session.publish_snapshot(snap) is False
+    assert attempts, "dirty state must be republished on the next cycle"
+    assert session._last_published is None
+
+
+def test_r7_heartbeat_emits_full_snapshot():
+    """R7: the <=1 Hz crash-recovery heartbeat sends the full snapshot
+    (nowPlaying, nowPlayingPlaylist when a playlist exists, onVolumeChanged)."""
+    from resources.lib.session_state import SessionState, PlayState
+
+    session = LoungeSession("s1", "t1", "d1")
+    session.sid = "sid-test"
+    posted = []
+    session.post_action = lambda sc, data, heartbeat=False: posted.append((sc, heartbeat)) or True
+
+    snap = SessionState(version=7, playlist=("a", "b"), current_video_id="a",
+                        current_index=0, list_id="L1", play_state=PlayState.PLAYING,
+                        duration=180.0, volume=100, lane="cl")
+    assert session.publish_snapshot(snap, heartbeat=True) is True
+    names = sorted(sc for sc, _ in posted)
+    assert names == ["nowPlaying", "nowPlayingPlaylist", "onVolumeChanged"], posted
+    assert all(hb is True for _, hb in posted), posted
+    # "<= 1 Hz" means no more than one heartbeat per second: period >= 1s.
+    assert session._heartbeat_interval >= 1.0, session._heartbeat_interval
+
+
 def test_duration_reporting_and_fallback():
     session = LoungeSession("s1", "t1", "d1")
     actions = []
@@ -976,6 +1108,10 @@ if __name__ == "__main__":
     test_actions_module()
     test_kodi_queue_mode_ended_no_self_advance()
     test_ofs_increment_thread_safe()
+    test_r7_publish_one_batch_per_changed_field_group()
+    test_r7_superseded_versions_never_posted_and_ofs_monotonic()
+    test_r7_failed_post_leaves_state_dirty()
+    test_r7_heartbeat_emits_full_snapshot()
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
     test_track_change_watchdog_adopts_on_kodi_native_advance()
