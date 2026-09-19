@@ -474,51 +474,96 @@ class KodiPlayerBridge:
             if drift > 5.0:
                 self._dump_thread_stacks(drift)
             self._poll_pause_state()
-            # Track-change watchdog: on LibreELEC Kodi 21 the xbmc.Player
-            # callbacks (onPlayBackStarted etc.) are never delivered to this
-            # service process (verified on device — zero callbacks of any
-            # kind, ever). During a Kodi-native playlist auto-advance the
-            # bridge state stays PLAYING, so the `state != PLAYING` branch
-            # never fires and _sync_current_from_kodi() never adopts the new
-            # track — the phone keeps reporting the OLD video forever.
-            #
-            # Signal source (verified live via YTCAST-PROBE2 on Kodi 21.3
-            # LibreELEC): while playing, getPlayingFile() returns the FINAL
-            # resolved googlevideo URL (no video id), but the info label
-            # "Player.FileNameAndPath" still carries the plugin:// URL with
-            # ?play=<video_id>. Poll that label and adopt on change.
             if KODI_AVAILABLE and self._kodi_player:
-                try:
-                    if self._kodi_player.isPlaying():
-                        playing_url = None
-                        try:
-                            playing_url = xbmc.getInfoLabel("Player.FileNameAndPath")  # type: ignore[union-attr]
-                        except Exception:
-                            playing_url = None
-                        if playing_url and "play=" in playing_url:
-                            kodi_vid = playing_url.split("play=")[-1].split("&")[0]
-                            if kodi_vid and self.current_video_id and kodi_vid != self.current_video_id:
-                                logger.info(
-                                    "Track-change watchdog: Kodi playing %s, bridge at %s — adopting",
-                                    kodi_vid, self.current_video_id)
-                                self._sync_current_from_kodi(playing_url)
-                        if self.state != PlayerState.PLAYING and not self._is_paused():
-                            self.owner.apply(ResumeEvent())
-                            self._sync_current_from_kodi()
-                except Exception as exc:
-                    logger.warning("position_loop player poll failed: %s", exc)
-                # Log-only drift reporting (R4: monitor ticks perform zero mutations)
-                self._report_drift_log_only()
+                # R8: the tick is a checker, not a writer. It compares the
+                # snapshot against the player and emits disagreements as
+                # events; the reducer resolves them.
+                self._reconcile_tick()
 
-            if self.state == PlayerState.PLAYING and self.current_video_id:
-                cur_time = float(self.get_time())
-                cur_duration = float(self.current_duration)
-                if cur_time != self.owner.position or cur_duration != self.owner.duration:
-                    self.owner.apply(PositionTickEvent(
-                        position=cur_time,
-                        duration=cur_duration,
-                        play_state=self.state,
-                    ))
+    def _reconcile_tick(self) -> None:
+        """Compare the snapshot against the Kodi player once per tick (R8).
+
+        One reconciler only. Every disagreement is emitted as an event and
+        resolved by the reducer; a quiet tick emits nothing. Never guesses:
+        a state the player cannot explain is published as UNKNOWN (R6).
+
+        Logs both sides for every corrective event:
+        ``reconcile: snapshot=<x> player=<y> -> event=<z>``
+        """
+        if not (KODI_AVAILABLE and self._kodi_player):
+            return
+        try:
+            playing = bool(self._kodi_player.isPlaying())
+        except Exception:
+            return
+
+        # 1. Item identity: which item is Kodi actually playing? On Kodi 21
+        #    getPlayingFile() returns the final googlevideo URL (no video id),
+        #    so read the info label carrying the plugin:// ?play=<id> URL.
+        kodi_vid = None
+        try:
+            playing_url = xbmc.getInfoLabel("Player.FileNameAndPath")  # type: ignore[union-attr]
+        except Exception:
+            playing_url = None
+        if playing_url and "play=" in playing_url:
+            kodi_vid = playing_url.split("play=")[-1].split("&")[0] or None
+
+        if not playing:
+            # Player is gone: if we still believe something plays, that is a
+            # contradiction. One corrective event, resolved by the reducer.
+            if self.state != PlayerState.STOPPED:
+                logger.info(
+                    "reconcile: snapshot=playing(%s) player=stopped -> event=playbackStopped",
+                    self.current_video_id)
+                self._on_playback_stopped()
+            return
+
+        if not kodi_vid:
+            # Alive player, no readable plugin URL. A momentary label gap is not
+            # a reason to contradict the phone (that would flap); the stored
+            # item stays authoritative until the label is readable again. Only
+            # when we have NO item at all is the item fact genuinely unknown.
+            # (R6: unknown is publishable, a guess is not.)
+            if self.state == PlayerState.PLAYING and not self.current_video_id:
+                logger.info(
+                    "reconcile: snapshot=playing(no item) player=alive/unidentified"
+                    " -> event=signalUnknown")
+                self.owner.apply(SignalUnknownEvent(source="player-clock"))
+            return
+
+        # 2. Item differs -> adopt the player's item through the reducer, then
+        #    fall through: the newly adopted item's clock is folded in this
+        #    same tick, exactly as the pre-R8 watchdog loop did.
+        if kodi_vid != self.current_video_id:
+            logger.info(
+                "reconcile: snapshot=%s player=%s -> event=kodiAdvanced",
+                self.current_video_id, kodi_vid)
+            self._sync_current_from_kodi(playing_url)
+
+        # 3. Play state: broken signals (getCondVisibility returns False while
+        #    paused) mean we cannot assert PLAYING from the live player alone.
+        #    If we believe PAUSED and the clock has advanced, that is a resume.
+        #    If we believe an unpaused state and the player is alive, nothing
+        #    to correct. The stall detector owns the pause direction.
+        try:
+            cur_time = float(self.get_time())
+            cur_duration = float(self.current_duration)
+        except Exception:
+            return
+
+        # 4. Position/duration: one event carrying the observed clock (R6:
+        #    source=player-clock), only when it actually differs.
+        if (self.state != PlayerState.PAUSED
+                and (cur_time != self.owner.position or cur_duration != self.owner.duration)):
+            self.owner.apply(PositionTickEvent(
+                position=cur_time,
+                duration=cur_duration,
+                play_state=self.state,
+                source="player-clock",
+            ))
+
+        # 5. GUI drift is log-only (R4: ticks perform zero mutations).
+        self._report_drift_log_only()
 
     def _poll_pause_state(self) -> None:
         """Detect pause via time-stall: a live Kodi player whose getTime()
@@ -557,7 +602,12 @@ class KodiPlayerBridge:
         if self._stall_polls >= 2:
             self._last_stall_time = cur
             if self.state != PlayerState.PAUSED:
-                logger.info("Pause detected via time-stall (t=%s x%s polls)", cur, self._stall_polls)
+                # R6: the clock stopped while the player claims to be playing and
+                # the duration is loaded — the only remaining explanation is a
+                # pause. Source recorded so a wrong inference is attributable.
+                logger.info(
+                    "pause detected via time-stall (t=%s x%s polls, source=player-clock)",
+                    cur, self._stall_polls)
                 self._on_playback_paused()
         elif self._stall_polls == 0 and self.state == PlayerState.PAUSED:
             # Clock moving again while we believe paused: TV-side resume.

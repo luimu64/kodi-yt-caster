@@ -221,7 +221,13 @@ R10 (independent; schedule when a quick win is wanted)
    `c28bebb`; R5 ✅ (publication derives the index from the queue it sends: `published_index()`
    in `session_state.py`, used by the `nowPlaying`/`nowPlayingPlaylist` builders, so a stale
    carried field or an out-of-range index can never reach the wire).
-6. **R6 → R8** — confidence and reconciliation.
+6. **R6 → R8** — confidence and reconciliation. R6 ✅ + R8 ✅ (the 2 s tick is now
+   `KodiPlayerBridge._reconcile_tick()`: it compares the snapshot against the player, emits one
+   `reconcile: snapshot=<x> player=<y> -> event=<z>`-logged event per disagreement, and folds
+   the clock as a `PositionTickEvent(source=player-clock)`; a quiet tick emits nothing. The item
+   fact has one source (the `?play=` info label) and a momentary unreadable label no longer
+   contradicts the phone; with no item at all it publishes `SignalUnknownEvent` (UNKNOWN,
+   recoverable) instead of guessing).
 7. **R10** — vocabulary coverage, independently schedulable.
 8. **Reliability matrix** — the acceptance gate, only meaningful after the rest.
 
@@ -302,6 +308,16 @@ Rules land on `feat/state-single-owner`, each with both gates green at its commi
   monotonic `ofs`, dirty-on-failure, ≤1 Hz heartbeat). The legacy per-tag coalescing queue and
   its `nowPlaying` exemption are gone; `player_bridge` no longer runs naive report loops.
   Both gates green.
+- **R5** (derive `currentIndex` at publication) — `published_index()` recomputes the index from
+  the queue the report is sent with, so no carried field or out-of-range index reaches the wire.
+  Unit tests `test_r5_*`. Both gates green.
+- **R6 → R8** (confidence + reconciliation) — the timer tick became
+  `KodiPlayerBridge._reconcile_tick()`: it compares the snapshot against the player and emits one
+  event per disagreement, each logged `reconcile: snapshot=<x> player=<y> -> event=<z>`. A quiet
+  tick emits nothing. Facts carry a source (`player-clock`, `command`); the item fact's only
+  source is the `?play=` info label, a momentary blank label no longer contradicts the phone,
+  and with no item at all it publishes `SignalUnknownEvent` (UNKNOWN) rather than a guess. Unit
+  tests `test_r8_*`, `test_r6_*`. Both gates green.
 - **R9** (one model, N subscribers) — the two channels already shared one `StateOwner`; the
   remaining duplication was the per-channel fan-out loops: `on_connected` and
   `_handle_get_now_playing` in `service.py` built a `nowPlaying`/`nowPlayingPlaylist` report per

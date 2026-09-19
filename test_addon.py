@@ -768,6 +768,130 @@ def test_r5_tv_side_pick_publishes_derived_index_with_original_listid():
     assert np["currentIndex"] == "2" and npp["currentIndex"] == "2"
     session.close()
 
+def test_r8_reconcile_emits_one_corrective_event_for_a_drift():
+    """R8: a deliberate drift produces exactly one corrective event and, when the
+    index moved, one publish carrying the adopted item with the stored listId."""
+    import resources.lib.player_bridge as pb
+    from resources.lib.session_state import (
+        SessionState, PlayState, StateOwner, SetPlaylistEvent,
+    )
+
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session, resolver=VideoResolver(bridge=MockYtDlpBridge()))
+    owner = player.owner
+    owner.apply(SetPlaylistEvent(video_ids=("a", "b", "c"), video_id="a", list_id="L7"))
+
+    class _FakePlayer:
+        def isPlaying(self):
+            return True
+        def isPlayingVideo(self):
+            return False
+        def isPlayingAudio(self):
+            return False
+        def getTime(self):
+            return 12.0
+        def getTotalTime(self):
+            return 300.0
+
+    class _FakeXbmc:
+        def __init__(self, label):
+            self._label = label
+        def getInfoLabel(self, name):
+            return self._label
+        def getCondVisibility(self, cond):
+            return False
+
+    orig_kodi = pb.KODI_AVAILABLE
+    orig_xbmc = pb.xbmc
+    pb.KODI_AVAILABLE = True
+    player._kodi_player = _FakePlayer()
+    # Kodi is playing 'c' while the snapshot still says 'a'.
+    pb.xbmc = _FakeXbmc("plugin://plugin.service.ytlounge-cast/?play=c")
+    try:
+        before = owner.version
+        player._reconcile_tick()
+        # The item drift produces one kodiAdvanced adoption; the clock fold that
+        # follows is a separate, legitimate observation. What matters (R8):
+        # the adopted item is published with a re-derived index and the stored
+        # listId, and the queue is unchanged.
+        assert owner.current_video_id == "c"
+        assert owner.list_id == "L7"
+        assert owner.current_index == 2  # re-derived against the stored queue
+        assert owner.playlist == ("a", "b", "c")
+        assert owner.version > before
+
+        # Quiet tick: same player, same state -> zero versions.
+        v = owner.version
+        player._reconcile_tick()
+        assert owner.version == v, f"quiet tick advanced to {owner.version}"
+    finally:
+        pb.KODI_AVAILABLE = orig_kodi
+        pb.xbmc = orig_xbmc
+        session.close()
+
+def test_r8_vanished_player_is_a_corrective_stop():
+    """R8: the player disappearing while we believe something plays is one
+    corrective STOPPED event, not a silent stale state."""
+    import resources.lib.player_bridge as pb
+    from resources.lib.session_state import SetPlaylistEvent
+
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session, resolver=VideoResolver(bridge=MockYtDlpBridge()))
+    player.owner.apply(SetPlaylistEvent(video_ids=("a",), video_id="a", list_id="L1"))
+
+    class _GonePlayer:
+        def isPlaying(self):
+            return False
+
+    orig_kodi = pb.KODI_AVAILABLE
+    pb.KODI_AVAILABLE = True
+    player._kodi_player = _GonePlayer()
+    try:
+        before = player.owner.version
+        player._reconcile_tick()
+        assert player.owner.version == before + 1
+        assert player.state == PlayerState.STOPPED
+    finally:
+        pb.KODI_AVAILABLE = orig_kodi
+        session.close()
+
+def test_r6_unknown_published_when_item_fact_has_no_source():
+    """R6: with an alive player but no item at all, the item fact is genuinely
+    unknown and UNKNOWN is publishable (state=-1), never a guess."""
+    import resources.lib.player_bridge as pb
+    from resources.lib.session_state import PlayState
+
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session, resolver=VideoResolver(bridge=MockYtDlpBridge()))
+    player.owner.apply(pb.PlaybackStartedEvent())
+
+    class _AliveNoItem:
+        def isPlaying(self):
+            return True
+        def isPlayingVideo(self):
+            return False
+        def isPlayingAudio(self):
+            return False
+
+    class _FakeXbmc:
+        def getInfoLabel(self, name):
+            return ""
+        def getCondVisibility(self, cond):
+            return False
+
+    orig_kodi = pb.KODI_AVAILABLE
+    orig_xbmc = pb.xbmc
+    pb.KODI_AVAILABLE = True
+    player._kodi_player = _AliveNoItem()
+    pb.xbmc = _FakeXbmc()  # no plugin URL readable
+    try:
+        player._reconcile_tick()
+        assert player.owner.play_state == PlayState.UNKNOWN, player.owner.play_state
+    finally:
+        pb.KODI_AVAILABLE = orig_kodi
+        pb.xbmc = orig_xbmc
+        session.close()
+
 def test_duration_reporting_and_fallback():
     session = LoungeSession("s1", "t1", "d1")
     actions = []
@@ -1293,6 +1417,9 @@ if __name__ == "__main__":
     test_r9_force_publish_resends_shared_snapshot_without_second_writer()
     test_r5_index_derived_at_publication_tracks_queue_edits()
     test_r5_tv_side_pick_publishes_derived_index_with_original_listid()
+    test_r8_reconcile_emits_one_corrective_event_for_a_drift()
+    test_r8_vanished_player_is_a_corrective_stop()
+    test_r6_unknown_published_when_item_fact_has_no_source()
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
     test_track_change_watchdog_adopts_on_kodi_native_advance()
