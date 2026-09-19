@@ -860,9 +860,9 @@ class StateOwner:
         if self._on_apply is not None:
             try:
                 self._on_apply(new_state)
-            except Exception:
-                # never let a persistence failure break state reduction
-                pass
+            except Exception as exc:
+                # never let a persistence or callback failure break state reduction
+                logger.warning("Error in StateOwner on_apply callback: %s", exc)
         return new_state
 
     def snapshot(self) -> SessionState:

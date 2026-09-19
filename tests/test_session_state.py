@@ -473,5 +473,142 @@ class TestReducerPurityAndIdempotence(unittest.TestCase):
         self.assertEqual(violations, [], f"Found forbidden field assignments: {violations}")
 
 
+class TestProjectionRuleR4(unittest.TestCase):
+    """Unit tests for Rule R4: Kodi player/window/playlist management as a projection."""
+
+    @classmethod
+    def setUpClass(cls):
+        emulator_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "emulator")
+        if emulator_dir not in sys.path:
+            sys.path.insert(0, emulator_dir)
+        import kodi_stub
+        kodi_stub.install()
+
+    def setUp(self):
+        import kodi_stub
+        kodi_stub.reset()
+        from resources.lib.lounge.session import LoungeSession
+        from resources.lib.player_bridge import KodiPlayerBridge
+        self.session = LoungeSession("test_screen", "token", "lounge_token")
+        self.bridge = KodiPlayerBridge(session=self.session)
+
+    def test_state_owner_on_apply_synchronous_hook(self):
+        """Verify StateOwner invokes on_apply synchronously on each reduction."""
+        applied = []
+        owner = StateOwner(SessionState(version=0), on_apply=lambda s: applied.append(s))
+        new_state = owner.apply(SetVolumeEvent(volume=50))
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0].version, 1)
+        self.assertEqual(applied[0].volume, 50)
+        self.assertEqual(applied[0], new_state)
+
+    def test_apply_projection_executes_only_on_version_change(self):
+        """Consecutive calls to apply_projection with identical version perform zero mutations."""
+        import xbmc
+        xbmc.BUILTIN.clear()
+        state1 = SessionState(playlist=("v1", "v2"), current_video_id="v1", play_state=PlayState.PLAYING, lane="cl", version=1)
+
+        # First call: executes projection
+        self.bridge.apply_projection(state1)
+        self.assertEqual(self.bridge._last_projected_version, 1)
+
+        # Count builtins / mutations
+        builtins_count = len(xbmc.BUILTIN)
+
+        # Second call with identical version: must perform zero mutations
+        self.bridge.apply_projection(state1)
+        self.assertEqual(len(xbmc.BUILTIN), builtins_count)
+
+        # Third call: still zero mutations
+        self.bridge.apply_projection(state1)
+        self.assertEqual(len(xbmc.BUILTIN), builtins_count)
+
+    def test_apply_projection_reconciles_active_windows(self):
+        """apply_projection projects window 12005 for video and 12006 for music lane."""
+        import xbmc
+        music_state = SessionState(playlist=("s1",), current_video_id="s1", play_state=PlayState.PLAYING, lane="m", version=2)
+        self.bridge.apply_projection(music_state)
+        self.assertTrue(any("12006" in cmd for cmd in xbmc.BUILTIN))
+
+    def test_apply_projection_reconciles_playlist_contents_and_labels(self):
+        """apply_projection reconciles playlist items and uses pre-cached metadata for titles."""
+        import xbmc
+        pl = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+        self.bridge._kodi_queue_mode = True
+        self.bridge._queue_titles["s1"] = "Cached Title S1"
+
+        state = SessionState(playlist=("s1", "s2"), current_video_id="s1", play_state=PlayState.PLAYING, lane="m", version=1)
+        self.bridge.apply_projection(state)
+
+        self.assertEqual(pl.size(), 2)
+        self.assertEqual(pl.get_entry(0).label, "Cached Title S1")
+        self.assertEqual(pl.get_entry(1).label, "s2")  # fallback to video ID
+
+        # Update playlist: remove s1, add s3
+        self.bridge._queue_titles["s3"] = "Cached Title S3"
+        state2 = SessionState(playlist=("s2", "s3"), current_video_id="s2", play_state=PlayState.PLAYING, lane="m", version=2)
+        self.bridge.apply_projection(state2)
+
+        self.assertEqual(pl.size(), 2)
+        self.assertEqual(pl.get_entry(0).label, "s2")
+        self.assertEqual(pl.get_entry(1).label, "Cached Title S3")
+
+    def test_natural_playback_end_emits_kodi_advanced_event(self):
+        """Natural Kodi playback end routes through KodiAdvancedEvent on StateOwner."""
+        events = []
+        original_apply = self.bridge.owner.apply
+
+        def tracking_apply(event):
+            events.append(event)
+            return original_apply(event)
+
+        self.bridge._play_video = lambda *a, **kw: None
+        self.bridge.owner.apply = tracking_apply
+        self.bridge.owner.apply(SetPlaylistEvent(video_id="v1", video_ids=["v1", "v2"], current_time=0))
+        events.clear()
+
+        # Simulate natural playback end
+        self.bridge._on_playback_ended()
+        self.assertTrue(any(isinstance(e, KodiAdvancedEvent) and e.video_id == "v2" for e in events))
+        self.assertEqual(self.bridge.current_video_id, "v2")
+
+    def test_repair_routines_perform_zero_mutations(self):
+        """Periodic repair loops are reduced to passive log-only checks without mutations."""
+        import xbmc
+        xbmc.BUILTIN.clear()
+        pl = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+        pl.clear()
+
+        self.bridge._repair_fullscreen_windows()
+        self.bridge._ensure_music_window()
+        self.bridge._repair_music_lane_start()
+        self.bridge._patch_playlist_label(["v1"], "v1", "Title")
+
+        self.assertEqual(len(xbmc.BUILTIN), 0)
+        self.assertEqual(pl.size(), 0)
+
+    def test_window_activation_modal_dialog_collision_retries(self):
+        """Window activation retries via bounded worker when modal dialog is active."""
+        import xbmc
+        import time
+        self.bridge.owner.apply(SetPlaylistEvent(video_id="s1", theme="m"))
+        xbmc.Player().play("plugin://plugin.service.ytlounge-cast/?play=s1", None)
+        xbmc.set_modal_dialog(True)
+        try:
+            self.bridge._project_music_window()
+            # Modal dialog is active -> refused
+            self.assertFalse(self.bridge._visualisation_is_active())
+            # Dismiss modal dialog
+            xbmc.set_modal_dialog(False)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if self.bridge._visualisation_is_active():
+                    break
+                time.sleep(0.1)
+            self.assertTrue(self.bridge._visualisation_is_active())
+        finally:
+            xbmc.set_modal_dialog(False)
+
+
 if __name__ == "__main__":
     unittest.main()

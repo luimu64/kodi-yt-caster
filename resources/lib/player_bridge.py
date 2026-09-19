@@ -132,9 +132,10 @@ class KodiPlayerBridge:
         self.pending_seek: Optional[float] = None
         self.store = store
         self._save_hook = on_apply
-        self.owner = StateOwner(
+        self._last_projected_version: Optional[int] = None
+        self._owner = StateOwner(
             initial_state if initial_state is not None else SessionState(),
-            on_apply=self._save_hook,
+            on_apply=self._handle_state_applied,
         )
         self._lock = threading.RLock()
         self._play_gen = 0  # monotonic play-request epoch; supersedes stale requests
@@ -162,16 +163,6 @@ class KodiPlayerBridge:
         # work is held back. A starved server makes Kodi's STAT time out and
         # defers OnPlayBackStopped/PlaybackCleanup with it.
         self._transition_until: float = 0.0
-        # Music-window engagement window (monotonic deadline). Kodi starts the
-        # tracks that follow a music video itself (its own playlist advance
-        # through our plugin) and cleans the windows up LATE: the outgoing video
-        # player is still closing when the next item is already playing, and
-        # PlaybackCleanup pops the window back to the GUI ~9-12s in
-        # (device-verified in kodi.log). A single activation therefore races that
-        # cleanup and loses, so the window is re-asserted for a bounded window
-        # after each music-queue item change — long enough to outlive the
-        # cleanup, short enough that it stops fighting a deliberate GUI browse.
-        self._music_window_until: float = 0.0
         self._viz_inflight = False
         # Last item re-opened because Kodi started it in the video player's mode.
         self._lane_repaired_id: Optional[str] = None
@@ -180,6 +171,172 @@ class KodiPlayerBridge:
             self._kodi_player = self._create_kodi_player()
         else:
             self._kodi_player = None
+
+    @property
+    def owner(self) -> StateOwner:
+        return self._owner
+
+    @owner.setter
+    def owner(self, new_owner: StateOwner) -> None:
+        self._owner = new_owner
+        if self._owner._on_apply is None:
+            self._owner._on_apply = self._handle_state_applied
+
+    def _handle_state_applied(self, new_state: SessionState) -> None:
+        self.apply_projection(new_state)
+        if self._save_hook is not None:
+            try:
+                self._save_hook(new_state)
+            except Exception:
+                pass
+
+    def apply_projection(self, snapshot: Optional[SessionState] = None) -> None:
+        """Sole reconciler for Kodi playlist contents, track ordering, item titles,
+        and active GUI window (12005 vs 12006).
+
+        Executes strictly when snapshot.version changes (Rule R4). Consecutive calls
+        with identical version perform zero mutations.
+        """
+        if snapshot is None:
+            snapshot = self.owner.snapshot()
+
+        with self._lock:
+            if snapshot.version == self._last_projected_version:
+                return
+            self._last_projected_version = snapshot.version
+
+            if not (KODI_AVAILABLE and xbmc):
+                return
+
+            # 1. Reconcile playlist contents, ordering, and pre-cached titles
+            if self._kodi_queue_mode:
+                try:
+                    playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+                    self._reconcile_playlist(playlist, snapshot)
+                except Exception as exc:
+                    logger.debug("Playlist reconciliation error: %s", exc)
+            else:
+                try:
+                    playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+                    if playlist.size() > 0:
+                        playlist.clear()
+                except Exception:
+                    pass
+
+            # 2. Check for player mode misclassification on music lane
+            is_music_lane = (snapshot.lane or "") == "m"
+            if is_music_lane and self._kodi_player and self._music_lane_playing():
+                try:
+                    if self._kodi_player.isPlayingVideo():
+                        vid = snapshot.current_video_id
+                        if vid and vid != self._lane_repaired_id:
+                            self._lane_repaired_id = vid
+                            position = self.get_time()
+                            try:
+                                info = self.resolver.resolve(vid)
+                            except Exception:
+                                info = {}
+                            wants_audio = bool(info.get("audio_url")) and (
+                                self.music_visualizer == "always"
+                                or (self.music_visualizer != "never" and info.get("is_static_art"))
+                            )
+                            if wants_audio:
+                                logger.info(
+                                    "Kodi opened music item %s in video player mode — re-opening on music lane at %ss",
+                                    vid, position)
+                                self.play_video_id(vid, position)
+                                return
+                except Exception as exc:
+                    logger.debug("Music lane check error: %s", exc)
+
+            # 3. Reconcile active GUI windows (12005 vs 12006)
+            if snapshot.play_state == PlayerState.PLAYING:
+                if is_music_lane:
+                    self._project_music_window()
+                else:
+                    self._project_video_window()
+
+    def _reconcile_playlist(self, playlist, snapshot: SessionState) -> None:
+        """Reconcile Kodi's music playlist with snapshot.playlist and pre-cached titles."""
+        expected_vids = list(snapshot.playlist)
+        expected_urls = [f"plugin://plugin.service.ytlounge-cast/?play={vid}" for vid in expected_vids]
+        expected_labels = [self._queue_titles.get(vid) or vid for vid in expected_vids]
+
+        if not expected_vids:
+            if playlist.size() > 0:
+                playlist.clear()
+            return
+
+        def _make_item(vid: str, label: str):
+            if not (KODI_AVAILABLE and xbmcgui):
+                return None
+            li = xbmcgui.ListItem(label=label)
+            li.setArt({
+                "thumb": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+                "icon": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+            })
+            return li
+
+        if playlist.size() == 0:
+            for vid, url, label in zip(expected_vids, expected_urls, expected_labels):
+                playlist.add(url, _make_item(vid, label))
+            return
+
+        if hasattr(playlist, "get_entry"):
+            current_entries = [playlist.get_entry(i) for i in range(playlist.size())]
+            current_urls = [e.url for e in current_entries]
+            current_labels = [e.label for e in current_entries]
+
+            if current_urls == expected_urls and current_labels == expected_labels:
+                return
+
+            pos = playlist.getposition()
+
+            if current_urls == expected_urls:
+                for idx, (vid, url, exp_lbl, cur_lbl) in enumerate(zip(expected_vids, expected_urls, expected_labels, current_labels)):
+                    if exp_lbl != cur_lbl and idx != pos:
+                        playlist.remove(url)
+                        playlist.add(url, _make_item(vid, exp_lbl), idx)
+                return
+
+            # Remove items that no longer belong in playlist
+            for u in list(current_urls):
+                if u not in expected_urls:
+                    playlist.remove(u)
+
+            # Reconcile ordering and labels
+            for idx, (vid, url, label) in enumerate(zip(expected_vids, expected_urls, expected_labels)):
+                if idx >= playlist.size():
+                    playlist.add(url, _make_item(vid, label))
+                elif playlist.get_entry(idx).url != url:
+                    if idx != pos:
+                        if url in [playlist.get_entry(i).url for i in range(playlist.size())]:
+                            playlist.remove(url)
+                        playlist.add(url, _make_item(vid, label), idx)
+                elif playlist.get_entry(idx).label != label and idx != pos:
+                    playlist.remove(url)
+                    playlist.add(url, _make_item(vid, label), idx)
+
+    def _project_music_window(self) -> None:
+        """Project music visualization window (12006)."""
+        if not (KODI_AVAILABLE and xbmc):
+            return
+        if not self._visualisation_is_active():
+            try:
+                xbmc.executebuiltin("ActivateWindow(12006)")
+            except Exception:
+                pass
+        self._activate_visualizer()
+
+    def _project_video_window(self) -> None:
+        """Project fullscreen video window (12005)."""
+        if not (KODI_AVAILABLE and xbmc):
+            return
+        if self._visualisation_is_active():
+            try:
+                xbmc.executebuiltin("ActivateWindow(12005)")
+            except Exception:
+                pass
 
     # --- Session facts: read-only views over the single owner (R1) ---
     # Every read routes to the owner; the only write path is owner.apply().
@@ -314,14 +471,8 @@ class KodiPlayerBridge:
                             self._sync_current_from_kodi()
                 except Exception as exc:
                     logger.warning("position_loop player poll failed: %s", exc)
-                self._repair_fullscreen_windows()
-                # Re-assert the music window across a track change: Kodi starts
-                # queue items itself with no window request and cleans the old
-                # video window up late (see _music_window_until).
-                if self._music_window_until > time.monotonic():
-                    self._ensure_music_window()
-                elif self._music_window_until:
-                    self._music_window_until = 0.0
+                # Log-only drift reporting (R4: monitor ticks perform zero mutations)
+                self._report_drift_log_only()
 
             if self.state == PlayerState.PLAYING and self.current_video_id:
                 cur_time = self.get_time()
@@ -709,15 +860,10 @@ class KodiPlayerBridge:
                 # one back-to-back) and only warm the next track once playback
                 # is actually up — see _activate_visualizer.
                 self._begin_transition()
-                # Hold the music window across the transition as well: Kodi's
-                # cleanup for the outgoing video can pop it back to the GUI
-                # after this play has already engaged it.
-                self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
                 self._play_music_queue(video_id, info, list_item)
             else:
                 self._kodi_queue_mode = False
                 # A video owns the screen: stop re-asserting the music window.
-                self._music_window_until = 0.0
                 self._lane_repaired_id = None
                 player = self._kodi_player if self._kodi_player is not None else (xbmc.Player() if xbmc else None)
                 if player:
@@ -890,8 +1036,6 @@ class KodiPlayerBridge:
             if not rest:
                 return
 
-            snapshot = list(video_ids)
-
             def _run() -> None:
                 try:
                     for vid in rest:
@@ -899,7 +1043,6 @@ class KodiPlayerBridge:
                         if not title:
                             continue
                         self._store_queue_title(vid, title)
-                        self._patch_playlist_label(snapshot, vid, title)
                 finally:
                     with self._lock:
                         for v in rest:
@@ -911,37 +1054,8 @@ class KodiPlayerBridge:
                     self._queue_titles_inflight.discard(v)
 
     def _patch_playlist_label(self, snapshot: List[str], video_id: str, title: str) -> None:
-        """Update one live playlist entry's label after its title arrives.
-
-        Only the currently playing item is left alone (remove+add on it
-        could disrupt playback); already-played earlier items are safe to
-        patch. Bails if the queue was replaced since (size/order mismatch).
-        """
-        if not KODI_AVAILABLE:
-            return
-        try:
-            import xbmc
-            import xbmcgui
-            playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
-            if playlist.size() != len(snapshot):
-                return
-            try:
-                idx = snapshot.index(video_id)
-            except ValueError:
-                return
-            if idx == playlist.getposition():
-                return
-            url = f"plugin://plugin.service.ytlounge-cast/?play={video_id}"
-            # NOTE: pass the raw title straight through — no normalization,
-            # stripping, or re-encoding. CJK renders blank if anything in the
-            # chain touches the string, so hands off.
-            li = xbmcgui.ListItem(label=title)
-            li.setArt({"thumb": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
-                       "icon": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"})
-            playlist.remove(url)
-            playlist.add(url, li, idx)
-        except Exception:
-            pass
+        """Passive stub (Rule R4: titles are projected on version change)."""
+        pass
 
     def _stop_video_player_for_audio(self) -> None:
         """Stop the video player before handing Kodi an audio-lane play.
@@ -1021,119 +1135,64 @@ class KodiPlayerBridge:
 
         ActivateWindow is REFUSED while a modal dialog is up — and Kodi shows
         its Busy dialog exactly during playback start, which is when this runs.
-        Firing it once and assuming success is why the visualiser sometimes
-        never appeared (the fullscreen video window stayed on top instead), so
-        verify the window is actually active and retry until it is.
-
-        Collapses concurrent calls into one in-flight activator: the monitor
-        loop re-asserts the window across a track change, and one retrying
-        thread is enough for all of them.
+        Spawns a bounded retry worker that retries window activation until the
+        dialog dismisses and the window sticks.
         """
         if not (KODI_AVAILABLE and xbmc) or self._viz_inflight:
             return
         self._viz_inflight = True
 
         def _run() -> None:
-            deadline = time.monotonic() + 12.0  # wait for playback start + retries
+            deadline = time.monotonic() + 15.0
+            prefetched = False
             try:
-                while time.monotonic() < deadline:
+                while time.monotonic() < deadline and not self._monitor_stop.is_set():
                     try:
-                        # isPlayingAudio() is not trusted alone: see
-                        # _music_lane_playing() for the device state where Kodi
-                        # reports the item as video while only its audio decoder
-                        # runs.
+                        if (self.owner.lane or "") != "m" or self.owner.play_state != PlayerState.PLAYING:
+                            break
                         if self._kodi_player and (self._kodi_player.isPlayingAudio()
                                                   or self._music_lane_playing()):
-                            # 12006 = music visualisation window (12005 is the
-                            # fullscreen VIDEO window — that showed a frozen
-                            # frame over the GUI).
-                            xbmc.executebuiltin("ActivateWindow(12006)")
+                            if not self._visualisation_is_active():
+                                xbmc.executebuiltin("ActivateWindow(12006)")
                             if self._visualisation_is_active():
-                                logger.info("Visualisation window active")
-                                # Audio lane is up and the handoff has settled:
-                                # only now is it safe to saturate this process
-                                # with the next item's resolve/preload.
-                                self._kick_prefetch()
-                                return
-                            logger.info("ActivateWindow(12006) did not take "
-                                        "(modal dialog?) — retrying")
+                                if not prefetched:
+                                    logger.info("Visualisation window active")
+                                    self._kick_prefetch()
+                                    prefetched = True
+                            else:
+                                logger.info("ActivateWindow(12006) did not take (modal dialog?) — retrying")
+                        time.sleep(0.5)
                     except Exception:
-                        pass
-                    time.sleep(0.5)
-                logger.warning("Visualisation window never became active")
+                        break
+                if not self._visualisation_is_active():
+                    logger.warning("Visualisation window never became active")
             finally:
                 self._viz_inflight = False
+
         threading.Thread(target=_run, daemon=True, name="VizActivator").start()
 
+    def _report_drift_log_only(self) -> None:
+        """Passive log-only drift reporting (R4: timer ticks perform zero mutations)."""
+        if not (KODI_AVAILABLE and self._kodi_player):
+            return
+        try:
+            if (self._kodi_player.isPlayingAudio()
+                    and not self._kodi_player.isPlayingVideo()
+                    and self._fullscreen_video_window_active()):
+                logger.debug("Drift detected: fullscreen video window active while audio playing")
+            if (self._music_lane_playing()
+                    and not self._visualisation_is_active()):
+                logger.debug("Drift detected: music window not active while music lane playing")
+        except Exception:
+            pass
+
     def _repair_music_lane_start(self) -> None:
-        """Re-open a music item Kodi started in the video player's mode.
-
-        Device-verified: when Kodi's own playlist advance opens one of our
-        audio-only items while the outgoing video player is still closing, the
-        item keeps the video player's mode for its whole duration — ffmpeg
-        reports a single ``Audio: opus`` stream and no video at all, yet
-        ``isPlayingVideo()`` is True, window 12005 stays up and the music window
-        is closed. Kodi's GUI keeps restoring that state (a repeated
-        ``PreviousWindow`` pop every few seconds), so merely re-asserting the
-        visualisation window fights it indefinitely.
-
-        Re-playing the item through the music-playlist path we control — which
-        stops the video player first, the reason a cast never hits this — reopens
-        it as audio, and playback resumes where it was. Only applied when the
-        item belongs on the audio lane per our own resolve (a real music video
-        handed through the plugin path is legitimately video).
-        """
-        if not self._music_lane_playing():
-            return
-        try:
-            if not self._kodi_player.isPlayingVideo():
-                return
-        except Exception:
-            return
-        with self._lock:
-            vid = self.current_video_id
-            if not vid or vid == self._lane_repaired_id:
-                return
-            self._lane_repaired_id = vid
-            position = self.get_time()
-        if (self.current_theme or "") != "m":
-            return
-        try:
-            info = self.resolver.resolve(vid)
-        except Exception:
-            return
-        wants_audio = bool(info.get("audio_url")) and (
-            self.music_visualizer == "always"
-            or (self.music_visualizer != "never" and info.get("is_static_art"))
-        )
-        if not wants_audio:
-            return
-        logger.info("Kodi opened music item %s in the video player's mode — "
-                    "re-opening on the music lane at %ss", vid, position)
-        self.play_video_id(vid, position)
+        """Passive log-only check (R4)."""
+        self._report_drift_log_only()
 
     def _ensure_music_window(self) -> None:
-        """Keep the music (visualisation) window up while OUR music item plays.
-
-        The tracks Kodi starts by itself — its own playlist advance through
-        plugin.py, or a queue pick in the GUI — come with no window request at
-        all (Kodi asks for fullscreen only for the FIRST file of a music
-        session), and Kodi's own cleanup for the outgoing video lands LATE: at
-        adoption the outgoing video player is still closing, so
-        ``isPlayingVideo()`` can still be True, and the window is popped back to
-        the GUI seconds later. Deciding the lane once at adoption therefore
-        loses the race both ways. Called on every monitor-loop poll inside the
-        engagement window (see ``_music_window_until``) until the window sticks.
-        """
-        if not self._music_lane_playing():
-            return
-        # Wrong player mode for this item: fixing the window alone would just be
-        # fought by Kodi's GUI. Re-open it on the music lane first.
-        self._repair_music_lane_start()
-        if self._visualisation_is_active():
-            return
-        logger.info("Music window missing while a music-queue item plays — engaging")
-        self._activate_visualizer()
+        """Passive log-only check (R4)."""
+        self._report_drift_log_only()
 
     @staticmethod
     def _dump_thread_stacks(drift: float) -> None:
@@ -1155,31 +1214,8 @@ class KodiPlayerBridge:
             pass
 
     def _repair_fullscreen_windows(self) -> None:
-        """Keep the GUI window honest about what is playing.
-
-        The lane transition can leave Kodi showing the fullscreen video window
-        (last frame) while only the audio player runs — the audio player never
-        activates the visualisation window on its own (Kodi only requests
-        fullscreen for the first file of a music-playlist session), and the
-        window cleanup can be skipped when the video was still closing. When
-        that stale state is detected, put the visualisation window back on top.
-        """
-        if not (KODI_AVAILABLE and xbmc) or not self._kodi_player:
-            return
-        try:
-            if not self._kodi_player.isPlayingAudio():
-                return
-            if self._kodi_player.isPlayingVideo():
-                return  # a video is genuinely on screen
-            if not self._fullscreen_video_window_active():
-                return
-        except Exception:
-            return
-        logger.info("Stale fullscreen video window while audio plays — activating visualisation")
-        try:
-            xbmc.executebuiltin("ActivateWindow(12006)")
-        except Exception:
-            pass
+        """Passive log-only check (R4)."""
+        self._report_drift_log_only()
 
     def _is_paused(self) -> bool:
         # xbmc.Player.isPlaying() returns True WHILE PAUSED, so it cannot
@@ -1433,20 +1469,8 @@ class KodiPlayerBridge:
             PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
             self._active_gen = self._play_gen
 
-        # An item Kodi started on its own inside the music queue (the plugin
-        # URL is ours, so this is Kodi's auto-advance or a queue pick in the
-        # GUI) comes with NO music view: Kodi asks for fullscreen only for the
-        # FIRST file of a music-playlist session, and its cleanup for the
-        # outgoing video lands late — at this point the video player may still
-        # be closing (isPlayingVideo() True) and the window is popped back to
-        # the GUI seconds later. So don't decide the lane here: open a bounded
-        # engagement window and let the monitor loop keep re-asserting the
-        # visualisation window until it sticks (device-verified: both races are
-        # real, and a single activation loses them).
         if "plugin://" in playing_url:
             self._lane_repaired_id = None
-            self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
-            self._ensure_music_window()
 
         # Duration unknown until resolve; refresh it (and the preload chain)
         # in the background without blocking the state reports below.
@@ -1539,15 +1563,6 @@ class KodiPlayerBridge:
                 pass
 
     def _on_playback_ended(self) -> None:
-        self.owner.apply(StopVideoEvent())
-        with self._lock:
-            self._requested_id = None
-        for s in self.sessions:
-            try:
-                s.report_state_change(self.state, 0, 0)
-            except Exception:
-                pass
-
         # Advance playlist. Kodi fires Ended for a manual skip too — but in
         # that case it has ALREADY started the next item itself and
         # onPlayBackStarted (with _sync_current_from_kodi) adopts it. The
@@ -1556,12 +1571,6 @@ class KodiPlayerBridge:
         # current_video_id on the finished track; a manual skip's Started
         # event fires first and syncs it forward. So: advance only if the
         # ended item is still current.
-        #
-        # NOTE: current_video_id is only trustworthy here because
-        # _sync_current_from_kodi() runs on EVERY onPlayBackStarted. If the
-        # manual skip's Started event hasn't been processed yet (race), this
-        # may still double-start; the generation guard in _play_video drops
-        # the stale one.
         with self._lock:
             kodi_queue_mode = self._kodi_queue_mode
             if self.playlist and self.current_index + 1 < len(self.playlist):
@@ -1575,12 +1584,21 @@ class KodiPlayerBridge:
                         # Kodi's advance and restart the track from 0.
                         logger.debug("Ended in Kodi-queue mode; letting Kodi auto-advance to %s", next_id)
                         return
-                    self.owner.apply(NextEvent(video_id=next_id))
+                    self.owner.apply(KodiAdvancedEvent(video_id=next_id))
                     self._requested_id = next_id
                     logger.info("Auto-advancing to next video: %s", next_id)
                     self._play_gen += 1
                     PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
                     threading.Thread(target=self._play_video, args=(next_id, self._play_gen, self.current_theme), daemon=True).start()
+                    return
                 else:
                     logger.debug("Ended after manual skip to %s; Kodi already playing it",
                                  self.current_video_id)
+                    return
+            self.owner.apply(StopVideoEvent())
+            self._requested_id = None
+        for s in self.sessions:
+            try:
+                s.report_state_change(self.state, 0, 0)
+            except Exception:
+                pass
