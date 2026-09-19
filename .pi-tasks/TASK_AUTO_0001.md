@@ -3,7 +3,7 @@ id: TASK_AUTO_0001
 state: in_progress
 phase: done
 created_at: 2026-09-19T07:35:57.678Z
-updated_at: 2026-09-19T07:35:57.825Z
+updated_at: 2026-09-19T08:03:29.511Z
 title: Implement refactor described within docs/STATE-TRANSFER-REFACTOR.md
 ---
 
@@ -17,7 +17,7 @@ Implement refactor described within docs/STATE-TRANSFER-REFACTOR.md
 
 ## tasks
 
-- [ ] P01 TASK_0001 a1  Establish SessionState as the single in-process state owner — extract an immutable snapshot data class
+- [x] P01 TASK_0001 a1  Establish SessionState as the single in-process state owner — extract an immutable snapshot data class
 - [ ] P02  Implement event reduction for all state changes — pure idempotent reducer and reduction logging
 - [ ] P03  Convert player and window management to derived projections — remove timer repair loops
 - [ ] P04  Publish outbound state batches by snapshot version — diff against last published state with monotonic ofs
