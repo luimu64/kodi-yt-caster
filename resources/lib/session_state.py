@@ -813,3 +813,78 @@ def reduce(state: SessionState, event: Event) -> SessionState:
 
     # Unknown events are inert, never fatal
     return state
+
+# =====================================================================
+# StateOwner: single mutable handle to the immutable SessionState (R1)
+# =====================================================================
+
+
+class StateOwner:
+    """Single in-process owner of the session facts (R1).
+
+    Wraps an immutable ``SessionState``. The only write path in the codebase
+    is ``apply``, which funnels every change through the pure reducer ``reduce``
+    and swaps the stored reference to the new immutable state. All other
+    access is via read-only properties, so no caller ever mutates a field
+    directly.
+    """
+
+    def __init__(self, state: SessionState) -> None:
+        self._state = state
+
+    def apply(self, event: "Event") -> SessionState:
+        """Reduce and store. Returns the new immutable state (idempotent events
+        leave version unchanged, per the reducer contract)."""
+        new_state = reduce(self._state, event)
+        self._state = new_state
+        return new_state
+
+    # --- canonical read-only accessors (the 9 facts + version) ---
+    @property
+    def playlist(self) -> Tuple[str, ...]:
+        return self._state.playlist
+
+    @property
+    def current_index(self) -> int:
+        return self._state.current_index
+
+    @property
+    def current_video_id(self) -> Optional[str]:
+        return self._state.current_video_id
+
+    @property
+    def list_id(self) -> str:
+        return self._state.list_id
+
+    @property
+    def position(self) -> float:
+        return self._state.position
+
+    @property
+    def duration(self) -> float:
+        return self._state.duration
+
+    @property
+    def play_state(self) -> int:
+        return self._state.play_state
+
+    @property
+    def lane(self) -> Optional[str]:
+        return self._state.lane
+
+    @property
+    def volume(self) -> int:
+        return self._state.volume
+
+    @property
+    def cpn(self) -> str:
+        return self._state.cpn
+
+    @property
+    def version(self) -> int:
+        return self._state.version
+
+    # --- legacy read-only compat alias (existing `self.state` reads) ---
+    @property
+    def state(self) -> int:
+        return self._state.play_state
