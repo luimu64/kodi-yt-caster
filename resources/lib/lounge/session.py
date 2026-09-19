@@ -18,9 +18,9 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from ..session_state import SessionState, PlayState, StateOwner, _diff_field_groups
+    from ..session_state import SessionState, PlayState, StateOwner, _diff_field_groups, published_index
 except ImportError:
-    from resources.lib.session_state import SessionState, PlayState, StateOwner, _diff_field_groups
+    from resources.lib.session_state import SessionState, PlayState, StateOwner, _diff_field_groups, published_index
 
 from .client import BASE_URL, DEFAULT_HEADERS, LoungeError, LoungeTokenExpiredError
 
@@ -360,6 +360,9 @@ class LoungeSession:
             payload["currentIndex"] = str(snapshot.current_index)
         if snapshot.list_id:
             payload["listId"] = str(snapshot.list_id)
+        # R5: the index is derived from the queue this report carries, never a
+        # carried field, so it can never point outside the phone's list.
+        payload["currentIndex"] = str(published_index(snapshot))
         return payload
 
     def _build_now_playing_playlist(self, snapshot: SessionState) -> Dict[str, Any]:
@@ -370,7 +373,7 @@ class LoungeSession:
         payload = {
             "videoIds": vids,
             "videoId": vid,
-            "currentIndex": str(max(0, snapshot.current_index)),
+            "currentIndex": str(published_index(snapshot)),
             "currentTime": str(cur),
             "duration": str(dur),
             "state": str(snapshot.play_state),

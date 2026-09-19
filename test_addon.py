@@ -705,6 +705,69 @@ def test_r9_force_publish_resends_shared_snapshot_without_second_writer():
     assert "nowPlaying" in posted, posted
     session.close()
 
+def test_r5_index_derived_at_publication_tracks_queue_edits():
+    """R5: currentIndex is derived from the stored queue at publication, so a
+    queue edit that removes an earlier item moves the reported index with it."""
+    from resources.lib.session_state import (
+        SessionState, PlayState, SetPlaylistEvent, UpdatePlaylistEvent, published_index,
+    )
+
+    session = LoungeSession("s1", "t1", "d1")
+    session.sid = "sid-test"
+    posted = []
+    session.post_action = lambda sc, data, heartbeat=False: posted.append((sc, dict(data))) or True
+
+    # Queue [a,b,c], playing b -> index 1.
+    base = SessionState(version=1, playlist=("a", "b", "c"), current_video_id="b",
+                        current_index=1, list_id="L1", play_state=PlayState.PLAYING)
+    npp = session._build_now_playing_playlist(base)
+    assert npp["currentIndex"] == "1"
+
+    # Phone removes 'a' -> [b,c]; b is now index 0 and the report must say 0,
+    # not the stale carried 1.
+    edited = SessionState(version=2, playlist=("b", "c"), current_video_id="b",
+                          current_index=0, list_id="L1", play_state=PlayState.PLAYING)
+    assert session._build_now_playing_playlist(edited)["currentIndex"] == "0"
+
+    # A snapshot whose stale index was never recomputed is still reported from
+    # the queue (derived at publication), not from the carried field.
+    stale = SessionState(version=3, playlist=("b", "c"), current_video_id="c",
+                         current_index=0, list_id="L1", play_state=PlayState.PLAYING)
+    assert published_index(stale) == 1
+    assert session._build_now_playing_playlist(stale)["currentIndex"] == "1"
+
+    # Never an out-of-range index, even when the active item is not in the queue.
+    foreign = SessionState(version=4, playlist=("x", "y"), current_video_id="zz",
+                           current_index=99, list_id="L1", play_state=PlayState.PLAYING)
+    idx = int(session._build_now_playing_playlist(foreign)["currentIndex"])
+    assert 0 <= idx <= 1, idx
+    assert session._build_now_playing(foreign)["currentIndex"] == str(idx)
+    # Empty queue -> 0, not a carried value.
+    empty = SessionState(version=5, playlist=(), current_video_id="a",
+                         current_index=7, play_state=PlayState.PLAYING)
+    assert published_index(empty) == 0
+    session.close()
+
+def test_r5_tv_side_pick_publishes_derived_index_with_original_listid():
+    """R5: a TV-side pick publishes one report with the re-derived index and the
+    original listId — the pair is never mismatched."""
+    from resources.lib.session_state import (
+        SessionState, PlayState, StateOwner, SetPlaylistEvent, KodiAdvancedEvent,
+    )
+
+    owner = StateOwner(SessionState())
+    owner.apply(SetPlaylistEvent(video_ids=("a", "b", "c"), video_id="a", list_id="L9"))
+    owner.apply(KodiAdvancedEvent(video_id="c", source="player-clock"))
+    snap = owner.snapshot()
+
+    session = LoungeSession("s1", "t1", "d1")
+    np = session._build_now_playing(snap)
+    npp = session._build_now_playing_playlist(snap)
+    assert np["listId"] == "L9" and npp["listId"] == "L9"
+    assert np["videoId"] == "c"
+    assert np["currentIndex"] == "2" and npp["currentIndex"] == "2"
+    session.close()
+
 def test_duration_reporting_and_fallback():
     session = LoungeSession("s1", "t1", "d1")
     actions = []
@@ -1228,6 +1291,8 @@ if __name__ == "__main__":
     test_r7_heartbeat_emits_full_snapshot()
     test_r9_one_model_n_channels_same_state_independent_ofs()
     test_r9_force_publish_resends_shared_snapshot_without_second_writer()
+    test_r5_index_derived_at_publication_tracks_queue_edits()
+    test_r5_tv_side_pick_publishes_derived_index_with_original_listid()
     test_duration_reporting_and_fallback()
     test_sync_current_from_kodi_refresh_dispatches_duration()
     test_track_change_watchdog_adopts_on_kodi_native_advance()

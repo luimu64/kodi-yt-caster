@@ -218,7 +218,9 @@ R10 (independent; schedule when a quick win is wanted)
    `lounge/listener.py` are gone — a handshake now re-sends the shared snapshot on each channel
    via `force_publish()`).
 5. **R2, R5** — identity: persist the session record, derive the index at publication. R2 ✅
-   `c28bebb`; R5 next.
+   `c28bebb`; R5 ✅ (publication derives the index from the queue it sends: `published_index()`
+   in `session_state.py`, used by the `nowPlaying`/`nowPlayingPlaylist` builders, so a stale
+   carried field or an out-of-range index can never reach the wire).
 6. **R6 → R8** — confidence and reconciliation.
 7. **R10** — vocabulary coverage, independently schedulable.
 8. **Reliability matrix** — the acceptance gate, only meaningful after the rest.

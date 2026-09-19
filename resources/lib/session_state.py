@@ -298,6 +298,22 @@ def _derive_index(playlist: Tuple[str, ...], video_id: Optional[str], fallback_i
         return max(0, min(fallback_index, len(playlist) - 1))
     return 0
 
+def published_index(snapshot: "SessionState") -> int:
+    """Derive the index to publish (R5) from the stored queue at publication time.
+
+    An index computed against a different list than the phone's is an identity
+    mismatch even when ``listId`` is correct, so it is never carried as a field:
+    it is recomputed here from the queue the report is actually sent with.
+
+    If the active item is absent from the queue, the fallback is the stored
+    index clamped into range — the report must never carry an out-of-range
+    index (R5).
+    """
+    playlist = snapshot.playlist
+    if not playlist:
+        return 0
+    return _derive_index(playlist, snapshot.current_video_id, snapshot.current_index)
+
 
 def _diff_field_groups(old: SessionState, new: SessionState) -> List[str]:
     """Compute changed field groups between old and new state.
