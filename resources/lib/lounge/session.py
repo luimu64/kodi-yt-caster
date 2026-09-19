@@ -11,10 +11,17 @@ import re
 import socket
 import string
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from ..session_state import SessionState, PlayState, StateOwner, _diff_field_groups
+except ImportError:
+    from resources.lib.session_state import SessionState, PlayState, StateOwner, _diff_field_groups
+
 from .client import BASE_URL, DEFAULT_HEADERS, LoungeError, LoungeTokenExpiredError
 
 logger = logging.getLogger("ytlounge.session")
@@ -90,6 +97,7 @@ class LoungeSession:
         device_id: str,
         screen_name: str = "Kodi",
         theme: str = "cl",
+        owner: Optional[StateOwner] = None,
     ):
         self.screen_id = screen_id
         self.lounge_token = lounge_token
@@ -100,21 +108,24 @@ class LoungeSession:
         self.gsessionid: Optional[str] = None
         self.ofs = 0
         self.last_code = -1
-        # Async reporting: posts to /bc/bind open a fresh TLS connection each
-        # time and can take seconds. Doing them on the listener thread stalls
-        # command delivery (seek/pause lag by seconds); doing them on the
-        # position loop drifts its cadence. So report_* enqueue and a single
-        # worker thread posts, coalescing repeated reports (last wins per tag)
-        # so a slow network cannot build an unbounded backlog of stale states.
-        self._post_queue: "queue.Queue[Optional[Tuple[str, str, Dict[str, Any]]]]" = queue.Queue()
+
+        # Version-driven state publication (R7)
         self._ofs_lock = threading.Lock()
         self._conn: Optional[http.client.HTTPConnection] = None
         self._conn_host: Optional[str] = None
         self._conn_scheme: Optional[str] = None
-        self._post_worker = threading.Thread(
-            target=self._post_worker_loop, daemon=True, name=f"LoungePoster-{theme}"
+
+        self._owner: Optional[StateOwner] = owner
+        self._last_published: Optional[SessionState] = None
+        self._wake_event = threading.Event()
+        self._stopped = threading.Event()
+        self._heartbeat_interval = 2.0  # <= 1 Hz
+
+        self._publisher_thread = threading.Thread(
+            target=self._publisher_loop, daemon=True, name=f"LoungePublisher-{theme}"
         )
-        self._post_worker.start()
+        self._post_worker = self._publisher_thread  # backwards compat
+        self._publisher_thread.start()
 
     def _random_zx(self) -> str:
         return "".join(random.choices(string.ascii_letters + string.digits, k=12))
@@ -136,6 +147,9 @@ class LoungeSession:
 
     def handshake(self) -> Tuple[str, str]:
         """Perform initial bind handshake to obtain SID and gsessionid."""
+        with self._ofs_lock:
+            self.ofs = 0
+
         params = self._base_params()
         params.update({
             "RID": "1337",
@@ -166,61 +180,233 @@ class LoungeSession:
         if not self.sid or not self.gsessionid:
             raise LoungeError("Failed to extract SID/gsessionid from handshake")
 
+        self._wake_event.set()
         return self.sid, self.gsessionid
 
-    def _post_worker_loop(self) -> None:
-        while True:
-            item = self._post_queue.get()
-            if item is None:
-                if self._conn is not None:
-                    try:
-                        self._conn.close()
-                    except Exception:
-                        pass
-                    self._conn = None
-                return
-            tag, sc, data = item
-            # Coalesce: if newer reports with the same tag are already queued,
-            # take the latest one and drop the stale ones.
-            # nowPlaying is EXEMPT: it carries the videoId, and dropping it
-            # loses the "this song started" signal the phone needs after a
-            # TV-side queue pick.
-            if sc != "nowPlaying":
-                pending: list = []
-                while True:
-                    try:
-                        nxt = self._post_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if nxt is None:
-                        pending.append(None)
-                        break
-                    if nxt[0] == tag:
-                        item = nxt
-                        tag, sc, data = item
-                    else:
-                        pending.append(nxt)
-                for p in pending:
-                    self._post_queue.put(p)
+    def attach_state_owner(self, owner: StateOwner) -> None:
+        """Attach the StateOwner handle to this session."""
+        self._owner = owner
+        self._wake_event.set()
+
+    def notify_state_changed(self, snapshot: Optional[SessionState] = None) -> None:
+        """Wake publication on SessionState.version changes."""
+        self._wake_event.set()
+
+    def flush(self, timeout: float = 1.0) -> None:
+        """Wait until any pending dirty state has been published."""
+        deadline = time.monotonic() + timeout
+        self._wake_event.set()
+        while time.monotonic() < deadline:
+            if self._owner is None:
+                break
+            snap = self._owner.snapshot()
+            if self._last_published is not None and self._last_published.version >= snap.version:
+                break
+            time.sleep(0.01)
+
+    def _publisher_loop(self) -> None:
+        last_heartbeat = time.monotonic()
+        while not self._stopped.is_set():
             try:
-                self._do_post(sc, data)
+                now = time.monotonic()
+                time_since_heartbeat = now - last_heartbeat
+                remaining_heartbeat = max(0.05, self._heartbeat_interval - time_since_heartbeat)
+
+                self._wake_event.wait(timeout=remaining_heartbeat)
+                self._wake_event.clear()
+
+                if self._stopped.is_set():
+                    break
+
+                owner = self._owner
+                if owner is None:
+                    continue
+
+                snapshot = owner.snapshot()
+
+                # Change-driven publication
+                is_dirty = (
+                    self._last_published is None
+                    or snapshot.version != self._last_published.version
+                )
+
+                if is_dirty:
+                    success = self.publish_snapshot(snapshot, heartbeat=False)
+                    if success:
+                        last_heartbeat = time.monotonic()
+                else:
+                    # Heartbeat check
+                    now = time.monotonic()
+                    if now - last_heartbeat >= self._heartbeat_interval:
+                        if self.sid:
+                            success = self.publish_snapshot(snapshot, heartbeat=True)
+                            if success:
+                                last_heartbeat = time.monotonic()
+            except Exception as e:
+                logger.debug("Publisher loop exception: %s", e, exc_info=True)
+                time.sleep(0.1)
+
+        if self._conn is not None:
+            try:
+                self._conn.close()
             except Exception:
-                logger.debug("Async post %s failed", sc, exc_info=True)
+                pass
+            self._conn = None
 
-    def post_action(self, sc: str, data: Dict[str, Any]) -> None:
-        """Enqueue a player/device state report; posted asynchronously by the
-        session's worker so callers (listener thread, position loop) never block."""
-        if not self.sid:
-            return
-        self._post_queue.put((sc, sc, data))
+    def publish_snapshot(self, snapshot: SessionState, heartbeat: bool = False) -> bool:
+        """Publish state snapshot diffed against the last published state."""
+        if not heartbeat:
+            old = self._last_published or SessionState(version=-1, volume=-1, play_state=-1)
+            changed_groups = _diff_field_groups(old, snapshot)
+            if not changed_groups:
+                return True
 
-    def _do_post(self, sc: str, data: Dict[str, Any]) -> None:
+            actions_to_emit: List[Tuple[str, Dict[str, Any]]] = []
+
+            # 1. Identity group
+            if "identity" in changed_groups:
+                actions_to_emit.append(("nowPlaying", self._build_now_playing(snapshot)))
+                if snapshot.playlist:
+                    actions_to_emit.append(("nowPlayingPlaylist", self._build_now_playing_playlist(snapshot)))
+
+            # 2. Playback group
+            if "playback" in changed_groups:
+                if "identity" not in changed_groups:
+                    actions_to_emit.append(("nowPlaying", self._build_now_playing(snapshot)))
+                should_emit_state_change = (
+                    self._last_published is None
+                    or self._last_published.play_state != snapshot.play_state
+                    or (self._last_published.duration == 0 and snapshot.duration > 0)
+                    or (snapshot.play_state == PlayState.PAUSED and self._last_published.position != snapshot.position)
+                )
+                if should_emit_state_change:
+                    actions_to_emit.append(("onStateChange", self._build_state_change(snapshot)))
+
+            # 3. Volume group
+            if "volume" in changed_groups:
+                actions_to_emit.append(("onVolumeChanged", self._build_volume(snapshot)))
+
+            # 4. Lane group: no outbound RPC action
+
+            groups_str = ", ".join(changed_groups)
+            action_names = [a[0] for a in actions_to_emit]
+            logger.info("PUBLISH v%d %s -> %s", snapshot.version, groups_str, action_names)
+
+            all_ok = True
+            for sc, payload in actions_to_emit:
+                try:
+                    res = self.post_action(sc, payload)
+                except TypeError:
+                    res = self.post_action(sc, payload)
+                if res is False:
+                    all_ok = False
+                    break
+
+            if all_ok:
+                self._last_published = snapshot
+                return True
+            else:
+                return False
+        else:
+            # Full snapshot heartbeat (<= 1 Hz)
+            heartbeat_actions: List[Tuple[str, Dict[str, Any]]] = [
+                ("nowPlaying", self._build_now_playing(snapshot)),
+            ]
+            if snapshot.playlist:
+                heartbeat_actions.append(("nowPlayingPlaylist", self._build_now_playing_playlist(snapshot)))
+            heartbeat_actions.append(("onVolumeChanged", self._build_volume(snapshot)))
+
+            action_names = [a[0] for a in heartbeat_actions]
+            logger.info("PUBLISH v%d heartbeat=true -> %s", snapshot.version, action_names)
+
+            all_ok = True
+            for sc, payload in heartbeat_actions:
+                try:
+                    res = self.post_action(sc, payload, heartbeat=True)
+                except TypeError:
+                    res = self.post_action(sc, payload)
+                if res is False:
+                    all_ok = False
+                    break
+            return all_ok
+
+    def _build_now_playing(self, snapshot: SessionState) -> Dict[str, Any]:
+        dur = max(0, int(snapshot.duration or 0))
+        cur = max(0, int(snapshot.position or 0))
+        state = snapshot.play_state
+        payload = {
+            "videoId": snapshot.current_video_id or "",
+            "currentTime": str(cur),
+            "duration": str(dur),
+            "state": str(state),
+            "cpn": snapshot.cpn or "kodi",
+        }
+        if dur > 0:
+            payload["seekableStartTime"] = "0"
+            payload["seekableEndTime"] = str(dur)
+            payload["loadedTime"] = str(dur if state == PlayState.PLAYING else cur)
+        if snapshot.current_index is not None and snapshot.current_index >= 0:
+            payload["currentIndex"] = str(snapshot.current_index)
+        if snapshot.list_id:
+            payload["listId"] = str(snapshot.list_id)
+        return payload
+
+    def _build_now_playing_playlist(self, snapshot: SessionState) -> Dict[str, Any]:
+        dur = max(0, int(snapshot.duration or 0))
+        cur = max(0, int(snapshot.position or 0))
+        vid = snapshot.current_video_id or ""
+        vids = ",".join(snapshot.playlist) if snapshot.playlist else vid
+        payload = {
+            "videoIds": vids,
+            "videoId": vid,
+            "currentIndex": str(max(0, snapshot.current_index)),
+            "currentTime": str(cur),
+            "duration": str(dur),
+            "state": str(snapshot.play_state),
+        }
+        if dur > 0:
+            payload["seekableStartTime"] = "0"
+            payload["seekableEndTime"] = str(dur)
+        if snapshot.list_id:
+            payload["listId"] = str(snapshot.list_id)
+        return payload
+
+    def _build_state_change(self, snapshot: SessionState) -> Dict[str, Any]:
+        dur = max(0, int(snapshot.duration or 0))
+        cur = max(0, int(snapshot.position or 0))
+        state = snapshot.play_state
+        payload = {
+            "state": str(state),
+            "currentTime": str(cur),
+            "duration": str(dur),
+            "cpn": snapshot.cpn or "kodi",
+        }
+        if dur > 0:
+            payload["seekableStartTime"] = "0"
+            payload["seekableEndTime"] = str(dur)
+            payload["loadedTime"] = str(dur if state == PlayState.PLAYING else cur)
+        return payload
+
+    def _build_volume(self, snapshot: SessionState) -> Dict[str, Any]:
+        return {
+            "volume": str(max(0, min(int(snapshot.volume), 100))),
+            "muted": "false",
+        }
+
+    def post_action(self, sc: str, data: Dict[str, Any], heartbeat: bool = False) -> bool:
+        """Post a player/device state report. Returns True on success, False on failure."""
         if not self.sid:
-            return
+            return False
+        return self._do_post(sc, data, heartbeat=heartbeat)
+
+    def _do_post(self, sc: str, data: Dict[str, Any], heartbeat: bool = False) -> bool:
+        if not self.sid:
+            return False
 
         with self._ofs_lock:
             self.ofs += 1
             ofs = self.ofs
+
         post_data = {
             "count": "1",
             "ofs": str(ofs),
@@ -228,6 +414,16 @@ class LoungeSession:
         }
         for k, v in data.items():
             post_data[f"req0_{k}"] = str(v)
+
+        hb_flag = " heartbeat=true" if heartbeat else ""
+        if sc == "nowPlaying":
+            logger.info(
+                "REPORT nowPlaying vid=%s idx=%s t=%s dur=%s state=%s listId=%s%s",
+                data.get("videoId"), data.get("currentIndex"), data.get("currentTime"),
+                data.get("duration"), data.get("state"), data.get("listId") or "-", hb_flag
+            )
+        else:
+            logger.info("REPORT %s data=%s%s", sc, data, hb_flag)
 
         params = self._base_params()
         params.update({
@@ -270,6 +466,7 @@ class LoungeSession:
                 conn.request("POST", path, body=encoded, headers=headers)
                 resp = conn.getresponse()
                 resp.read()
+                return True
             except (http.client.RemoteDisconnected, http.client.CannotSendRequest,
                     ConnectionResetError, BrokenPipeError, socket.error):
                 try:
@@ -281,12 +478,14 @@ class LoungeSession:
                 conn.request("POST", path, body=encoded, headers=headers)
                 resp = conn.getresponse()
                 resp.read()
+                return True
         except Exception as e:
-            # INFO-level: post failures break the phone-side session
-            # (remote never sees our state) and must be visible in kodi.log.
             logger.info("Failed to post action %s: %s (ofs=%s)", sc, e, ofs)
+            return False
 
     def close(self) -> None:
+        self._stopped.set()
+        self._wake_event.set()
         if self._conn is not None:
             try:
                 self._conn.close()
@@ -322,10 +521,6 @@ class LoungeSession:
         if list_id:
             payload["listId"] = str(list_id)
 
-        logger.info(
-            "REPORT nowPlaying vid=%s idx=%s t=%s dur=%s state=%s listId=%s",
-            video_id, payload.get("currentIndex"), cur, dur, state, payload.get("listId") or "-",
-        )
         self.post_action("nowPlaying", payload)
 
     def report_now_playing_playlist(

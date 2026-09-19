@@ -41,28 +41,22 @@ def test_duration_fallback_from_kodi():
 
 
 def test_position_loop_emits_both_reports():
-    """_position_loop emits both nowPlaying and onStateChange during active playback."""
+    """Version-driven position tick emits nowPlaying with resolved duration during active playback."""
     with Scenario() as s:
         s.phone.set_playlist("v_loop", ["v_loop"], current_time=0)
         s.wait_until(lambda: "v_loop" in (s.playing_file() or ""), what="v_loop playing")
         # Clear initial burst of reports
         time.sleep(0.5)
         s.lounge.clear_reports()
-        # Wait for position loop interval (2s)
+        # Wait for position advance
         time.sleep(2.5)
-        # Position loop must emit both nowPlaying and onStateChange with duration 180 (from fake resolve)
+        # Position tick must emit nowPlaying with duration 180 (from fake resolve)
         np = s.lounge.wait_for_report(
             "nowPlaying",
             lambda r: r.get("videoId") == "v_loop" and r.get("duration") == "180",
             timeout=3.0,
         )
-        assert np, f"Position loop must emit nowPlaying with duration: {s.lounge.reports()}"
-        sc = s.lounge.wait_for_report(
-            "onStateChange",
-            lambda r: r.get("duration") == "180",
-            timeout=3.0,
-        )
-        assert sc, f"Position loop must emit onStateChange with duration: {s.lounge.reports()}"
+        assert np, f"Position tick must emit nowPlaying with duration: {s.lounge.reports()}"
 
 
 def test_sync_current_from_kodi_refresh_dispatches_duration():

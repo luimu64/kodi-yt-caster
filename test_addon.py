@@ -701,12 +701,14 @@ def test_pause_and_resume_reporting():
 
     actions.clear()
     player.pause()
+    session.flush()
     assert player.state == PlayerState.PAUSED
     assert any(a[0] == "onStateChange" and a[1]["state"] == "2" for a in actions)
     assert any(a[0] == "nowPlaying" and a[1]["state"] == "2" for a in actions)
 
     actions.clear()
     player.resume()
+    session.flush()
     assert player.state == PlayerState.PLAYING
     assert any(a[0] == "onStateChange" and a[1]["state"] == "1" for a in actions)
     assert any(a[0] == "nowPlaying" and a[1]["state"] == "1" for a in actions)
