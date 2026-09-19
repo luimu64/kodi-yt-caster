@@ -41,6 +41,7 @@ from resources.lib.session_state import (
     SetPlaylistEvent,
     SetVolumeEvent,
     SignalUnknownEvent,
+    StateOwner,
     StopEvent,
     StopVideoEvent,
     UpdatePlaylistEvent,
@@ -394,6 +395,77 @@ class TestReducerPurityAndIdempotence(unittest.TestCase):
 
         finally:
             logger.removeHandler(handler)
+
+    def test_state_owner_snapshot_immutability_and_detachment(self):
+        """Verify StateOwner.snapshot() returns an immutable detached SessionState snapshot."""
+        owner = StateOwner(SessionState(playlist=("v1", "v2"), current_video_id="v1", version=1))
+        snap = owner.snapshot()
+        self.assertIsInstance(snap, SessionState)
+        self.assertEqual(snap.playlist, ("v1", "v2"))
+        self.assertEqual(snap.current_video_id, "v1")
+        self.assertEqual(snap.version, 1)
+
+        # Snapshot is frozen
+        with self.assertRaises(FrozenInstanceError):
+            snap.version = 2  # type: ignore
+
+        # Mutating through StateOwner advances version, snapshot unchanged
+        owner.apply(SetVolumeEvent(volume=80))
+        self.assertEqual(owner.volume, 80)
+        self.assertEqual(owner.version, 2)
+        self.assertEqual(snap.volume, 100)
+        self.assertEqual(snap.version, 1)
+
+    def test_backward_compatibility_properties(self):
+        """Verify backward-compatibility properties current_theme and theme on SessionState and StateOwner."""
+        state = SessionState(lane="cl")
+        self.assertEqual(state.lane, "cl")
+        self.assertEqual(state.current_theme, "cl")
+        self.assertEqual(state.theme, "cl")
+        self.assertEqual(state.state, PlayState.STOPPED)
+
+        owner = StateOwner(state)
+        self.assertEqual(owner.lane, "cl")
+        self.assertEqual(owner.current_theme, "cl")
+        self.assertEqual(owner.theme, "cl")
+        self.assertEqual(owner.state, PlayState.STOPPED)
+
+    def test_zero_field_assignments_outside_session_state(self):
+        """Mechanical check: zero assignments to the 11 session state attributes outside session_state.py."""
+        import ast
+        import os
+
+        lib_dir = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "resources", "lib")
+        )
+        forbidden = {
+            "playlist",
+            "current_index",
+            "current_video_id",
+            "list_id",
+            "position",
+            "duration",
+            "play_state",
+            "lane",
+            "volume",
+            "cpn",
+            "version",
+        }
+        violations = []
+        for root, _, files in os.walk(lib_dir):
+            for file in files:
+                if not file.endswith(".py") or file == "session_state.py":
+                    continue
+                path = os.path.join(root, file)
+                with open(path, "r", encoding="utf-8") as f:
+                    tree = ast.parse(f.read(), filename=path)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                        for target in targets:
+                            if isinstance(target, ast.Attribute) and target.attr in forbidden:
+                                violations.append(f"{path}:{target.lineno} assigned to attribute '{target.attr}'")
+        self.assertEqual(violations, [], f"Found forbidden field assignments: {violations}")
 
 
 if __name__ == "__main__":

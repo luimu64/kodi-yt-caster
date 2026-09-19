@@ -232,6 +232,10 @@ class KodiPlayerBridge:
                     pass
         return max(0, int(self.owner.duration))
 
+    def snapshot(self) -> SessionState:
+        """Return an immutable detached SessionState snapshot from the owner."""
+        return self.owner.snapshot()
+
     def get_duration(self) -> int:
         """Return total duration in seconds, querying Kodi player if unknown."""
         return self.current_duration

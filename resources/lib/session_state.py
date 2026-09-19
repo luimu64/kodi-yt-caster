@@ -64,6 +64,18 @@ class SessionState:
         """
         return copy.deepcopy(self)
 
+    @property
+    def current_theme(self) -> Optional[str]:
+        return self.lane
+
+    @property
+    def theme(self) -> Optional[str]:
+        return self.lane
+
+    @property
+    def state(self) -> int:
+        return self.play_state
+
 
 # =====================================================================
 # Event Vocabulary (First-Class Values)
@@ -131,7 +143,14 @@ class ResumeEvent(Event):
 @dataclass(frozen=True)
 class SeekToEvent(Event):
     seconds: float = 0.0
+    position: Optional[float] = None
     source: str = "phone"
+
+    def __post_init__(self):
+        if self.position is not None:
+            object.__setattr__(self, "seconds", float(self.position))
+        else:
+            object.__setattr__(self, "position", float(self.seconds))
 
 
 @dataclass(frozen=True)
@@ -846,6 +865,10 @@ class StateOwner:
                 pass
         return new_state
 
+    def snapshot(self) -> SessionState:
+        """Return an immutable detached copy of the current state."""
+        return self._state.snapshot()
+
     # --- canonical read-only accessors (the 9 facts + version) ---
     @property
     def playlist(self) -> Tuple[str, ...]:
@@ -895,3 +918,11 @@ class StateOwner:
     @property
     def state(self) -> int:
         return self._state.play_state
+
+    @property
+    def current_theme(self) -> Optional[str]:
+        return self._state.lane
+
+    @property
+    def theme(self) -> Optional[str]:
+        return self._state.lane
