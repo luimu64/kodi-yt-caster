@@ -67,24 +67,44 @@ def test_sync_current_from_kodi_refresh_dispatches_duration():
         s.wait_until(lambda: "v1" in (s.playing_file() or ""), what="v1 playing")
         s.lounge.clear_reports()
 
-        # Simulate Kodi playing next queue track via plugin url
-        xbmc.MEDIA["plugin://plugin.service.ytlounge-cast/?play=v2"] = {"duration": 180.0}
-        xbmc.Player().play("plugin://plugin.service.ytlounge-cast/?play=v2")
-        s.wait_until(lambda: "v2" in (s.playing_file() or ""), what="v2 playing")
+        # The phone has to be told the duration WHEN IT BECOMES KNOWN, and the
+        # publisher keys that onStateChange on a 0 -> >0 transition
+        # (session.py: should_emit_state_change). v1 and v2 both resolve to 180,
+        # so unless a publish carrying duration 0 goes out first there is no
+        # transition to emit: whether this test passes then depends on whether
+        # _refresh beats the publisher's tick — machine-speed dependent (it
+        # failed on CI while passing locally on the same tree). Hold the v2
+        # resolve long enough to make the transition deterministic.
+        orig_resolve = ytdlp_bridge.YtDlpBridge.resolve
 
-        # Background _refresh should resolve v2 (duration 180) and dispatch reports
-        np = s.lounge.wait_for_report(
-            "nowPlaying",
-            lambda r: r.get("videoId") == "v2" and r.get("duration") == "180",
-            timeout=5.0,
-        )
-        assert np, f"nowPlaying for v2 with duration 180 must be dispatched: {s.lounge.reports()}"
-        sc = s.lounge.wait_for_report(
-            "onStateChange",
-            lambda r: r.get("duration") == "180",
-            timeout=5.0,
-        )
-        assert sc, f"onStateChange with duration 180 must be dispatched: {s.lounge.reports()}"
+        def _slow_v2_resolve(self, video_id):
+            res = orig_resolve(self, video_id)
+            if video_id == "v2":
+                time.sleep(1.5)
+            return res
+
+        ytdlp_bridge.YtDlpBridge.resolve = _slow_v2_resolve
+        try:
+            # Simulate Kodi playing next queue track via plugin url
+            xbmc.MEDIA["plugin://plugin.service.ytlounge-cast/?play=v2"] = {"duration": 180.0}
+            xbmc.Player().play("plugin://plugin.service.ytlounge-cast/?play=v2")
+            s.wait_until(lambda: "v2" in (s.playing_file() or ""), what="v2 playing")
+
+            # Background _refresh should resolve v2 (duration 180) and dispatch reports
+            np = s.lounge.wait_for_report(
+                "nowPlaying",
+                lambda r: r.get("videoId") == "v2" and r.get("duration") == "180",
+                timeout=8.0,
+            )
+            assert np, f"nowPlaying for v2 with duration 180 must be dispatched: {s.lounge.reports()}"
+            sc = s.lounge.wait_for_report(
+                "onStateChange",
+                lambda r: r.get("duration") == "180",
+                timeout=8.0,
+            )
+            assert sc, f"onStateChange with duration 180 must be dispatched: {s.lounge.reports()}"
+        finally:
+            ytdlp_bridge.YtDlpBridge.resolve = orig_resolve
 
 
 def main():
