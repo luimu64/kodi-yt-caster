@@ -1531,21 +1531,25 @@ def test_music_window_repair_never_re_arms_itself():
         def executebuiltin(self, cmd):
             builtins.append(cmd)
 
-    armed = []
     orig_kodi, orig_xbmc = pb.KODI_AVAILABLE, pb.xbmc
-    orig_activate = player._activate_visualizer
     pb.KODI_AVAILABLE = True
     pb.xbmc = _FakeXbmc()
-    player._activate_visualizer = lambda *a, **k: armed.append(1)
     try:
-        player._music_window_until = 0.0
+        # Armed with 5s left: the tick must assert but leave the deadline ALONE.
+        # Renewing it here is what made the bound permanent on the device.
+        deadline = time.monotonic() + 5.0
+        player._music_window_until = deadline
         player._project_music_window()
         assert builtins == ["ActivateWindow(12006)"], builtins
+        assert player._music_window_until == deadline, (
+            "projection tick must not renew the repair deadline "
+            f"({deadline} -> {player._music_window_until})")
+        # And it must never arm an unarmed repair either.
+        player._music_window_until = 0.0
+        player._project_music_window()
         assert player._music_window_until == 0.0, "projection tick must not arm the repair"
-        assert not armed, "_project_music_window must not call _activate_visualizer"
     finally:
         pb.KODI_AVAILABLE, pb.xbmc = orig_kodi, orig_xbmc
-        player._activate_visualizer = orig_activate
         session.close()
 
 
@@ -1574,7 +1578,7 @@ def test_music_window_dismissal_yields_the_gui():
     pb, player, fake, session, orig = _music_window_fixture()
     try:
         player._music_window_until = time.monotonic() + 30.0
-        player._lane_switch_at = 0.0
+        player._video_window_seen_at = 0.0
         player._viz_was_active = True
         fake.viz = False
         step = player._music_window_step()
@@ -1585,18 +1589,25 @@ def test_music_window_dismissal_yields_the_gui():
         session.close()
 
 
-def test_music_window_lane_switch_pop_is_repaired_not_yielded():
-    """Inside the video->music grace a disappearance is Kodi's own late pop:
-    re-assert it, never read it as user input."""
+def test_music_window_disappearance_during_video_mode_is_not_a_dismissal():
+    """While the player still reports video mode (Kodi's own video window, or a
+    lingering outgoing video player) a disappearing music window is Kodi's
+    teardown and must be re-asserted, never read as user input."""
     pb, player, fake, session, orig = _music_window_fixture()
     try:
+        class _VideoPlayer:
+            def isPlayingVideo(self):
+                return True
+            def isPlayingAudio(self):
+                return False
+        player._kodi_player = _VideoPlayer()
         player._music_window_until = time.monotonic() + 30.0
-        player._lane_switch_at = time.monotonic()
+        player._video_window_seen_at = 0.0
         player._viz_was_active = True
         fake.viz = False
         step = player._music_window_step()
         assert step == "assert", step
-        assert player._music_window_until > 0.0
+        assert player._music_window_until > 0.0, "Kodi's teardown must not disarm the repair"
     finally:
         pb.KODI_AVAILABLE, pb.xbmc = orig
         session.close()
@@ -1670,6 +1681,6 @@ if __name__ == "__main__":
     test_audio_normalization_spawns_without_preexec()
     test_music_window_repair_never_re_arms_itself()
     test_music_window_dismissal_yields_the_gui()
-    test_music_window_lane_switch_pop_is_repaired_not_yielded()
+    test_music_window_disappearance_during_video_mode_is_not_a_dismissal()
     test_music_window_hold_idle_and_handoff_arm()
     print("All unit tests passed successfully.")
