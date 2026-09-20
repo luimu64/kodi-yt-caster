@@ -11,43 +11,56 @@ against a fake Kodi API and a mock Lounge server with a scripted phone — for
 the subsystem under test it is the closest thing to "actually works" that can
 run offline and deterministically.
 
-## Test scope: run targeted, not the whole suite
+## Test scope: targeted tests + real hardware
 
 **Run the targeted tests for what you changed — that is what backs a commit.**
-Name the scenarios that cover your subsystem and run them directly:
+Name the checks that cover your subsystem and run them directly:
 
 ```bash
 python3 test_addon.py                                  # fast unit checks: always
-python3 emulator/scenarios/test_remote_control.py      # + the scenarios your change touches
-python3 emulator/scenarios/test_user_navigation_during_music.py
-python3 emulator/scenarios/test_lane_switch_windows.py
+python3 emulator/scenarios/test_user_navigation_during_music.py   # only when debugging that subsystem
 ```
 
 Every scenario file is a plain script (`python3 <file>`; the harness lives in
-`emulator/scenarios/harness.py`) and runs its own `test_*` functions, so a
-two-scenario run is seconds-to-a-minute against the ten-minute full suite.
+`emulator/scenarios/harness.py`) and runs its own `test_*` functions.
 
-**Run the whole suite only before a version bump** (`emulator/run_all.py`) —
-its job is finding bugs *you were not looking for*, across subsystems you did
-not name:
+**`emulator/run_all.py` is BANNED outside an actual debugging session.** Do not
+run the whole-suite sweep for a regular code change, and do not run it "before a
+version bump" — a change is verified with targeted tests plus the real device,
+full stop. The sweep exists for exactly one purpose: hunting a bug you cannot
+localise (cross-subsystem, only-reproduces-on-device, "something regressed and I
+do not know what"). When you do run it, say why in the commit message or the
+handoff.
 
-```bash
-python3 emulator/run_all.py   # pre-release sweep, exit 0 or you don't bump
-```
+**Regular code changes are verified on the real hardware and/or by targeted
+tests.** The target device (LibreELEC / Kodi 21) is the only place a
+GUI / window / lane / playback change is actually proven: deploy the built
+addon, restart Kodi, drive the real repro, and read the device log for the
+fix's own lines. A green offline suite has never caught the device-only failures
+this repo has shipped — window fights, codec selection, STAT stalls.
 
-Do not burn the full suite on every commit or iteration; do not skip it at
-release time. CI runs both gates on every push
-(`.github/workflows/release.yml`), so a red cross-cutting scenario still gets
-caught.
+CI still runs both gates on every push (`.github/workflows/release.yml`). Treat
+a red sweep there as a signal to go debug, not as your per-change gate.
 
 ## When you fix a bug
 
-Add or extend a scenario that fails before the fix and passes after
-(`emulator/scenarios/test_*.py`, discovered automatically by `run_all.py`).
-A bug fixed without a regression scenario is not fixed. Assertions are
-state-based with deadlines (`harness.wait_until`), never thread-ordering.
-Demonstrate it both ways: the scenario failing on the pre-fix tree (stash the
-fix, or `git checkout` the file) and passing after — that is the proof.
+Prove it both ways, with the cheapest tool that can actually observe the bug:
+
+1. **Targeted test** — add or extend a unit check (`test_addon.py`) or the
+   specific scenario covering that subsystem, and show it FAILING on the
+   pre-fix tree (`git stash push <fix-file>`, run, `git stash pop`) and
+   PASSING after. A test that cannot be made to fail is documentation, not a
+   guard.
+2. **Real hardware** — deploy to the device, drive the real repro, then read
+   the log for the fix's own evidence (the line that must now be absent, or
+   present). For anything touching the GUI, windows, lanes or the player this
+   step is mandatory: the emulator's Kodi is a model, and device-only bugs hide
+   in the difference between the model and the box.
+
+The emulator is a **debugging instrument**, not a per-change gate. Reach for it
+when a device repro is ambiguous and you need a deterministic harness, or to
+bisect a cross-subsystem regression. Do not add a scenario for every fix, and
+never substitute an emulator scenario for the hardware check.
 
 ## Workspace discipline (kanban workers)
 

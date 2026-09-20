@@ -99,6 +99,15 @@ PRELOAD_PROXY_ENABLED = False
 # device-reported "menus won't open while music plays".
 MUSIC_WINDOW_ENGAGE_SECONDS = 30.0
 
+# Kodi pops the music window back to the GUI ITSELF ~9-12s after a VIDEO->AUDIO
+# lane switch (PlaybackCleanup of the outgoing video player). Inside this grace
+# period a disappearing visualisation window is therefore Kodi's own pop and has
+# to be re-asserted; outside it, a window that was up and is now gone is the
+# USER (Back on 12006) and the receiver yields the GUI for the rest of the
+# track. Without that distinction the repair fights the person holding the
+# remote.
+MUSIC_WINDOW_POP_GRACE_SECONDS = 13.0
+
 try:
     import xbmc
     import xbmcgui
@@ -184,6 +193,13 @@ class KodiPlayerBridge:
         # after the music lane is entered — long enough to outlive the cleanup,
         # short enough that the GUI is the user's again afterwards.
         self._music_window_until: float = 0.0
+        # Monotonic time of the video->music lane switch that armed the current
+        # repair (0.0 when the music lane was already projected). Used only to
+        # exclude Kodi's own late window pop from dismissal detection.
+        self._lane_switch_at: float = 0.0
+        # Was the visualisation window up at the previous projection tick? A
+        # True -> False transition is how the user's Back on 12006 is detected.
+        self._viz_was_active = False
         # Lane whose GUI window was last asserted. The window is projected on a
         # change of lane, never on a version bump (see apply_projection).
         self._projected_lane: Optional[str] = None
@@ -313,18 +329,27 @@ class KodiPlayerBridge:
             if snapshot.play_state == PlayerState.PLAYING:
                 if is_music_lane:
                     if self._projected_lane != "m":
-                        self._projected_lane = "m"
                         # The music lane is entered: arm the bounded repair. This
                         # is the arm that covers items Kodi starts by itself
                         # (auto-advance, GUI queue pick) — they come with no
-                        # window request from anyone.
+                        # window request from anyone. Only a video->music switch
+                        # gets the late-pop grace.
+                        self._lane_switch_at = (time.monotonic()
+                                                if self._projected_lane == "v" else 0.0)
+                        self._projected_lane = "m"
                         self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
-                    if time.monotonic() < self._music_window_until:
+                    step = self._music_window_step()
+                    if step == "yield":
+                        logger.info("Visualisation window dismissed by the user — "
+                                    "GUI is the user's for this track")
+                    elif step == "assert":
                         self._project_music_window()
                 else:
                     self._projected_lane = "v"
                     # A video owns the screen: stop re-asserting the music window.
                     self._music_window_until = 0.0
+                    self._lane_switch_at = 0.0
+                    self._viz_was_active = False
                     self._project_video_window()
 
     def _reconcile_playlist(self, playlist, snapshot: SessionState) -> None:
@@ -388,6 +413,29 @@ class KodiPlayerBridge:
                     playlist.remove(url)
                     playlist.add(url, _make_item(vid, label), idx)
 
+    def _music_window_step(self) -> str:
+        """One decision step for the bounded music-window repair.
+
+        Returns "idle" (no repair armed), "hold" (window up), "assert" (it is
+        gone — re-assert it) or "yield" (the USER dismissed it: disarm for the
+        rest of this track). Shared by the 2s projection tick and the retry
+        worker so the rule lives in exactly one place.
+        """
+        active = self._visualisation_is_active()
+        if not self._music_window_until:
+            self._viz_was_active = active
+            return "idle"
+        # A window that was up and is now gone is the user pressing Back on
+        # 12006 — EXCEPT inside the lane-switch grace, where Kodi pops the
+        # window itself (PlaybackCleanup of the outgoing video player).
+        dismissed = (self._viz_was_active and not active
+                     and time.monotonic() >= self._lane_switch_at + MUSIC_WINDOW_POP_GRACE_SECONDS)
+        self._viz_was_active = active
+        if dismissed:
+            self._music_window_until = 0.0
+            return "yield"
+        return "hold" if active else "assert"
+
     def _project_music_window(self) -> None:
         """Project music visualization window (12006)."""
         if not (KODI_AVAILABLE and xbmc):
@@ -397,7 +445,11 @@ class KodiPlayerBridge:
                 xbmc.executebuiltin("ActivateWindow(12006)")
             except Exception:
                 pass
-        self._activate_visualizer()
+        # NEVER arm from here. _activate_visualizer() resets the deadline, and
+        # this runs from the 2s projection tick — arming here renewed the bound
+        # forever, so Back on 12006 was reverted within a tick for the whole
+        # track (device-reported: "cannot leave the player"). Only a real play
+        # handoff arms the repair.
 
     def _project_video_window(self) -> None:
         """Project fullscreen video window (12005)."""
@@ -1229,12 +1281,15 @@ class KodiPlayerBridge:
         # across Kodi's late cleanup. Every caller here is such a handoff (a
         # music play, or a music item re-opened on the audio lane).
         self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
+        self._lane_switch_at = (time.monotonic()
+                                if self._projected_lane == "v" else 0.0)
         if self._viz_inflight:
             return
         self._viz_inflight = True
 
         def _run() -> None:
             prefetched = False
+            misses = 0
             try:
                 while (time.monotonic() < self._music_window_until
                        and not self._monitor_stop.is_set()):
@@ -1243,15 +1298,31 @@ class KodiPlayerBridge:
                             break
                         if self._kodi_player and (self._kodi_player.isPlayingAudio()
                                                   or self._music_lane_playing()):
-                            if not self._visualisation_is_active():
+                            step = self._music_window_step()
+                            if step == "yield":
+                                logger.info("Visualisation window dismissed by the user — "
+                                            "GUI is the user's for this track")
+                                break
+                            if step == "assert":
                                 xbmc.executebuiltin("ActivateWindow(12006)")
-                            if self._visualisation_is_active():
+                                # Kodi switches windows asynchronously: judge the
+                                # activation a beat later, never immediately (the
+                                # immediate check logged a failure ~27ms BEFORE
+                                # Kodi's own activation line — a false negative).
+                                time.sleep(0.4)
+                                if self._visualisation_is_active():
+                                    misses = 0
+                                else:
+                                    misses += 1
+                                    if misses == 3:
+                                        logger.info("ActivateWindow(12006) did not take after "
+                                                    "%d attempts (window not active)", misses)
+                            elif step == "hold":
+                                misses = 0
                                 if not prefetched:
                                     logger.info("Visualisation window active")
                                     self._kick_prefetch()
                                     prefetched = True
-                            else:
-                                logger.info("ActivateWindow(12006) did not take (modal dialog?) — retrying")
                         time.sleep(0.5)
                     except Exception:
                         break

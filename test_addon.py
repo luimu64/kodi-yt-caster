@@ -1511,6 +1511,116 @@ def test_audio_normalization_spawns_without_preexec():
     assert stderr is not None and "I: -14.0 LUFS" in stderr
 
 
+def test_music_window_repair_never_re_arms_itself():
+    """The 2s projection tick must NOT renew the music-window deadline.
+
+    Device regression ("cannot leave the player"): _project_music_window() called
+    _activate_visualizer(), which resets the deadline — so the bound never
+    expired while music played and Back on 12006 was reverted within a tick for
+    the whole track.
+    """
+    import resources.lib.player_bridge as pb
+
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session, resolver=VideoResolver(bridge=MockYtDlpBridge()))
+    builtins = []
+
+    class _FakeXbmc:
+        def getCondVisibility(self, cond):
+            return False                      # visualisation window is not up
+        def executebuiltin(self, cmd):
+            builtins.append(cmd)
+
+    armed = []
+    orig_kodi, orig_xbmc = pb.KODI_AVAILABLE, pb.xbmc
+    orig_activate = player._activate_visualizer
+    pb.KODI_AVAILABLE = True
+    pb.xbmc = _FakeXbmc()
+    player._activate_visualizer = lambda *a, **k: armed.append(1)
+    try:
+        player._music_window_until = 0.0
+        player._project_music_window()
+        assert builtins == ["ActivateWindow(12006)"], builtins
+        assert player._music_window_until == 0.0, "projection tick must not arm the repair"
+        assert not armed, "_project_music_window must not call _activate_visualizer"
+    finally:
+        pb.KODI_AVAILABLE, pb.xbmc = orig_kodi, orig_xbmc
+        player._activate_visualizer = orig_activate
+        session.close()
+
+
+def _music_window_fixture():
+    """A real bridge + a fake xbmc whose visualisation-window state we control."""
+    import resources.lib.player_bridge as pb
+
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session, resolver=VideoResolver(bridge=MockYtDlpBridge()))
+
+    class _FakeXbmc:
+        viz = False
+        def getCondVisibility(self, cond):
+            return self.viz if "visualisation" in cond else False
+
+    fake = _FakeXbmc()
+    orig = (pb.KODI_AVAILABLE, pb.xbmc)
+    pb.KODI_AVAILABLE = True
+    pb.xbmc = fake
+    return pb, player, fake, session, orig
+
+
+def test_music_window_dismissal_yields_the_gui():
+    """Window was up, is now gone, past the lane-switch grace -> the user pressed
+    Back: the repair disarms instead of dragging them back."""
+    pb, player, fake, session, orig = _music_window_fixture()
+    try:
+        player._music_window_until = time.monotonic() + 30.0
+        player._lane_switch_at = 0.0
+        player._viz_was_active = True
+        fake.viz = False
+        step = player._music_window_step()
+        assert step == "yield", step
+        assert player._music_window_until == 0.0, "the repair must disarm on dismissal"
+    finally:
+        pb.KODI_AVAILABLE, pb.xbmc = orig
+        session.close()
+
+
+def test_music_window_lane_switch_pop_is_repaired_not_yielded():
+    """Inside the video->music grace a disappearance is Kodi's own late pop:
+    re-assert it, never read it as user input."""
+    pb, player, fake, session, orig = _music_window_fixture()
+    try:
+        player._music_window_until = time.monotonic() + 30.0
+        player._lane_switch_at = time.monotonic()
+        player._viz_was_active = True
+        fake.viz = False
+        step = player._music_window_step()
+        assert step == "assert", step
+        assert player._music_window_until > 0.0
+    finally:
+        pb.KODI_AVAILABLE, pb.xbmc = orig
+        session.close()
+
+
+def test_music_window_hold_idle_and_handoff_arm():
+    """idle/hold states, and: only a real play handoff arms the repair."""
+    pb, player, fake, session, orig = _music_window_fixture()
+    try:
+        player._music_window_until = 0.0
+        fake.viz = True
+        assert player._music_window_step() == "idle"
+        player._music_window_until = time.monotonic() + 30.0
+        assert player._music_window_step() == "hold"
+        # _viz_inflight keeps the worker spawn out of this unit test.
+        player._music_window_until = 0.0
+        player._viz_inflight = True
+        player._activate_visualizer()
+        assert player._music_window_until > time.monotonic(), "a handoff must arm the repair"
+    finally:
+        pb.KODI_AVAILABLE, pb.xbmc = orig
+        session.close()
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_frame_parsing_chunked()
@@ -1558,4 +1668,8 @@ if __name__ == "__main__":
     test_handoff_pending_gate()
     test_audio_normalization_hold_check_is_fault_tolerant()
     test_audio_normalization_spawns_without_preexec()
+    test_music_window_repair_never_re_arms_itself()
+    test_music_window_dismissal_yields_the_gui()
+    test_music_window_lane_switch_pop_is_repaired_not_yielded()
+    test_music_window_hold_idle_and_handoff_arm()
     print("All unit tests passed successfully.")
