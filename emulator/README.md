@@ -6,9 +6,13 @@ a mock YouTube Lounge backend, plus a fake casting **phone** that drives the
 receiver through the real wire protocol.
 
 ```bash
-python3 emulator/run_all.py            # all scenarios
+python3 emulator/run_all.py            # all scenarios (pre-release sweep — see AGENTS.md)
 python3 emulator/scenarios/test_cast_basic.py   # one suite directly
 ```
+
+Run the scenarios that cover what you changed while iterating and for a commit;
+keep `run_all.py` for a version bump, where its job is finding bugs nobody was
+looking for.
 
 ## What it is
 

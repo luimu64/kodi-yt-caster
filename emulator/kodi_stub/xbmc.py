@@ -26,6 +26,10 @@ DEFAULT_RATE = 1.0
 WINDOW_HOME = 10000
 WINDOW_FULLSCREEN_VIDEO = 12005
 WINDOW_VISUALISATION = 12006
+# The music playlist view (MyMusicPlaylist.xml). Only used by scenarios that
+# model the user browsing: to the receiver every window other than the
+# visualisation one looks the same.
+WINDOW_MUSIC_PLAYLIST = 10500
 
 # Device-verified Kodi quirk: on LibreELEC 12 / Kodi 21.3 the service process
 # receives NO xbmc.Player callbacks at all (not even the first cast's Started).
@@ -169,6 +173,19 @@ def _active_window():
 
 def window_is_active(win):
     return _windows.active == win
+
+
+def user_opens_window(win):
+    """Model the USER navigating to a window (home, playlist, settings, ...).
+
+    Same history rule as ``ActivateWindow``, but this is user input: whatever
+    the receiver asserts afterwards is a fight with the person holding the
+    remote. Scenarios use it to hold the receiver to the rule that the GUI
+    belongs to the user — the receiver cannot tell this from one of Kodi's own
+    window pops, so it must simply stop asserting outside its bounded repair
+    window.
+    """
+    _windows.activate(win)
 
 
 def getCondVisibility(cond):

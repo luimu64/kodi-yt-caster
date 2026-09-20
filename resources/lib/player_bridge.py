@@ -83,12 +83,20 @@ PLAY_GATE = PlayGate()
 # OFF on purpose — see the comment at its use site in _play_video_locked.
 PRELOAD_PROXY_ENABLED = False
 
-# How long after a music-queue item change the monitor loop keeps re-asserting
-# the music (visualisation) window. Sized from device behaviour: Kodi's
+# How long after a music-queue item change the receiver keeps re-asserting the
+# music (visualisation) window. Sized from device behaviour: Kodi's
 # PlaybackCleanup for the outgoing video popped the window back to the GUI
 # ~9-12s after the next item had already started, so the window has to be
-# re-asserted across that window; after it the loop stops, so a deliberate GUI
-# browse is not fought.
+# re-asserted across that window; after it the receiver stops, so a deliberate
+# GUI browse is not fought.
+#
+# THIS DEADLINE IS THE WHOLE REPAIR. It is armed only when a play is handed to
+# Kodi on the music lane and when the music lane is entered (see
+# _activate_visualizer / apply_projection); a clock tick must never arm it.
+# The snapshot's version bumps on every 2s position poll, so re-asserting the
+# window on every version asserted it FOREVER: every window the user opened
+# while music played (home, playlist) was closed again within a tick — the
+# device-reported "menus won't open while music plays".
 MUSIC_WINDOW_ENGAGE_SECONDS = 30.0
 
 try:
@@ -166,8 +174,20 @@ class KodiPlayerBridge:
         # work is held back. A starved server makes Kodi's STAT time out and
         # defers OnPlayBackStopped/PlaybackCleanup with it.
         self._transition_until: float = 0.0
-        self._viz_inflight = False
+        # Music-window engagement window (monotonic deadline). Kodi starts the
+        # tracks that follow a music video itself (its own playlist advance
+        # through our plugin) and cleans the windows up LATE: the outgoing video
+        # player is still closing when the next item is already playing, and
+        # PlaybackCleanup pops the window back to the GUI ~9-12s in
+        # (device-verified in kodi.log). A single activation therefore races that
+        # cleanup and loses, so the window is re-asserted for a bounded window
+        # after the music lane is entered — long enough to outlive the cleanup,
+        # short enough that the GUI is the user's again afterwards.
         self._music_window_until: float = 0.0
+        # Lane whose GUI window was last asserted. The window is projected on a
+        # change of lane, never on a version bump (see apply_projection).
+        self._projected_lane: Optional[str] = None
+        self._viz_inflight = False
         # Item identity taken from Kodi's info label is adopted only after TWO
         # consecutive ticks agree: the label lags a play handoff by ~2s in both
         # directions (device log 2026-09-20), so a single differing reading is
@@ -287,11 +307,30 @@ class KodiPlayerBridge:
                 except Exception as exc:
                     logger.debug("Music lane check error: %s", exc)
 
-            # 3. Reconcile active GUI windows (12005 vs 12006)
+            # 3. Reconcile active GUI windows (12005 vs 12006) — on a change of
+            #    LANE, never on a version bump. The version bumps on every 2s
+            #    position poll, so projecting the window on every version
+            #    re-asserted 12006 forever and closed whatever the user opened
+            #    while music played (device-reported: "prevents opening the main
+            #    menu and any other menu like playlist whenever music is
+            #    playing"). Inside the engagement window Kodi's own late window
+            #    pop is repaired (see MUSIC_WINDOW_ENGAGE_SECONDS); outside it
+            #    the GUI belongs to the user.
             if snapshot.play_state == PlayerState.PLAYING:
                 if is_music_lane:
-                    self._project_music_window()
+                    if self._projected_lane != "m":
+                        self._projected_lane = "m"
+                        # The music lane is entered: arm the bounded repair. This
+                        # is the arm that covers items Kodi starts by itself
+                        # (auto-advance, GUI queue pick) — they come with no
+                        # window request from anyone.
+                        self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
+                    if time.monotonic() < self._music_window_until:
+                        self._project_music_window()
                 else:
+                    self._projected_lane = "v"
+                    # A video owns the screen: stop re-asserting the music window.
+                    self._music_window_until = 0.0
                     self._project_video_window()
 
     def _reconcile_playlist(self, playlist, snapshot: SessionState) -> None:
@@ -1208,15 +1247,25 @@ class KodiPlayerBridge:
     def _activate_visualizer(self) -> None:
         """Route the GUI to the music/visualisation window (12006).
 
-        ActivateWindow is REFUSED while a modal dialog is up — and Kodi shows
-        its Busy dialog exactly during playback start, which is when this runs.
-        Spawns a bounded retry worker that retries window activation until the
-        dialog dismisses and the window sticks.
+        Arms the bounded engagement window and then re-asserts the window until
+        it sticks: ActivateWindow is REFUSED while a modal dialog is up — and
+        Kodi shows its Busy dialog exactly during playback start, which is when
+        this runs — and Kodi pops the window back to the GUI late (9-12s after a
+        video→audio switch, see MUSIC_WINDOW_ENGAGE_SECONDS).
+
+        The worker stops at the engagement deadline. It never runs beyond it:
+        after that the GUI is the user's, and re-asserting 12006 there is what
+        closed their menus while music played.
         """
-        if not (KODI_AVAILABLE and xbmc) or self._viz_inflight:
+        if not (KODI_AVAILABLE and xbmc):
+            return
+        # A play is being handed to Kodi on the music lane: hold the window
+        # across Kodi's late cleanup. Every caller here is such a handoff (a
+        # music play, or a music item re-opened on the audio lane).
+        self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
+        if self._viz_inflight:
             return
         self._viz_inflight = True
-        self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
 
         def _run() -> None:
             prefetched = False
@@ -1275,7 +1324,13 @@ class KodiPlayerBridge:
                 logger.debug("Drift detected: fullscreen video window active while audio playing")
             if (self._music_lane_playing()
                     and not self._visualisation_is_active()):
-                logger.debug("Drift detected: music window not active while music lane playing")
+                if time.monotonic() < self._music_window_until:
+                    logger.debug("Drift detected: music window not active while music lane playing")
+                else:
+                    # Past the engagement window the GUI is the user's: they opened
+                    # something (home, playlist) and that is not drift.
+                    logger.debug("Music window not active while music lane playing — "
+                                 "engagement window closed, GUI assumed user-owned")
         except Exception:
             pass
 

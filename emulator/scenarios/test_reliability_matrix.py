@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reliability matrix — the acceptance gate of docs/STATE-TRANSFER-REFACTOR.md §4.
+"""Reliability matrix — the acceptance gate of the state model (AGENTS.md, R1–R10).
 
 Not "no crash": after every quiescent point the receiver snapshot, the last
 published report set and the simulated player must agree on item, index,
