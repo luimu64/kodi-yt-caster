@@ -382,8 +382,20 @@ def run_service() -> None:
                 client_name = data.get("name", "Phone")
                 log_kodi(f"Device disconnected: {client_name}", 1)
                 PairingDialog("", screen_name).show_notification("YouTube Cast", f"Disconnected from {client_name}")
-                # Cast session ended: drop playback immediately, like a Chromecast does when the sender leaves.
-                player.stop()
+                # A sender's connection dropping is NOT a stop command.
+                # remoteDisconnected fires on every routine blip — the phone
+                # sleeping, a wifi/network change, the app being swiped away —
+                # and carries no intent to end playback. A real Chromecast keeps
+                # playing when its sender leaves; only an explicit stopVideo
+                # ends the session, and the phone can reconnect and drive the
+                # receiver again.
+                #
+                # Stopping here also killed media this session never started:
+                # device log 2026-09-20 19:12:50 shows a phone disconnect
+                # closing the video that was on Kodi's player at that moment,
+                # and the same call stops ANY content (Jellyfin, local files,
+                # another addon) whenever a paired phone drops off.
+                log_kodi("Disconnect is not a stop: leaving playback untouched", 1)
 
             dispatcher.on_remote_connected = on_connected
             dispatcher.on_remote_disconnected = on_disconnected
