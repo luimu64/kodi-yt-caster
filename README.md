@@ -42,6 +42,34 @@ To automatically bundle a `yt-dlp` binary for ARM / Raspberry Pi or x86_64:
 ./build.sh x86_64    # For x86_64 PC
 ```
 
+## Architecture (how cast state stays in sync)
+
+The phone and the TV each hold a model of playback, and every sync bug this addon has had
+was those two models diverging. The addon keeps exactly **one** model and derives everything
+else from it:
+
+```
+ Lounge frames ─┐
+ Kodi signals  ─┼─► SessionState (one owner, versioned) ─► one publisher per channel (cl, m)
+ Resolver      ─┘        ▲
+                         └── Kodi playlist / windows / titles = PROJECTION (never a source)
+```
+
+- `resources/lib/session_state.py` — the single state owner: an immutable, versioned
+  `SessionState` plus a pure, idempotent event reducer. Nothing else may hold or write those
+  facts. Every accepted change logs one line: `state v<N> <event> -> <groups> (<source>)`.
+- `resources/lib/lounge/session.py` — publishes one batch per channel per changed field group
+  when the version changes, with a ≤1 Hz full-snapshot heartbeat as the phone's crash-recovery
+  path. A channel is transport; it is never a second copy of the state.
+- `resources/lib/player_bridge.py` — Kodi is a **projection**: playlist contents, item titles
+  and the active window are reconciled from the snapshot, and the 2 s tick *reconciles* the
+  player against the snapshot (emitting events) instead of writing state itself.
+
+The invariants that keep it that way (R1–R10, including the load-bearing music-window bound)
+are listed in `AGENTS.md`; the design analysis — state transfer in the official Lounge client,
+the measured wire behaviour, and the five structural causes behind the sync bugs — is
+`docs/lounge-state-transfer.pdf`.
+
 ## Protocol Testing (`protolab/`)
 
 The `protolab/` folder contains standalone contract test harnesses verifying the Lounge API and yt-dlp resolver outside Kodi:

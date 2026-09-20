@@ -1,6 +1,7 @@
 """SessionState module: single in-process owner of session state and pure idempotent reducer.
 
-Per design doc /opt/data/misc/lounge-state-sync/lounge-state-transfer.pdf §9 (R1, R3) and §9.2:
+Per the design analysis `docs/lounge-state-transfer.pdf` §9 (R1, R3) and §9.2:
+(the rule invariants themselves are listed in AGENTS.md — R1–R10)
 1. SessionState: immutable data class representing session state.
 2. Snapshot immutability: snapshot() / copy accessors returning detached immutable state.
 3. Explicit event vocabulary as first-class values covering §9.2:
