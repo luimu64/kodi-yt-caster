@@ -460,25 +460,46 @@ def run_service() -> None:
             if enable_discovery:
                 def on_dial_pairing(code: str, theme: str = "") -> None:
                     log_kodi(f"Registering DIAL pairing code: {code} (theme={theme or 'cl'})", 1)
-                    try:
-                        # Register both screens: pairing codes are NOT single-use
-                        # (verified: same code registers twice with 200), and the
-                        # music app sends theme=cl anyway, so routing by theme is
-                        # unreliable. Both registrations let either app join either
-                        # lounge.
-                        register_pairing_code(screen_id, code, screen_name, device_id)
-                        if screen_id_m:
-                            register_pairing_code(screen_id_m, code, screen_name, device_id)
-                        dlg = state.get("pairing_dialog")
-                        if dlg:
-                            try:
-                                dlg.dismiss()
-                            except Exception:
-                                pass
-                            state["pairing_dialog"] = None
-                        PairingDialog(code, screen_name).show_notification("YouTube Cast", "Linked device via Wi-Fi")
-                    except Exception as err:
-                        log_kodi(f"Error registering DIAL pairing code: {err}", 2)
+                    def _async_register() -> None:
+                        try:
+                            # Register screens concurrently in the background so we don't
+                            # block the DIAL HTTP response. Mobile casting clients
+                            # have an aggressive timeout on the DIAL POST (2-3s);
+                            # serialized HTTPS calls to YouTube Lounge API cause
+                            # the client to abort connection on the first attempt.
+                            threads = []
+                            t1 = threading.Thread(
+                                target=register_pairing_code,
+                                args=(screen_id, code, screen_name, device_id),
+                                name="DIALReg-cl",
+                                daemon=True,
+                            )
+                            t1.start()
+                            threads.append(t1)
+                            if screen_id_m:
+                                t2 = threading.Thread(
+                                    target=register_pairing_code,
+                                    args=(screen_id_m, code, screen_name, device_id),
+                                    name="DIALReg-m",
+                                    daemon=True,
+                                )
+                                t2.start()
+                                threads.append(t2)
+                            for t in threads:
+                                t.join(timeout=10.0)
+
+                            dlg = state.get("pairing_dialog")
+                            if dlg:
+                                try:
+                                    dlg.dismiss()
+                                except Exception:
+                                    pass
+                                state["pairing_dialog"] = None
+                            PairingDialog(code, screen_name).show_notification("YouTube Cast", "Linked device via Wi-Fi")
+                        except Exception as err:
+                            log_kodi(f"Error registering DIAL pairing code: {err}", 2)
+
+                    threading.Thread(target=_async_register, name="DIALPairingWorker", daemon=True).start()
 
                 dial_service = DIALService(
                     port=dial_port,

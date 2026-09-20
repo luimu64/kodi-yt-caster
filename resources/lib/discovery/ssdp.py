@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 import socket
 import struct
@@ -15,6 +16,7 @@ logger = logging.getLogger("ytlounge.ssdp")
 SSDP_ADDR = "239.255.255.250"
 SSDP_PORT = 1900
 DIAL_ST = "urn:dial-multiscreen-org:service:dial:1"
+DIAL_DEV_ST = "urn:dial-multiscreen-org:device:dial:1"
 
 
 def get_local_ip(target_ip: str = "8.8.8.8") -> str:
@@ -53,6 +55,8 @@ class SSDPResponder(threading.Thread):
         # the multicast join fails with 'No such device' and discovery stays dead all session.
         # Retry the bind until a real interface appears (max ~5 min), re-resolving the local IP.
         for attempt in range(60):
+            if self._sock is not None:
+                break
             try:
                 self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
                 self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -89,6 +93,8 @@ class SSDPResponder(threading.Thread):
         if current_ip and not current_ip.startswith("127."):
             self.local_ip = current_ip
 
+        last_ip_check = time.monotonic()
+
         while not self._stop_event.is_set():
             try:
                 data, addr = self._sock.recvfrom(2048)
@@ -96,32 +102,46 @@ class SSDPResponder(threading.Thread):
                     continue
 
                 msg = data.decode("utf-8", errors="replace")
-                if "M-SEARCH" not in msg or not (DIAL_ST in msg or "ssdp:all" in msg):
-                    continue
-                # SSDP requires the MAN: header per spec.
-                if 'MAN: "ssdp:discover"' not in msg and "MAN: ssdp:discover" not in msg:
+                if "M-SEARCH" not in msg.upper():
                     continue
 
-                # Re-resolve the advertised IP: a stale address from startup
-                # makes discovery advertise an unreachable device forever.
-                current_ip = get_local_ip()
-                if current_ip != "127.0.0.1":
-                    self.local_ip = current_ip
+                # SSDP requires MAN: "ssdp:discover" (case-insensitive)
+                if not re.search(r'MAN:\s*"?ssdp:discover"?', msg, re.MULTILINE | re.IGNORECASE):
+                    continue
+
+                # Check Search Target ST (matches service ST, device ST, or ssdp:all)
+                m_st = re.search(r"^ST:\s*(.+)$", msg, re.MULTILINE | re.IGNORECASE)
+                st = m_st.group(1).strip() if m_st else ""
+                msg_lower = msg.lower()
+                is_service = DIAL_ST in msg or DIAL_ST.lower() in msg_lower
+                is_device = DIAL_DEV_ST in msg or DIAL_DEV_ST.lower() in msg_lower
+                is_all = "ssdp:all" in msg_lower or "upnp:rootdevice" in msg_lower
+                if not (is_service or is_device or is_all):
+                    continue
+
+                target_st = DIAL_DEV_ST if (is_device and not is_service) else DIAL_ST
+
+                # Periodic IP re-resolution if not non-loopback
+                now = time.monotonic()
+                if self.local_ip == "127.0.0.1" or (now - last_ip_check > 30.0):
+                    last_ip_check = now
+                    current_ip = get_local_ip()
+                    if current_ip != "127.0.0.1":
+                        self.local_ip = current_ip
 
                 # MX handling: wait a random 0..MX seconds so M-SEARCH floods
                 # do not desynchronise clients (SSDP/UPnP requirement).
+                # Cap the random delay to 0.2s so cast discovery responds promptly.
                 mx = 1.0
-                m = re.search(r"^MX:\s*([\d.]+)", msg, re.MULTILINE)
+                m = re.search(r"^MX:\s*([\d.]+)", msg, re.MULTILINE | re.IGNORECASE)
                 if m:
                     try:
                         mx = min(float(m.group(1)), 5.0)
                     except ValueError:
                         pass
                 if mx > 0:
-                    for _ in range(int(mx * 20)):
-                        if self._stop_event.is_set():
-                            return
-                        time.sleep(0.05)
+                    delay = random.uniform(0.01, min(mx, 0.2))
+                    time.sleep(delay)
 
                 response = (
                     "HTTP/1.1 200 OK\r\n"
@@ -130,9 +150,11 @@ class SSDPResponder(threading.Thread):
                     "EXT:\r\n"
                     f"LOCATION: http://{self.local_ip}:{self.dial_port}/ssdp/device-desc.xml\r\n"
                     "SERVER: UPnP/1.0\r\n"
-                    f"ST: {DIAL_ST}\r\n"
-                    f"USN: uuid:{self.device_uuid}::{DIAL_ST}\r\n\r\n"
+                    f"ST: {target_st}\r\n"
+                    f"USN: uuid:{self.device_uuid}::{target_st}\r\n\r\n"
                 ).encode("utf-8")
+                logger.debug("Sending SSDP response to %s", addr)
+                self._sock.sendto(response, addr)
                 logger.debug("Sending SSDP response to %s", addr)
                 self._sock.sendto(response, addr)
             except socket.timeout:

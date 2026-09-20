@@ -109,6 +109,9 @@ class Scenario:
         with open(os.path.join(xbmcaddon.profile_dir(), "bin", "yt-dlp"), "w") as f:
             f.write("#!fake\n")
         os.chmod(os.path.join(xbmcaddon.profile_dir(), "bin", "yt-dlp"), 0o755)
+        with open(os.path.join(xbmcaddon.profile_dir(), "bin", "ffmpeg"), "w") as f:
+            f.write("#!fake\n")
+        os.chmod(os.path.join(xbmcaddon.profile_dir(), "bin", "ffmpeg"), 0o755)
 
         # the two deterministic patches (see module docstring)
         import resources.lib.ytdlp_bridge as ytdlp_bridge
@@ -154,6 +157,16 @@ class Scenario:
                 _orig_pb_init(self, *a, **kw)
                 service._emu_player = self
             pb_mod.KodiPlayerBridge.__init__ = _pb_init
+
+        import resources.lib.discovery.dial_server as dial_mod
+        if not getattr(dial_mod, "_emu_wrapped", False):
+            dial_mod._emu_wrapped = True
+            _orig_dial_init = dial_mod.DIALService.__init__
+
+            def _dial_init(self, *a, **kw):
+                _orig_dial_init(self, *a, **kw)
+                service._emu_dial = self
+            dial_mod.DIALService.__init__ = _dial_init
 
         self.service = service
         _CALLS["resolve"].clear()

@@ -149,7 +149,7 @@ class DIALServer(http.server.ThreadingHTTPServer):
         on_pairing_code: Optional[Callable[[str, str], None]] = None,
     ):
         super().__init__(("0.0.0.0", port), DIALRequestHandler)
-        self.port = port
+        self.port = self.server_address[1]
         self.device_uuid = device_uuid
         self.friendly_name = friendly_name
         self.screen_id = screen_id
