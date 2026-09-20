@@ -340,6 +340,32 @@ def test_hls_master_generation():
     assert "#EXT-X-MEDIA:TYPE=AUDIO" in content
 
 
+def test_hls_master_hides_undecodable_renditions():
+    """A VP9 4K rendition must not reach the master: the ffmpeg HLS demuxer picks
+    the highest-BANDWIDTH variant, so exposing VP9 4K wins the selection on a
+    device that cannot decode it (still frame + audio → growing A/V desync)."""
+    import re
+    import urllib.request
+    from resources.lib.ytdlp_bridge import build_hls_master_manifest
+    formats = [
+        {"format_id": "234", "url": "https://example.com/audio.m3u8", "vcodec": "none",
+         "acodec": "mp4a", "format_note": "English - original"},
+        {"format_id": "312", "url": "https://example.com/1080p.m3u8", "vcodec": "avc1.64002A",
+         "height": 1080, "width": 1920, "fps": 60, "tbr": 6943.9, "resolution": "1920x1080"},
+        {"format_id": "628", "url": "https://example.com/2160p.m3u8", "vcodec": "vp09.00.51.08",
+         "height": 2160, "width": 3840, "fps": 60, "tbr": 42997.5, "resolution": "3840x2160"},
+    ]
+    url = build_hls_master_manifest(formats, "test_vp9")
+    assert url, "master must be built"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        content = resp.read().decode("utf-8")
+    assert "vp09" not in content, "VP9 rendition must be excluded when H.264 exists"
+    variants = re.findall(r"#EXT-X-STREAM-INF:[^\n]*BANDWIDTH=(\d+)[^\n]*CODECS=\"([^\"]+)\"", content)
+    assert variants, content
+    top = max(variants, key=lambda v: int(v[0]))
+    assert top[1].startswith("avc1"), f"highest-bandwidth variant must be H.264: {top}"
+
+
 
 def test_youtube_music_session():
     session_m = LoungeSession("s_music", "token_m", "dev_123", "Kodi Music", theme="m")

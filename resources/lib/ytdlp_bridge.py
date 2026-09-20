@@ -59,13 +59,37 @@ def find_ytdlp_binary(custom_path: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def _codec_family_rank(f: Dict[str, Any]) -> int:
+    """Decodability rank of a rendition's video codec family, best first.
+
+    H.264 (avc1) is hardware-decodable everywhere; HEVC (hvc1/hev1) on Pi-class
+    hardware; VP9/AV1 are software-only there and cannot run realtime at high
+    resolutions.
+    """
+    vcodec = str(f.get("vcodec") or "").lower()
+    for prefix, rank in (("avc1", 3), ("hvc1", 2), ("hev1", 2), ("vp09", 1), ("vp9", 1)):
+        if vcodec.startswith(prefix):
+            return rank
+    return 0  # av01 / unknown
+
+
 def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> Optional[str]:
     """Generate an HLS Master Playlist (m3u8) exposing video resolutions and audio streams.
 
-    Codec filtering: one codec family per resolution (avc1 preferred, vp09 as
-    fallback) so the OSD picker never offers streams a device cannot decode, and
-    resolutions are not duplicated.
+    Codec ceiling: only the best DECODABLE codec family is exposed. This is not
+    cosmetic — the HLS lane here is Kodi's own ffmpeg demuxer (inputstream.adaptive
+    is deliberately not used for these detached-audio masters) and a non-adaptive
+    HLS demuxer honours neither playlist order nor a resolution cap: it selects the
+    variant with the HIGHEST BANDWIDTH in the master. A master that merely listed
+    H.264 first still got its 43 Mbps VP9 2160p60 rendition picked, which a Pi 4
+    cannot hardware-decode (no VP9 in the DRM PRIME decoder) and cannot
+    software-decode realtime — video production falls below realtime, the video
+    cache drains to ~50 ms against the audio's ~300 ms, Kodi logs
+    ``CVideoPlayerAudio::Process - stream stalled`` / ``HandlePlaySpeed - audio
+    stream stalled, triggering re-sync``, holds a still frame, and the picture ends
+    up seconds behind the audio.
     """
+
     hls_video: List[Dict[str, Any]] = []
     hls_audio: List[Dict[str, Any]] = []
 
@@ -83,6 +107,24 @@ def build_hls_master_manifest(formats: List[Dict[str, Any]], video_id: str) -> O
 
     if not hls_video:
         return None
+
+    # Expose ONE codec family: the best decodable one present. The ffmpeg HLS
+    # demuxer picks the highest-BANDWIDTH variant regardless of order, so any
+    # undecodable-but-higher-bitrate rendition in the master (VP9 4K @ 43 Mbps on
+    # a YouTube master whose AVC ladder tops out at 1080p) wins the selection and
+    # the device plays a stream it cannot keep up with.
+    best_rank = max(_codec_family_rank(v) for v in hls_video)
+    chosen = [v for v in hls_video if _codec_family_rank(v) == best_rank]
+    if len(chosen) != len(hls_video):
+        logger.info(
+            "HLS master %s: exposing %d %s rendition(s), dropped %d renditions of a "
+            "lower-decodability codec family (%s)",
+            video_id, len(chosen),
+            ", ".join(sorted({str(v.get("vcodec") or "?") for v in chosen})),
+            len(hls_video) - len(chosen),
+            ", ".join(sorted({str(v.get("vcodec") or "?") for v in hls_video if v not in chosen})),
+        )
+    hls_video = chosen
 
     # One codec family per resolution: prefer H.264 (universally decodable),
     # fall back to VP9, then anything else.
