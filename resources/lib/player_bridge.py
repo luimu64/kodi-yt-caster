@@ -167,6 +167,13 @@ class KodiPlayerBridge:
         # defers OnPlayBackStopped/PlaybackCleanup with it.
         self._transition_until: float = 0.0
         self._viz_inflight = False
+        self._music_window_until: float = 0.0
+        # Item identity taken from Kodi's info label is adopted only after TWO
+        # consecutive ticks agree: the label lags a play handoff by ~2s in both
+        # directions (device log 2026-09-20), so a single differing reading is
+        # not evidence of a Kodi-side advance.
+        self._adopt_candidate: Optional[str] = None
+        self._adopt_candidate_hits = 0
         # Last item re-opened because Kodi started it in the video player's mode.
         self._lane_repaired_id: Optional[str] = None
 
@@ -531,14 +538,26 @@ class KodiPlayerBridge:
                 self.owner.apply(SignalUnknownEvent(source="player-clock"))
             return
 
-        # 2. Item differs -> adopt the player's item through the reducer, then
-        #    fall through: the newly adopted item's clock is folded in this
-        #    same tick, exactly as the pre-R8 watchdog loop did.
+        # 2. Item differs -> adopt the player's item through the reducer, but
+        #    only once two consecutive ticks agree (hysteresis, same rule the
+        #    pause stall detector uses). The label lags a handoff in both
+        #    directions, so one differing reading proves nothing.
         if kodi_vid != self.current_video_id:
-            logger.info(
-                "reconcile: snapshot=%s player=%s -> event=kodiAdvanced",
-                self.current_video_id, kodi_vid)
-            self._sync_current_from_kodi(playing_url)
+            if kodi_vid == self._adopt_candidate:
+                self._adopt_candidate_hits += 1
+            else:
+                self._adopt_candidate = kodi_vid
+                self._adopt_candidate_hits = 1
+            if self._adopt_candidate_hits >= 2:
+                logger.info(
+                    "reconcile: snapshot=%s player=%s -> event=kodiAdvanced",
+                    self.current_video_id, kodi_vid)
+                self._adopt_candidate = None
+                self._adopt_candidate_hits = 0
+                self._sync_current_from_kodi(playing_url)
+        else:
+            self._adopt_candidate = None
+            self._adopt_candidate_hits = 0
 
         # 3. Play state: broken signals (getCondVisibility returns False while
         #    paused) mean we cannot assert PLAYING from the live player alone.
@@ -1136,6 +1155,22 @@ class KodiPlayerBridge:
         except Exception:
             return False
 
+    def _visualisation_block_reason(self) -> str:
+        """Observed reason the visualisation window is not up (never a guess)."""
+        try:
+            if xbmc.getCondVisibility("Window.IsModalDialog"):
+                return "modal dialog up"
+        except Exception:
+            pass
+        try:
+            if self._fullscreen_video_window_active():
+                return "fullscreen video window owns the screen"
+            if self._kodi_player and self._kodi_player.isPlayingVideo():
+                return "player is in video mode for this item"
+        except Exception:
+            pass
+        return "window not active after ActivateWindow"
+
     @staticmethod
     def _fullscreen_video_window_active() -> bool:
         try:
@@ -1181,17 +1216,27 @@ class KodiPlayerBridge:
         if not (KODI_AVAILABLE and xbmc) or self._viz_inflight:
             return
         self._viz_inflight = True
+        self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
 
         def _run() -> None:
-            deadline = time.monotonic() + 15.0
             prefetched = False
+            armed = False
+            last_reason = None
             try:
-                while time.monotonic() < deadline and not self._monitor_stop.is_set():
+                while (time.monotonic() < self._music_window_until
+                       and not self._monitor_stop.is_set()):
                     try:
-                        if (self.owner.lane or "") != "m" or self.owner.play_state != PlayerState.PLAYING:
+                        if ((self.owner.lane or "") != "m"
+                                or self.owner.play_state != PlayerState.PLAYING):
                             break
                         if self._kodi_player and (self._kodi_player.isPlayingAudio()
                                                   or self._music_lane_playing()):
+                            if not armed:
+                                # The lane can take seconds to come up; time
+                                # spent waiting must not consume the budget.
+                                self._music_window_until = (
+                                    time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS)
+                                armed = True
                             if not self._visualisation_is_active():
                                 xbmc.executebuiltin("ActivateWindow(12006)")
                             if self._visualisation_is_active():
@@ -1199,13 +1244,21 @@ class KodiPlayerBridge:
                                     logger.info("Visualisation window active")
                                     self._kick_prefetch()
                                     prefetched = True
+                                last_reason = None
                             else:
-                                logger.info("ActivateWindow(12006) did not take (modal dialog?) — retrying")
+                                reason = self._visualisation_block_reason()
+                                if reason != last_reason:
+                                    logger.info(
+                                        "ActivateWindow(12006) did not take (%s) — retrying",
+                                        reason)
+                                    last_reason = reason
                         time.sleep(0.5)
                     except Exception:
                         break
                 if not self._visualisation_is_active():
-                    logger.warning("Visualisation window never became active")
+                    logger.info("Music window engagement window closed (%.0fs) without the "
+                                "window up; last reason: %s",
+                                MUSIC_WINDOW_ENGAGE_SECONDS, last_reason or "none observed")
             finally:
                 self._viz_inflight = False
 
@@ -1449,6 +1502,17 @@ class KodiPlayerBridge:
             return False
         if not vid or vid == self.current_video_id:
             return False
+        # An in-flight play request owns the identity: adopting the outgoing
+        # item here bumps _play_gen and silently cancels the phone's cast
+        # (4/4 observed drops had this exact adoption in front of them).
+        with self._lock:
+            if (self._requested_id is not None
+                    and self._requested_id != vid
+                    and self._active_gen != self._play_gen):
+                logger.debug(
+                    "adoption of %s suppressed: play request for %s is in flight",
+                    vid, self._requested_id)
+                return False
         logger.info("Queue pick via Kodi UI: %s -> %s", self.current_video_id, vid)
         with self._lock:
             self._requested_id = vid

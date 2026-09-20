@@ -172,6 +172,8 @@ def window_is_active(win):
 
 
 def getCondVisibility(cond):
+    if cond == "Window.IsModalDialog":
+        return modal_dialog_active()
     if cond == "Player.Paused":
         return bool(_engine and _engine.paused)
     if cond == "Window.IsActive(visualisation)":

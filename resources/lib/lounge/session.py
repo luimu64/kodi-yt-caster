@@ -346,7 +346,6 @@ class LoungeSession:
                 up_next = self._build_up_next(snapshot)
                 if up_next is not None:
                     heartbeat_actions.append(("autoplayUpNext", up_next))
-            heartbeat_actions.append(("onAdStateChange", self._build_ad_state()))
             heartbeat_actions.append(("onVolumeChanged", self._build_volume(snapshot)))
 
             action_names = [a[0] for a in heartbeat_actions]

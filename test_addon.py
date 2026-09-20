@@ -634,7 +634,7 @@ def test_r7_heartbeat_emits_full_snapshot():
     names = sorted(sc for sc, _ in posted)
     # R10: the crash-recovery heartbeat carries the full vocabulary we know.
     assert names == sorted(["nowPlaying", "nowPlayingPlaylist", "autoplayUpNext",
-                            "onAdStateChange", "onVolumeChanged"]), posted
+                            "onVolumeChanged"]), posted
     assert all(hb is True for _, hb in posted), posted
     # "<= 1 Hz" means no more than one heartbeat per second: period >= 1s.
     assert session._heartbeat_interval >= 1.0, session._heartbeat_interval
@@ -858,7 +858,8 @@ def test_r8_reconcile_emits_one_corrective_event_for_a_drift():
     pb.xbmc = _FakeXbmc("plugin://plugin.service.ytlounge-cast/?play=c")
     try:
         before = owner.version
-        player._reconcile_tick()
+        player._reconcile_tick()  # tick 1: candidate observed (hysteresis)
+        player._reconcile_tick()  # tick 2: candidate confirmed -> adopted
         # The item drift produces one kodiAdvanced adoption; the clock fold that
         # follows is a separate, legitimate observation. What matters (R8):
         # the adopted item is published with a re-derived index and the stored
@@ -1190,11 +1191,11 @@ def test_track_change_watchdog_adopts_on_kodi_native_advance():
             pass
 
         orig_time_sleep = pb.time.sleep
-        first = [True]
+        passes = [2]  # Hysteresis requires two agreeing reconcile ticks
 
         def sleeper(_s):
-            if first[0]:
-                first[0] = False
+            if passes[0] > 0:
+                passes[0] -= 1
                 return
             raise OnePass()
 
@@ -1485,6 +1486,25 @@ def test_audio_normalization_spawns_without_preexec():
     assert stderr is not None and "I: -14.0 LUFS" in stderr
 
 
+def test_cpn_regenerates_on_item_change():
+    from resources.lib.session_state import (
+        SessionState, SetPlaylistEvent, PlayEvent, StateOwner)
+    owner = StateOwner(SessionState())
+    owner.apply(SetPlaylistEvent(video_id="AAAAAAAAAAA", video_ids=("AAAAAAAAAAA",),
+                                 list_id="L1", current_time=0, source="phone"))
+    assert owner.snapshot().cpn == "cpn_AAAAAAAAAAA"
+
+    owner.apply(SetPlaylistEvent(video_id="BBBBBBBBBBB",
+                                 video_ids=("AAAAAAAAAAA", "BBBBBBBBBBB"),
+                                 list_id="L1", current_time=0, source="phone"))
+    assert owner.snapshot().cpn == "cpn_BBBBBBBBBBB", \
+        f"stale cpn after item change: {owner.snapshot().cpn}"
+
+    # Same item, no cpn on the event: the nonce must be preserved.
+    owner.apply(PlayEvent(video_id="BBBBBBBBBBB", source="phone"))
+    assert owner.snapshot().cpn == "cpn_BBBBBBBBBBB"
+
+
 if __name__ == "__main__":
     test_frame_parsing()
     test_frame_parsing_chunked()
@@ -1526,6 +1546,7 @@ if __name__ == "__main__":
     test_audio_normalization_gain_math()
     test_audio_normalization_artifact_paths()
     test_audio_normalization_range_parsing()
+    test_cpn_regenerates_on_item_change()
     test_audio_normalization_master_retarget()
     test_audio_normalization_never_blocks_resolve()
     test_audio_normalization_disabled_is_inert()

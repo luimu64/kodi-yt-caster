@@ -111,6 +111,18 @@ def test_get_now_playing_resends_shared_state():
                         for r in _reports_for(s, "cl")[before_cl:]),
             what="getNowPlaying ack carries shared item")
 
+def test_no_ad_state_in_heartbeat():
+    """Finding 4: idle heartbeats must not spam onAdStateChange reports."""
+    import time
+    with Scenario() as s:
+        s.phone.set_playlist("v1", ["v1"], current_time=0)
+        s.wait_until(lambda: "v1" in (s.playing_file() or ""), what="v1 plays")
+        s.lounge.clear_reports()
+        time.sleep(4.0)  # idle: only heartbeats run
+        hb_ads = s.lounge.reports("onAdStateChange")
+        assert not hb_ads, f"ad state re-sent on the heartbeat: {len(hb_ads)}"
+
+
 def main():
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

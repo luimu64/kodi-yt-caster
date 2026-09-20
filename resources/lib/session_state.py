@@ -397,7 +397,15 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             return state
 
         # When explicitly casting a new playlist or re-initiating playback, assign CPN
-        new_cpn = event.cpn or (state.cpn if state.cpn != "kodi" else "cpn_" + (new_vid or "cast"))
+        # A new item gets a new CPN: the previous item's nonce must never ride
+        # along on a report about a different video (device log 2026-09-20:
+        # 41/94 onStateChange reports carried the previous video's cpn).
+        if event.cpn:
+            new_cpn = event.cpn
+        elif new_vid and new_vid != state.current_video_id:
+            new_cpn = "cpn_" + new_vid
+        else:
+            new_cpn = state.cpn if state.cpn != "kodi" else "cpn_" + (new_vid or "cast")
 
         new_state = SessionState(
             playlist=new_playlist,
@@ -459,7 +467,12 @@ def reduce(state: SessionState, event: Event) -> SessionState:
         ):
             return state
 
-        new_cpn = event.cpn or (state.cpn if state.cpn != "kodi" else ("cpn_" + (new_vid or "play")))
+        if event.cpn:
+            new_cpn = event.cpn
+        elif new_vid and new_vid != state.current_video_id:
+            new_cpn = "cpn_" + new_vid
+        else:
+            new_cpn = state.cpn if state.cpn != "kodi" else ("cpn_" + (new_vid or "play"))
 
         new_state = SessionState(
             playlist=new_playlist,
