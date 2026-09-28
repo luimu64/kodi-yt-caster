@@ -54,8 +54,14 @@ def request(
     except urllib.error.HTTPError as e:
         status = e.code
         body = e.read().decode("utf-8", errors="replace")
-        if status in (400, 404) and ("lounge_token" in body or "token" in body):
+        # 401 is the server's rejection of an expired/revoked lounge token —
+        # exactly the class the caller must treat as "refresh the token", not
+        # as transient network trouble. (Device: both sessions 401-looping on
+        # handshake while the stored tokens had expired two days earlier.)
+        if status in (400, 401, 404) and ("lounge_token" in body or "token" in body):
             raise LoungeTokenExpiredError(f"Token rejected (HTTP {status}): {body}") from e
+        if status == 401:
+            raise LoungeTokenExpiredError(f"Unauthorized (HTTP 401) on {endpoint}") from e
         raise LoungeError(f"HTTP {status} on {endpoint}: {body}") from e
     except Exception as e:
         raise LoungeError(f"Network error on {endpoint}: {e}") from e

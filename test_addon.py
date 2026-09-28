@@ -931,6 +931,64 @@ def test_r8_vanished_player_is_a_corrective_stop():
         pb.KODI_AVAILABLE = orig_kodi
         session.close()
 
+def test_token_expiry_401_is_classified_as_expiry():
+    """HTTP 401 on the handshake is a token expiry, not 'transient trouble'.
+
+    Device 2026-09-28: both stored lounge tokens had expired (14-day lifespan),
+    the handshake answered 401, and the listener retried it forever with backoff
+    because 401 fell through to a generic LoungeError — so the refresh path never
+    ran and neither YouTube app could connect at all.
+    """
+    import urllib.error
+    import resources.lib.lounge.session as sess_mod
+    from resources.lib.lounge.client import (
+        LoungeError, LoungeTokenExpiredError, request as client_request,
+    )
+
+    url = f"{BASE_URL}/bc/bind"
+
+    def _raise(code, body=b'{"error": "unauthorized"}'):
+        def _f(*_a, **_kw):
+            raise urllib.error.HTTPError(url, code, "x", {}, None)
+        return _f
+
+    session = LoungeSession("s1", "t1", "d1")
+    orig = sess_mod.urllib.request.urlopen
+    try:
+        sess_mod.urllib.request.urlopen = _raise(401)
+        try:
+            session.handshake()
+        except LoungeTokenExpiredError:
+            pass
+        else:
+            raise AssertionError("handshake 401 must raise LoungeTokenExpiredError")
+
+        sess_mod.urllib.request.urlopen = _raise(500)
+        try:
+            session.handshake()
+        except LoungeTokenExpiredError:
+            raise AssertionError("HTTP 500 is not a token expiry")
+        except LoungeError:
+            pass
+    finally:
+        sess_mod.urllib.request.urlopen = orig
+        session.close()
+
+    # ...and the shared client maps 401 the same way (report/pairing paths).
+    import resources.lib.lounge.client as client_mod
+    orig_req = client_mod.urllib.request.urlopen
+    client_mod.urllib.request.urlopen = _raise(401, b"nope")
+    try:
+        try:
+            client_request("pairing/get_lounge_token_batch")
+        except LoungeTokenExpiredError:
+            pass
+        else:
+            raise AssertionError("client 401 must raise LoungeTokenExpiredError")
+    finally:
+        client_mod.urllib.request.urlopen = orig_req
+
+
 def test_r6_unknown_published_when_item_fact_has_no_source():
     """R6: with an alive player but no item at all, the item fact is genuinely
     unknown and UNKNOWN is publishable (state=-1), never a guess."""
@@ -1683,6 +1741,7 @@ if __name__ == "__main__":
     test_r8_reconcile_emits_one_corrective_event_for_a_drift()
     test_r8_vanished_player_is_a_corrective_stop()
     test_r6_unknown_published_when_item_fact_has_no_source()
+    test_token_expiry_401_is_classified_as_expiry()
     test_r10_vocabulary_declared_and_coverage_logged()
     test_r10_up_next_emitted_when_known_omitted_when_not()
     test_duration_reporting_and_fallback()

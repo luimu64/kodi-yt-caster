@@ -169,7 +169,12 @@ class LoungeSession:
             with urllib.request.urlopen(req, timeout=30.0) as resp:
                 body = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
-            if e.code in (400, 404):
+            # 401 == the server rejects the lounge token (expired 14-day token or
+            # revoked screen). It MUST surface as a token expiry: classifying it
+            # as a generic error made the listener retry the same dead token
+            # forever with backoff, so the refresh path never ran and neither
+            # YouTube app could connect at all.
+            if e.code in (400, 401, 404):
                 raise LoungeTokenExpiredError(f"Session token invalid: HTTP {e.code}") from e
             raise LoungeError(f"Handshake failed: HTTP {e.code}") from e
         except Exception as e:

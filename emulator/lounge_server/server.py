@@ -61,6 +61,7 @@ class MockLoungeServer:
         self.base_url = f"http://127.0.0.1:{self.port}/api/lounge"
         self._screen_counter = [0]
         self._sid_counter = [0]
+        self._token_serial = [0]
         self._lock = threading.Lock()
         self.sessions = {}          # sid -> _Session
         self.reported_screens = set()
@@ -70,6 +71,7 @@ class MockLoungeServer:
         self.tokens = {}            # screen_id -> token
         self.expire_next_bind = threading.Event()   # 400 "token" once
         self.bad_screen_ids = set()
+        self.unauthorized_tokens = set()            # token -> 401 on bind
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True, name="MockLounge")
 
@@ -206,13 +208,26 @@ def _make_handler(server: MockLoungeServer):
 
             if path.endswith("/pairing/get_lounge_token_batch"):
                 screens = form.get("screen_ids", "")
+                if any(s in server.bad_screen_ids for s in screens.split("|") if s):
+                    # A revoked screen cannot be refreshed in place — the real
+                    # server rejects the batch call too, which is what forces the
+                    # receiver onto its new-screen/re-pair path.
+                    self._send(400, json.dumps({"error": "invalid lounge_token"}),
+                               "application/json")
+                    return
                 out = []
                 for sid in screens.split("|"):
                     if not sid:
                         continue
-                    token = f"tok-{sid}"
+                    # Real tokens are REISSUED with a new value + expiry on every
+                    # batch call (that is the refresh endpoint). Rotating here is
+                    # what lets a test tell "refreshed in place" from "not
+                    # refreshed at all".
                     with server._lock:
+                        server._token_serial[0] += 1
+                        token = f"tok-{sid}-{server._token_serial[0]}"
                         server.tokens[sid] = token
+                    server.PAIRING_CALLS.append(("get_lounge_token_batch", dict(form)))
                     out.append({"loungeToken": token, "expiration": int(time.time() * 1000) + 7 * 86400_000})
                 self._send_json(200, {"screens": out})
                 return
@@ -244,6 +259,10 @@ def _make_handler(server: MockLoungeServer):
             expire_now = server.expire_next_bind.is_set()
             if expire_now:
                 server.expire_next_bind.clear()
+            if token and token in server.unauthorized_tokens:
+                # Real-server shape for an expired/revoked lounge token.
+                self._send(401, json.dumps({"error": "unauthorized"}), "application/json")
+                return
             if expire_now or screen in server.bad_screen_ids:
                 if screen is not None:
                     server.bad_screen_ids.discard(screen)

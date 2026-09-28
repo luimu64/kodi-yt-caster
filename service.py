@@ -237,6 +237,35 @@ def run_service() -> None:
                                  name="YtDlpPrewarm", daemon=True).start()
 
             session_data = store.load()
+
+            # Proactive token refresh. The lounge token has a 14-day lifespan;
+            # once it lapses the handshake answers 401 and nothing can connect
+            # until it is refreshed (device: two days of 401-looping, no cast
+            # possible). Refresh IN PLACE for the same screen id, which keeps the
+            # phone's existing pairing — no TV code needed.
+            now_ms = time.time() * 1000
+            for sid_key, tok_key, exp_key, label in (
+                ("screen_id", "lounge_token", "expiration", "YouTube"),
+                ("screen_id_m", "lounge_token_m", "expiration_m", "YouTube Music"),
+            ):
+                sid = session_data.get(sid_key)
+                tok = session_data.get(tok_key)
+                exp = session_data.get(exp_key) or 0
+                if not sid or not tok:
+                    continue
+                if exp and exp - now_ms > 3_600_000:
+                    continue
+                try:
+                    new_tok, new_exp = get_lounge_token_batch(sid)
+                    if new_tok:
+                        session_data[tok_key] = new_tok
+                        session_data[exp_key] = new_exp
+                        store.save(session_data)
+                        log_kodi(f"{label} lounge token refreshed in place "
+                                 f"(screen {sid}, pairing preserved)", 1)
+                except Exception as ex:
+                    log_kodi(f"{label} token refresh failed: {ex}", 2)
+
             # Ensure valid screen_id and lounge_token for YouTube video
             screen_id = session_data.get("screen_id")
             lounge_token = session_data.get("lounge_token")
@@ -418,15 +447,35 @@ def run_service() -> None:
             def make_token_expired(sess: LoungeSession):
                 """Build a per-session token refresh handler.
 
-                Each session refreshes only its OWN registration; the other session's
-                pairing (and the rest of the store) is preserved via merge, and the
-                listener keeps running afterwards.
+                The lounge token has a 14-day lifespan. Refresh it IN PLACE for
+                the SAME screen id first: that keeps the phone's existing pairing
+                (a new screen id orphans the TV entry in the YouTube app and
+                forces a fresh TV-code pairing). Only fall back to a brand-new
+                screen + pairing dialog when the in-place refresh itself fails
+                (screen revoked, or the refreshed token is still rejected).
+
+                Each session refreshes only its OWN registration; the other
+                session's pairing (and the rest of the store) is preserved via
+                merge, and the listener keeps running afterwards.
                 """
                 def _handler() -> None:
                     log_kodi(f"Token expired for theme={sess.theme}, refreshing registration...", 1)
                     try:
-                        new_sid = generate_screen_id()
-                        new_tok, exp = get_lounge_token_batch(new_sid)
+                        refreshed = False
+                        try:
+                            new_tok, exp = get_lounge_token_batch(sess.screen_id)
+                            if new_tok and new_tok != sess.lounge_token:
+                                refreshed = True
+                        except Exception as ex:
+                            log_kodi(f"In-place token refresh failed for theme={sess.theme}: {ex}; "
+                                     "falling back to a new screen", 2)
+                            new_tok, exp = "", 0
+
+                        new_sid = sess.screen_id
+                        if not refreshed:
+                            new_sid = generate_screen_id()
+                            new_tok, exp = get_lounge_token_batch(new_sid)
+
                         with store_lock:
                             data = store.load()
                             if sess.theme == "cl":
@@ -443,7 +492,10 @@ def run_service() -> None:
                         sess.sid = None
                         sess.gsessionid = None
                         sess.last_code = -1
-                        if sess.theme == "cl":
+                        if refreshed:
+                            log_kodi(f"Token refreshed in place for theme={sess.theme} "
+                                     f"(screen {new_sid} kept — pairing preserved)", 1)
+                        if not refreshed and sess.theme == "cl":
                             new_code = get_pairing_code(new_sid, new_tok, screen_name)
                             dlg = state.get("pairing_dialog")
                             if dlg:
