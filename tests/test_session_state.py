@@ -491,6 +491,41 @@ class TestProjectionRuleR4(unittest.TestCase):
         from resources.lib.player_bridge import KodiPlayerBridge
         self.session = LoungeSession("test_screen", "token", "lounge_token")
         self.bridge = KodiPlayerBridge(session=self.session)
+        # Fixtures must OWN the player: the projection only runs while media the
+        # addon itself started is on the player (a bare snapshot is no longer
+        # enough — the receiver used to project a stale session's GUI over
+        # whatever the user was actually watching). Playing our plugin URL here
+        # is what a music-lane handoff leaves behind.
+        import xbmc
+        xbmc.Player().play("plugin://plugin.service.ytlounge-cast/?play=fixture", None)
+
+    def test_apply_projection_skipped_while_foreign_media_plays(self):
+        """Another addon's movie: zero window builtins, zero playlist rewrites."""
+        import xbmc
+        xbmc.BUILTIN.clear()
+        xbmc.Player().play("http://192.168.1.10:8096/Videos/abc/stream", None)
+        pl = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+        pl.clear()
+        self.bridge._kodi_queue_mode = True
+        state = SessionState(playlist=("s1", "s2"), current_video_id="s1",
+                             play_state=PlayState.PLAYING, lane="m", version=7)
+        self.bridge.apply_projection(state)
+        self.assertEqual(xbmc.BUILTIN, [], "no window builtin over foreign media")
+        self.assertEqual(pl.size(), 0, "Kodi's playlist must not be rewritten")
+        self.assertIsNone(self.bridge._last_projected_version,
+                          "a skipped projection must not be marked as done")
+
+    def test_transport_commands_refused_while_foreign_media_plays(self):
+        """pause/resume/stop/seek never touch media the addon did not start."""
+        import xbmc
+        xbmc.Player().play("http://192.168.1.10:8096/Videos/abc/stream", None)
+        self.bridge.owner.apply(SetPlaylistEvent(video_id="s1", theme="m"))
+        self.bridge.pause()
+        self.bridge.stop()
+        self.bridge.seek_to(30.0)
+        self.bridge.resume()
+        self.assertEqual(xbmc._engine.url, "http://192.168.1.10:8096/Videos/abc/stream")
+        self.assertFalse(xbmc._engine.paused, "foreign playback must not be paused")
 
     def test_state_owner_on_apply_synchronous_hook(self):
         """Verify StateOwner invokes on_apply synchronously on each reduction."""

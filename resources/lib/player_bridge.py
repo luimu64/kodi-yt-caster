@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -18,6 +19,22 @@ from .session_state import (
 from . import preloader
 
 logger = logging.getLogger("ytlounge.player")
+
+
+# The addon's own plugin URL prefix: every music-queue item Kodi plays for us
+# carries it, so the playing file identifies our own playback.
+OUR_PLUGIN_PREFIX = "plugin://plugin.service.ytlounge-cast/"
+
+
+def _url_origin(url: str) -> str:
+    """``scheme://host[:port]`` of a URL ('' when unparseable).
+
+    Used to recognise the addon's own localhost manifest origin on the playing
+    file (the video lane plays ``http://127.0.0.1:<port>/yt_<id>.m3u8``), which
+    a foreign item — a Jellyfin/local-library movie — can never share.
+    """
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://[^/]+)", url or "")
+    return m.group(1) if m else ""
 
 
 class PlayGate:
@@ -172,6 +189,16 @@ class KodiPlayerBridge:
         # URLs): Kodi auto-advances natively, so _on_playback_ended must NOT
         # spawn its own play for the next item there (restart-from-0 race).
         self._kodi_queue_mode = False
+        # The URL this addon last handed to Kodi for its own item, plus the
+        # origins it served from. Ownership of the player is decided from these:
+        # while another addon's media is playing (a movie from Jellyfin, the
+        # local library), this receiver must be inert — no window builtins, no
+        # playlist rewriting, no pause inference from a foreign clock, no
+        # transport commands pointed at it.
+        self._owned_url: Optional[str] = None
+        self._owned_origins: set = set()
+        # Consecutive reconcile ticks that saw foreign media on the player.
+        self._foreign_polls = 0
         self._monitor_stop = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         # Time-stall pause detection: getCondVisibility("Player.Paused") is
@@ -280,10 +307,20 @@ class KodiPlayerBridge:
         with self._lock:
             if snapshot.version == self._last_projected_version:
                 return
-            self._last_projected_version = snapshot.version
 
             if not (KODI_AVAILABLE and xbmc):
                 return
+
+            # Inert unless the player holds media THIS addon started (or a cast
+            # handoff is in flight). A stale persisted session used to keep
+            # projecting — rewriting Kodi's music playlist from an old queue and
+            # asserting the visualisation window over whatever the user was
+            # actually watching. Nothing here may touch the GUI or the playlist
+            # of media the addon does not own.
+            if not self._owns_player():
+                return
+
+            self._last_projected_version = snapshot.version
 
             # 1. Reconcile playlist contents, ordering, and pre-cached titles
             #    Kodi's music playlist is a projection of the snapshot queue. A
@@ -462,8 +499,14 @@ class KodiPlayerBridge:
             # Kodi's own video state, which ends when the video player/window is
             # gone. A tick with no video window in the picture never extends the
             # repair (that is what made Back impossible).
-            self._music_window_until = max(self._music_window_until,
-                                           time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS)
+            #
+            # It may only EXTEND an armed repair, never arm one: max() against a
+            # zeroed bound returned ``now + ENGAGE``, so a tick with a video on
+            # screen (the user's own movie) started a 30s music-window repair
+            # from nothing and pushed 12006 over the film.
+            if self._music_window_until:
+                self._music_window_until = max(self._music_window_until,
+                                               time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS)
         if not self._music_window_until:
             self._viz_was_active = active
             return "idle"
@@ -652,14 +695,42 @@ class KodiPlayerBridge:
                     "reconcile: snapshot=playing(%s) player=stopped -> event=playbackStopped",
                     self.current_video_id)
                 self._on_playback_stopped()
+            self._foreign_polls = 0
             return
 
+        if not self._owns_player():
+            # Either Kodi is playing media this addon did not start (a movie
+            # from another addon, a local file), or the player is alive with an
+            # unreadable item URL. In both cases the receiver is INERT: it must
+            # not read that clock, project a window over it, rewrite the
+            # playlist, or point transport commands at it.
+            if not playing_url:
+                # Alive player, no readable item URL. A momentary label gap is
+                # not a reason to contradict the phone (that would flap); the
+                # stored item stays authoritative until the label is readable
+                # again. Only when we have NO item at all is the item fact
+                # genuinely unknown. (R6: unknown is publishable, a guess is not.)
+                if self.state == PlayerState.PLAYING and not self.current_video_id:
+                    logger.info(
+                        "reconcile: snapshot=playing(no item) player=alive/unidentified"
+                        " -> event=signalUnknown")
+                    self.owner.apply(SignalUnknownEvent(source="player-clock"))
+                return
+            # Readable and not ours: foreign media. Only when the same reading
+            # repeats do we retire our stale item — a label that lags a handoff
+            # is not evidence.
+            self._foreign_polls += 1
+            if self._foreign_polls == 2:
+                logger.info(
+                    "reconcile: player holds media this addon did not start (%s)"
+                    " -> event=playbackStopped (receiver passive)", playing_url)
+                self._on_playback_stopped()
+            return
+        self._foreign_polls = 0
+
         if not kodi_vid:
-            # Alive player, no readable plugin URL. A momentary label gap is not
-            # a reason to contradict the phone (that would flap); the stored
-            # item stays authoritative until the label is readable again. Only
-            # when we have NO item at all is the item fact genuinely unknown.
-            # (R6: unknown is publishable, a guess is not.)
+            # Ours, but with no video id in the URL: the video lane plays the
+            # localhost master manifest, so the stored item is authoritative.
             if self.state == PlayerState.PLAYING and not self.current_video_id:
                 logger.info(
                     "reconcile: snapshot=playing(no item) player=alive/unidentified"
@@ -724,6 +795,15 @@ class KodiPlayerBridge:
         zero-advance polls (hysteresis against demuxer hiccups).
         """
         if not (KODI_AVAILABLE and self._kodi_player) or not self.current_video_id:
+            self._last_poll_time = None
+            self._stall_polls = 0
+            return
+        if not self._owns_player():
+            # Never infer pause/resume from media we did not start: a stale
+            # session's item made this read the CURRENT (foreign) player's clock,
+            # so a movie's buffering or OSD stall was published as a pause of an
+            # old cast — and every one of those events bumped the snapshot
+            # version, which is what drove the window projection over the film.
             self._last_poll_time = None
             self._stall_polls = 0
             return
@@ -1035,6 +1115,12 @@ class KodiPlayerBridge:
                 # top of the GUI while the audio plays underneath.
                 self._stop_video_player_for_audio()
 
+            # Ownership marker: the URL this addon hands Kodi is what later
+            # identifies the player as ours (see _owns_player). Without it the
+            # receiver cannot tell its own video-lane playback — the localhost
+            # master manifest — from a movie another addon started.
+            self._remember_owned_url(playable_url)
+
             list_item = xbmcgui.ListItem(info.get("title", "YouTube Video"))
             if audio_mode:
                 list_item.setInfo("music", {
@@ -1122,6 +1208,9 @@ class KodiPlayerBridge:
             for vid in self.playlist or [video_id]:
                 playlist.add(f"plugin://plugin.service.ytlounge-cast/?play={vid}", _item(vid))
             kodi_player = self._kodi_player if self._kodi_player is not None else (xbmc.Player() if xbmc else None)
+            # The music lane plays OUR plugin URLs; that prefix is the ownership
+            # marker for every item Kodi auto-advances through by itself.
+            self._remember_owned_url(f"{OUR_PLUGIN_PREFIX}?play={video_id}")
             if kodi_player:
                 kodi_player.play(playlist, list_item, False, position)
             self._activate_visualizer()
@@ -1291,6 +1380,91 @@ class KodiPlayerBridge:
         except Exception:
             return False
 
+    def _playing_label(self) -> str:
+        """The URL of the item Kodi's player currently holds ('' if unknown).
+
+        ``Player.FileNameAndPath`` is the only API that carries the URL the
+        player was HANDED (a plugin URL or our localhost master), rather than
+        the final resolved media URL.
+        """
+        if not (KODI_AVAILABLE and xbmc):
+            return ""
+        try:
+            return str(xbmc.getInfoLabel("Player.FileNameAndPath") or "")
+        except Exception:
+            return ""
+
+    def _owns_media_url(self, url: str) -> bool:
+        """True when ``url`` is media this addon put on the player ourselves.
+
+        Ours: our plugin URL (every music-queue item), the URL we handed over,
+        and the loopback manifest origin we serve the video lane from. Anything
+        else — a Jellyfin stream, a local file, another addon's plugin — is
+        foreign.
+        """
+        if not url:
+            return False
+        if url.startswith(OUR_PLUGIN_PREFIX):
+            return True
+        if url == self._owned_url:
+            return True
+        origin = _url_origin(url)
+        return bool(origin) and origin in self._owned_origins
+
+    def _remember_owned_url(self, url: str) -> None:
+        """Record a URL handed to Kodi as ours, with its (loopback) origin.
+
+        The origin matters for lane switches: the label still shows the
+        outgoing item's URL for a beat after the new one starts, so "ours"
+        cannot be a single current URL.
+        """
+        if not url:
+            return
+        self._owned_url = url
+        origin = _url_origin(url)
+        if origin and ("127.0.0.1" in origin or "localhost" in origin):
+            self._owned_origins.add(origin)
+
+    def _play_inflight(self) -> bool:
+        """A cast play request is enqueued but not yet handed to the player."""
+        return self._requested_id is not None and self._active_gen != self._play_gen
+
+    def _owns_player(self) -> bool:
+        """True only while the player holds media THIS addon started.
+
+        Everything reactive is gated on this: the GUI/window projection, the
+        music-playlist reconciliation, the pause-stall inference and the
+        transport commands. Without it the receiver acted on whatever Kodi was
+        playing — a stale persisted session made it read a Jellyfin movie's
+        clock and assert the visualisation window over the film (device log:
+        a movie started at 12:54:19, ``ActivateWindow(12006)`` came 2s later and
+        tore VideoFullScreen.xml down).
+        """
+        if self._play_inflight():
+            return True
+        return self._owns_media_url(self._playing_label())
+
+    def _foreign_playback_active(self) -> bool:
+        """Kodi is playing media this addon did not start.
+
+        Deliberately conservative: an unreadable label is not evidence of
+        foreign media (Kodi's label lags a handoff), so only a readable,
+        non-ours URL on a live player counts.
+        """
+        if not (KODI_AVAILABLE and self._kodi_player):
+            return False
+        if self._play_inflight():
+            return False
+        try:
+            if not self._kodi_player.isPlaying():
+                return False
+        except Exception:
+            return False
+        url = self._playing_label()
+        if not url:
+            return False
+        return not self._owns_media_url(url)
+
     def _music_lane_playing(self) -> bool:
         """True when the playing item is one of OUR music-queue items.
 
@@ -1350,6 +1524,11 @@ class KodiPlayerBridge:
                        and not self._monitor_stop.is_set()):
                     try:
                         if (self.owner.lane or "") != "m" or self.owner.play_state != PlayerState.PLAYING:
+                            break
+                        if not self._owns_player():
+                            # The GUI repair is for OUR music lane only. A stale
+                            # session must never drive the visualiser over
+                            # whatever else is on screen.
                             break
                         if self._kodi_player and (self._kodi_player.isPlayingAudio()
                                                   or self._music_lane_playing()):
@@ -1453,6 +1632,18 @@ class KodiPlayerBridge:
                 pass
         return False
 
+    def _refuse_when_foreign(self, what: str) -> bool:
+        """Transport commands never touch media the addon did not start.
+
+        A connected phone (or a stale session's item) must not be able to pause,
+        resume, seek or STOP whatever the user is watching — the same class as
+        the sender-disconnect bug that killed playback.
+        """
+        if self._foreign_playback_active():
+            logger.info("%s ignored: player holds media this addon did not start", what)
+            return True
+        return False
+
     def pause(self) -> None:
         # Nothing loaded (stopped/never started) -> pausing is a no-op. A
         # fire-and-forget pause applied here would claim PAUSED on an empty
@@ -1461,6 +1652,8 @@ class KodiPlayerBridge:
         if not self.current_video_id or self.owner.play_state == PlayerState.STOPPED:
             logger.info("pause ignored: nothing loaded (state=%s)", self.owner.play_state)
             return
+        if self._refuse_when_foreign("pause"):
+            return
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             # pause() TOGGLES: guard so pause-while-paused does not resume.
             if not self._is_paused():
@@ -1468,6 +1661,8 @@ class KodiPlayerBridge:
         self.owner.apply(PauseEvent())
 
     def resume(self) -> None:
+        if self._refuse_when_foreign("resume"):
+            return
         if KODI_AVAILABLE and self._kodi_player:
             if self._is_paused():
                 # Kodi's pause() toggles pause/resume.
@@ -1482,6 +1677,8 @@ class KodiPlayerBridge:
         self.owner.apply(ResumeEvent())
 
     def stop(self) -> None:
+        if self._refuse_when_foreign("stop"):
+            return
         with self._lock:
             self._play_gen += 1
             PLAY_GATE.bump(self._play_gen)  # wake/hold supersede for the shared stream gate
@@ -1492,6 +1689,8 @@ class KodiPlayerBridge:
             self._kodi_player.stop()
 
     def seek_to(self, seconds: float) -> None:
+        if self._refuse_when_foreign("seek"):
+            return
         if KODI_AVAILABLE and self._kodi_player and self._kodi_player.isPlaying():
             self._kodi_player.seekTime(seconds)
         else:
