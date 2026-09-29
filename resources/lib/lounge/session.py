@@ -392,7 +392,7 @@ class LoungeSession:
         if dur > 0:
             payload["seekableStartTime"] = "0"
             payload["seekableEndTime"] = str(dur)
-            payload["loadedTime"] = str(dur if state == PlayState.PLAYING else cur)
+            payload["loadedTime"] = str(dur if PlayState.is_active(state) else cur)
         if snapshot.current_index is not None and snapshot.current_index >= 0:
             payload["currentIndex"] = str(snapshot.current_index)
         if snapshot.list_id:
@@ -435,7 +435,7 @@ class LoungeSession:
         if dur > 0:
             payload["seekableStartTime"] = "0"
             payload["seekableEndTime"] = str(dur)
-            payload["loadedTime"] = str(dur if state == PlayState.PLAYING else cur)
+            payload["loadedTime"] = str(dur if PlayState.is_active(state) else cur)
         return payload
 
     def _build_volume(self, snapshot: SessionState) -> Dict[str, Any]:

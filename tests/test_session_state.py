@@ -111,6 +111,34 @@ class TestSessionState(unittest.TestCase):
         self.assertEqual(snap.volume, 100)
         self.assertEqual(snap.version, 5)
 
+    def test_cast_reports_buffering_until_the_item_clock_advances(self):
+        """A cast is a REQUEST, not playback (device 2026-09-29: the receiver
+        reported the new item as `state=1 dur=0` 34ms after setPlaylist, the
+        phone re-sent the same cast 76ms later, then the receiver published the
+        previous item's clock under the new id). The receiver must never say
+        PLAYING with duration 0; BUFFERING (3) covers the window until the
+        requested item's own clock advances."""
+        s = reduce(SessionState(), SetPlaylistEvent(
+            video_id="new", video_ids=["new", "old"], list_id="PL1", current_time=0.0))
+        self.assertEqual(s.play_state, PlayState.BUFFERING)
+        self.assertEqual(s.current_video_id, "new")
+        self.assertEqual(s.duration, 0.0)
+        self.assertTrue(PlayState.is_active(s.play_state))
+
+        # The resolver lands the duration: still loading, still not "playing".
+        s2 = reduce(s, ResolverCompletedEvent(video_id="new", duration=254.0))
+        self.assertEqual(s2.play_state, PlayState.BUFFERING)
+        self.assertEqual(s2.duration, 254.0)
+
+        # The requested item's clock advances -> PLAYING, from the player alone.
+        s3 = reduce(s2, PositionTickEvent(position=1.0, duration=254.0,
+                                          play_state=PlayState.PLAYING))
+        self.assertEqual(s3.play_state, PlayState.PLAYING)
+
+        # Invariant: no report may pair PLAYING with a zero duration.
+        for state in (s, s2, s3):
+            self.assertFalse(state.play_state == PlayState.PLAYING and state.duration == 0.0)
+
     def test_version_monotonicity(self):
         """Verify that version increases monotonically on accepted state changes."""
         s0 = SessionState()
@@ -122,7 +150,10 @@ class TestSessionState(unittest.TestCase):
         self.assertEqual(s1.current_video_id, "v1")
         self.assertEqual(s1.current_index, 0)
         self.assertEqual(s1.list_id, "PL1")
-        self.assertEqual(s1.play_state, PlayState.PLAYING)
+        # A cast ACCEPTS the request: the item is not playing until its own
+        # clock advances (device 2026-09-29: state=1 dur=0 34ms after a cast
+        # made the phone re-send the cast 76ms later).
+        self.assertEqual(s1.play_state, PlayState.BUFFERING)
 
         # Pause
         s2 = reduce(s1, PauseEvent())

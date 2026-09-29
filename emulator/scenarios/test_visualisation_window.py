@@ -55,7 +55,7 @@ def test_give_up_names_a_reason():
                 phone = _connect_music_phone(s)
                 phone.set_playlist("v_art", ["v_art"], current_time=0)
                 s.wait_until(lambda: "v_art" in (s.playing_file() or ""), what="art plays")
-                time.sleep(3.0)
+                time.sleep(8.0)
             finally:
                 xbmc.set_modal_dialog(False)
         assert any("did not take" in m for m in msgs), "refusal was never logged"

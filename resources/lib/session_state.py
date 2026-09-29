@@ -39,7 +39,22 @@ class PlayState:
     STOPPED = 0
     PLAYING = 1
     PAUSED = 2
+    # Buffering / starting: the item is OURS and requested, but its own clock
+    # has not advanced yet (resolve + player open). The phone renders this as a
+    # spinner; asserting PLAYING here instead is a lie the client acts on — a
+    # "playing" item with duration 0 is the zero-length/unseekable case mobile
+    # clients retry, and the retry re-casts the item (device 2026-09-29:
+    # `state=1 dur=0` 34ms after setPlaylist, phone re-sent the same cast 76ms
+    # later). YT labels 3 "buffering"; pyytlounge's State enum maps Starting=3.
+    BUFFERING = 3
     UNKNOWN = -1
+
+    @staticmethod
+    def is_active(state: int) -> bool:
+        """True while the receiver owns an item in this session — loading or
+        playing. Loads are active: the window/lane projections and the music
+        repair must not decide `state != PLAYING` means nothing is ours."""
+        return state in (PlayState.PLAYING, PlayState.BUFFERING)
 
 
 @dataclass(frozen=True)
@@ -383,7 +398,10 @@ def reduce(state: SessionState, event: Event) -> SessionState:
         new_list_id = event.list_id if event.list_id else state.list_id
         new_theme = event.theme if event.theme is not None else state.lane
         new_pos = max(0.0, float(event.current_time))
-        new_play_state = PlayState.PLAYING if new_vid else PlayState.STOPPED
+        # A cast ACCEPTS a request; it does not mean the item is running. Until
+        # the requested item's own clock advances the phone must be told
+        # BUFFERING (3), not PLAYING with duration 0.
+        new_play_state = PlayState.BUFFERING if new_vid else PlayState.STOPPED
 
         # Idempotence check: if playlist, list_id, item, index, pos, and state are already identical, no-op
         if (
@@ -467,9 +485,9 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             new_pos = 0.0 if identity_changed else state.position
         new_dur = 0.0 if identity_changed else state.duration
 
-        # Idempotence: already playing this video at this position
+        # Idempotence: already loading/playing this video at this position
         if (
-            state.play_state == PlayState.PLAYING
+            state.play_state in (PlayState.PLAYING, PlayState.BUFFERING)
             and new_vid == state.current_video_id
             and new_idx == state.current_index
             and new_pos == state.position
@@ -491,7 +509,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             list_id=state.list_id,
             position=new_pos,
             duration=new_dur,
-            play_state=PlayState.PLAYING,
+            play_state=PlayState.BUFFERING,
             lane=new_theme,
             volume=state.volume,
             cpn=new_cpn,
@@ -634,7 +652,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             list_id=state.list_id,
             position=0.0,
             duration=0.0,
-            play_state=PlayState.PLAYING,
+            play_state=PlayState.BUFFERING,
             lane=state.lane,
             volume=state.volume,
             cpn=new_cpn,
@@ -661,7 +679,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
             list_id=state.list_id,
             position=0.0,
             duration=0.0,
-            play_state=PlayState.PLAYING,
+            play_state=PlayState.BUFFERING,
             lane=state.lane,
             volume=state.volume,
             cpn=new_cpn,
@@ -820,7 +838,7 @@ def reduce(state: SessionState, event: Event) -> SessionState:
                 list_id=state.list_id,
                 position=0.0,
                 duration=0.0,
-                play_state=PlayState.PLAYING,
+                play_state=PlayState.BUFFERING,
                 lane=state.lane,
                 volume=state.volume,
                 cpn="cpn_" + next_vid,

@@ -14,7 +14,8 @@ from .session_state import (
     PauseEvent, ResumeEvent, PauseDetectedEvent, ResumeDetectedEvent, SeekToEvent,
     SetVolumeEvent, StopVideoEvent, NextEvent, PlaybackStartedEvent, KodiAdvancedEvent,
     PlaybackEndedEvent, ResolverCompletedEvent, KodiStateObservedEvent, SignalUnknownEvent,
-    PositionTickEvent
+    PositionTickEvent,
+    PlayState,
 )
 from . import preloader
 
@@ -145,6 +146,9 @@ class PlayerState:
     STOPPED = 0
     PLAYING = 1
     PAUSED = 2
+    # Mirrors the wire codes: an item the addon owns whose own clock has not
+    # advanced yet (load window). Never report PLAYING with duration 0.
+    BUFFERING = 3
 
 
 class KodiPlayerBridge:
@@ -236,6 +240,19 @@ class KodiPlayerBridge:
         # only to exclude Kodi's own teardown of that window from dismissal
         # detection (see MUSIC_WINDOW_POP_GRACE_SECONDS).
         self._video_window_seen_at: float = 0.0
+        # Video id for which the fullscreen video window has been asserted (see
+        # _project_video_window: at most one assert per item, and only inside the
+        # item's engagement window — never a fight with a user who navigated away
+        # mid-track).
+        self._video_window_asserted_for: Optional[str] = None
+        # Video item whose window assert budget is currently being tracked, and
+        # when it started: the assert waits out the outgoing item's teardown.
+        self._video_item_id: Optional[str] = None
+        self._video_item_started_at: float = 0.0
+        # What we asked Kodi to play for the current item ("audio" lane vs video
+        # lane) — the window projection's only honest source (see _play_video).
+        self._lane_audio_for: Optional[str] = None
+        self._lane_audio_flag: bool = False
         # Was the visualisation window up at the previous projection tick? A
         # True -> False transition is how the user's Back on 12006 is detected.
         self._viz_was_active = False
@@ -311,6 +328,16 @@ class KodiPlayerBridge:
 
         with self._lock:
             if snapshot.version == self._last_projected_version:
+                return
+
+            if snapshot.play_state == PlayState.BUFFERING:
+                # A loading snapshot is nothing to project: the item is not on
+                # the player yet, so there is no window, playlist or lane state
+                # to reconcile. Skipping it (without recording the version) keeps
+                # the GUI rules exactly as they were when only a PLAYING snapshot
+                # drove them — the projection then runs on the first version
+                # where the item really started. Reporting state=3 to the phone
+                # is a wire concern and must not move the GUI.
                 return
 
             if not (KODI_AVAILABLE and xbmc):
@@ -392,7 +419,14 @@ class KodiPlayerBridge:
             #    pop is repaired (see MUSIC_WINDOW_ENGAGE_SECONDS); outside it
             #    the GUI belongs to the user.
             if snapshot.play_state == PlayerState.PLAYING:
-                if is_music_lane:
+                video_on_screen = (
+                    self.current_video_id is not None
+                    and self._lane_audio_for == self.current_video_id
+                    and not self._lane_audio_flag
+                    and self._kodi_player is not None
+                    and self._kodi_player.isPlayingVideo()
+                )
+                if is_music_lane and not video_on_screen:
                     if self._projected_lane != "m":
                         # The music lane is entered: arm the bounded repair. This
                         # is the arm that covers items Kodi starts by itself
@@ -407,8 +441,15 @@ class KodiPlayerBridge:
                     elif step == "assert":
                         self._project_music_window()
                 else:
+                    # A video is on screen — a video-lane item, or a music item
+                    # Kodi is playing in the video player (a music video, which
+                    # Deinits MusicVisualisation on the device). The video window
+                    # is the right projection and the visualiser must never be
+                    # asserted over it: doing both in the same tick put 12006 up
+                    # one moment after asserting 12005 — which is what left the
+                    # fullscreen video window missing for a music video
+                    # (emulator test_lane_switch_windows).
                     self._projected_lane = "v"
-                    # A video owns the screen: stop re-asserting the music window.
                     self._music_window_until = 0.0
                     self._viz_was_active = False
                     self._video_window_seen_at = time.monotonic()
@@ -544,14 +585,43 @@ class KodiPlayerBridge:
         self._activate_visualizer(arm=False)
 
     def _project_video_window(self) -> None:
-        """Project fullscreen video window (12005)."""
+        """Project fullscreen video window (12005) inside a bounded engagement.
+
+        Kodi opens fullscreenvideo itself for a video item, so most of the time
+        there is nothing to do. It CAN be lost anyway: the outgoing item's
+        cleanup pops the window that the new item just opened (the emulator's
+        `set_stopped` -> `_windows.previous()` models the device's video->audio
+        switch leaving Home underneath, and the same teardown runs after a fresh
+        video play). The repair is bounded exactly like the music-window repair:
+        re-assert while the item is in its first MUSIC_WINDOW_ENGAGE_SECONDS —
+        a tick cadence, so at most one attempt per tick — and never after. Past
+        that the GUI is the user's; a track must not keep grabbing the screen.
+        """
         if not (KODI_AVAILABLE and xbmc):
             return
-        if self._visualisation_is_active():
-            try:
-                xbmc.executebuiltin("ActivateWindow(12005)")
-            except Exception:
-                pass
+        vid = self.current_video_id
+        if vid != self._video_item_id:
+            self._video_item_id = vid
+            self._video_item_started_at = time.monotonic()
+        if self._fullscreen_video_window_active():
+            return
+        if not vid or time.monotonic() - self._video_item_started_at >= MUSIC_WINDOW_ENGAGE_SECONDS:
+            return
+        if time.monotonic() - self._video_item_started_at < MUSIC_WINDOW_POP_GRACE_SECONDS:
+            # Too early: the outgoing item's cleanup can still pop the window
+            # this item just opened, so an assert now would be wasted on the very
+            # race it exists to repair.
+            return
+        if self._video_window_asserted_for == vid:
+            # Already asserted once for this item: a second attempt is the
+            # per-tick fight this bound exists to prevent.
+            return
+        try:
+            xbmc.executebuiltin("ActivateWindow(12005)")
+            self._video_window_asserted_for = vid
+            logger.info("Fullscreen video window asserted for %s", vid)
+        except Exception:
+            pass
 
     # --- Session facts: read-only views over the single owner (R1) ---
     # Every read routes to the owner; the only write path is owner.apply().
@@ -790,6 +860,18 @@ class KodiPlayerBridge:
         """
         if self.state == PlayerState.PAUSED:
             return
+        if (
+            self._play_inflight()
+        ):
+            # The load window: the player still holds the PREVIOUS item (or is
+            # opening the new file), so its clock and duration belong to someone
+            # else. Publishing them pairs the new id with a foreign clock —
+            # device 2026-09-29, 1.4s after a cast: `vid=<new> t=111 dur=156`
+            # while the old item was at t=111/156, then `t=111 dur=254`. The
+            # phone renders those as jumps and snaps back to its last
+            # consistent item. Hold instead: the snapshot stays BUFFERING at
+            # t=0, with the duration the resolver reports when it lands.
+            return
         try:
             cur_time = float(self.get_time())
             cur_duration = float(self.current_duration)
@@ -799,7 +881,11 @@ class KodiPlayerBridge:
             self.owner.apply(PositionTickEvent(
                 position=cur_time,
                 duration=cur_duration,
-                play_state=self.state,
+                # A tick only fires when the clock ADVANCED (or the duration
+                # changed), and that is the receiver's evidence that the item
+                # is playing now: this is what moves BUFFERING -> PLAYING (R6).
+                # Reporting the owner's own state here would hold 3 forever.
+                play_state=PlayerState.PLAYING,
                 source="player-clock",
             ))
 
@@ -824,6 +910,31 @@ class KodiPlayerBridge:
             # so a movie's buffering or OSD stall was published as a pause of an
             # old cast — and every one of those events bumped the snapshot
             # version, which is what drove the window projection over the film.
+            self._last_poll_time = None
+            self._stall_polls = 0
+            self._last_change_at = time.monotonic()
+            return
+        if self._play_inflight():
+            # A load handoff is not a stall. While the request is in flight the
+            # clock read here belongs to the PREVIOUS item, and inferring a
+            # pause from it published state=2 two seconds into a cold cast
+            # (device 2026-09-29: `pauseDetected (t=20 x3 polls,
+            # source=player-clock)`, then `resumeDetected (t=0)`) — every flip
+            # re-rendered the phone's queue. The item is BUFFERING; nothing to
+            # infer from it.
+            self._last_poll_time = None
+            self._stall_polls = 0
+            self._last_change_at = time.monotonic()
+            return
+        if self.owner.play_state == PlayState.BUFFERING:
+            # The item is LOADING (the cast handed over a request; the requested
+            # item's own clock has not advanced yet). Nothing is playing, so
+            # there is no pause to infer — and the numbers the player still
+            # holds belong to the item before it. Device 2026-09-29:
+            # `pauseDetected (t=20 x3 polls, source=player-clock)` 2 s into a
+            # cold cast, then `resumeDetected (t=0)` when the new item finally
+            # started — both were published to the phone, which re-rendered its
+            # queue on each flip.
             self._last_poll_time = None
             self._stall_polls = 0
             self._last_change_at = time.monotonic()
@@ -1142,6 +1253,13 @@ class KodiPlayerBridge:
                 # leaves the VideoFullScreen window rendering its last frame on
                 # top of the GUI while the audio plays underneath.
                 self._stop_video_player_for_audio()
+            # What WE asked Kodi to play for this item — the only honest source
+            # for the window projection below: Kodi's own isPlayingVideo() is a
+            # player-mode fact (a closing video player reports video mode for an
+            # audio item, device-verified), and a snapshot alone says nothing
+            # about the item.
+            self._lane_audio_for = video_id
+            self._lane_audio_flag = bool(audio_mode)
 
             # Ownership marker: the URL this addon hands Kodi is what later
             # identifies the player as ours (see _owns_player). Without it the
@@ -1540,6 +1658,15 @@ class KodiPlayerBridge:
         # music play, or a music item re-opened on the audio lane).
         if arm:
             self._music_window_until = time.monotonic() + MUSIC_WINDOW_ENGAGE_SECONDS
+            # A new item is being handed over on the music lane: the PREVIOUS
+            # track's window state must not be read as "the user dismissed THIS
+            # track". `_viz_was_active` is True after any track whose window was
+            # up, so the new handoff's very first poll saw "was up, now down" and
+            # ended the takeover before the window was ever asserted — a cast
+            # made from the user's own menu was swallowed (emulator
+            # test_user_menus_survive_music_playback, step 3). A dismissal only
+            # means anything for the track that was on screen when it happened.
+            self._viz_was_active = False
         if self._viz_inflight:
             return
         self._viz_inflight = True
@@ -1551,7 +1678,14 @@ class KodiPlayerBridge:
                 while (time.monotonic() < self._music_window_until
                        and not self._monitor_stop.is_set()):
                     try:
-                        if (self.owner.lane or "") != "m" or self.owner.play_state != PlayerState.PLAYING:
+                        if (self.owner.lane or "") != "m" or self.owner.play_state not in (
+                                PlayerState.PLAYING, PlayerState.BUFFERING):
+                            # A live item of ours keeps the repair running. The
+                            # state is BUFFERING for as long as the resolver
+                            # takes, so requiring PLAYING here aborted the whole
+                            # repair on every cold cast — the window was never
+                            # asserted, and the visualiser never came up after a
+                            # cast made from the user's own menu.
                             break
                         if not self._owns_player():
                             # The GUI repair is for OUR music lane only. A stale

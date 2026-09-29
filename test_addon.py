@@ -13,7 +13,7 @@ from resources.lib.persistence import SessionStore
 from resources.lib.resolver import VideoResolver
 from resources.lib.player_bridge import KodiPlayerBridge, PlayerState
 from resources.lib.lounge.listener import CommandDispatcher
-from resources.lib.session_state import SessionState, StateOwner
+from resources.lib.session_state import SessionState, StateOwner, PlayState, SetPlaylistEvent, PositionTickEvent
 from dataclasses import replace
 
 
@@ -140,13 +140,26 @@ def test_persistence():
 
 
 def test_session_state_module():
-    """Run all unit tests in tests/test_session_state.py as part of test_addon.py."""
-    import unittest
-    loader = unittest.TestLoader()
-    suite = loader.loadTestsFromName("tests.test_session_state")
-    runner = unittest.TextTestRunner(verbosity=0)
-    result = runner.run(suite)
-    assert result.wasSuccessful(), f"test_session_state failed: {result.errors + result.failures}"
+    """Run tests/test_session_state.py as part of test_addon.py — in a CHILD process.
+
+    In-process does not work here: this file imports ``resources.lib.player_bridge``
+    at module import time, before the emulator's Kodi stub is installed, so the
+    bridge's module-global ``xbmc`` stays None and every window/playlist
+    projection test fails for a reason that has nothing to do with the code
+    under test (verified: 4 projection failures with the suite run in-process
+    against unmodified lib code, 0 failures in a fresh interpreter). A
+    subprocess gives the suite the same clean import order CI gives it.
+    """
+    import subprocess
+    import sys as _sys
+    completed = subprocess.run(
+        [_sys.executable, "-m", "unittest", "tests.test_session_state"],
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    assert completed.returncode == 0, (
+        "test_session_state failed (child process):\n" + completed.stdout[-4000:])
+    print(completed.stdout.strip().splitlines()[-3])
 
 
 
@@ -1549,6 +1562,134 @@ def test_audio_normalization_disabled_is_inert():
     assert VideoResolver(bridge=object())._with_audio("off1", info) is info
 
 
+def test_cold_cast_never_reports_the_previous_items_clock():
+    """Device 2026-09-29 (kodi.log 10:09:5x), one song change, three lies:
+
+      setPlaylist -> 34ms later `REPORT nowPlaying vid=<new> idx=25 t=0 dur=0
+      state=1` (a "playing" item of zero length: the phone re-sent the identical
+      cast 76ms later), then `vid=<new> t=111 dur=156` — the clock of the item
+      still in the player — then `t=111 dur=254`, then `t=0`.
+
+    Identity came from the snapshot while the clock came from someone else's
+    media, and the load was announced as playing. A cast is BUFFERING until the
+    requested item's own clock advances, and the tick publishes nothing while
+    the play request is in flight.
+    """
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session)
+    import resources.lib.player_bridge as pb
+    orig_avail = pb.KODI_AVAILABLE
+    pb.KODI_AVAILABLE = True
+
+    class _OldItemStillInThePlayer:
+        _time = 111.0
+        def isPlaying(self):
+            return True
+        def getTime(self):
+            return self._time
+        def getTotalTime(self):
+            return 156.0
+
+    try:
+        _set_state(player, play_state=PlayerState.PLAYING, current_video_id="olditem",
+                   position=111.0, duration=156.0)
+        player._kodi_player = _OldItemStillInThePlayer()
+
+        # The phone casts: the reducer accepts the request as BUFFERING, never as
+        # a playing item with duration 0.
+        player.owner.apply(SetPlaylistEvent(
+            video_id="newitem", video_ids=["newitem", "olditem"], list_id="PL1",
+            current_time=0.0))
+        assert player.owner.play_state == PlayState.BUFFERING, (
+            f"a cast must report BUFFERING (3), got {player.owner.play_state}")
+
+        # The resolver thread now owns the request; nothing is in the player yet.
+        player._requested_id = "newitem"
+        player._play_gen = 1
+        player._active_gen = 0
+        assert player._play_inflight() is True
+
+        before = (player.owner.position, player.owner.duration, player.owner.play_state)
+        player._emit_position_tick()
+        after = (player.owner.position, player.owner.duration, player.owner.play_state)
+        assert after == before, f"load window published the old clock: {before} -> {after}"
+
+        # The old item's frozen clock is not a pause of the new one either.
+        player._poll_pause_state()
+        assert player.owner.play_state == PlayState.BUFFERING, player.owner.play_state
+    finally:
+        pb.KODI_AVAILABLE = orig_avail
+
+
+def test_a_loading_item_cannot_be_inferred_as_a_pause():
+    """The stall detector may only call a pause for an item whose OWN clock has
+    advanced at least once (device 2026-09-29: `pauseDetected via time-stall
+    (t=20 x3 polls, source=player-clock)` two seconds into a cold cast, followed
+    by `resumeDetected (t=0)` when the new item finally started — each flip
+    published state=2/state=1 to the phone).
+
+    Both directions are asserted: an item that has never ticked cannot stall
+    into a pause, and an item that has ticked still can.
+    """
+    session = LoungeSession("s1", "t1", "d1")
+    player = KodiPlayerBridge(session=session)
+    import resources.lib.player_bridge as pb
+    orig_avail, orig_time = pb.KODI_AVAILABLE, pb.time
+    pb.KODI_AVAILABLE = True
+
+    class _Clock:
+        """Controllable wall clock: the stall needs >= 2.5s of wall time."""
+        now = 1000.0
+        @staticmethod
+        def monotonic():
+            return _Clock.now
+
+    class _Player:
+        _time = 20
+        def isPlaying(self):
+            return True
+        def getTime(self):
+            return self._time
+        def getTotalTime(self):
+            return 193.0
+
+    try:
+        pb.time = _Clock()
+        player._kodi_player = _Player()
+        player._owns_player = lambda: True  # test seam: the gate is tested elsewhere
+        _set_state(player, play_state=PlayState.BUFFERING, current_video_id="newitem",
+                   position=0.0, duration=193.0)
+
+        # (a) The item is LOADING: a frozen clock (even a stale one from the item
+        #     before it) is not a pause.
+        for _ in range(4):
+            _Clock.now += 1.5
+            player._poll_pause_state()
+        assert player.owner.play_state == PlayState.BUFFERING, (
+            f"a loading item was published as state {player.owner.play_state}")
+
+        # (b) Its clock advances, which is what flips the snapshot to PLAYING
+        #     (the tick that proves it is the only evidence allowed to)...
+        _Player._time = 21
+        _Clock.now += 1.5
+        player._poll_pause_state()
+        player.owner.apply(PositionTickEvent(position=21.0, duration=193.0,
+                                             play_state=PlayState.PLAYING))
+        assert player.owner.play_state == PlayState.PLAYING
+
+        # ...and now a 3s standstill IS a pause, as before.
+        _Clock.now += 1.5
+        player._poll_pause_state()   # baseline sample at t=21
+        _Clock.now += 4.0
+        player._poll_pause_state()
+        player._poll_pause_state()
+        assert player.owner.play_state == PlayState.PAUSED, (
+            "the stall detector must still infer a real pause")
+    finally:
+        pb.KODI_AVAILABLE = orig_avail
+        pb.time = orig_time
+
+
 def test_handoff_pending_gate():
     """The normalizer holds its ffmpeg child while a handoff is in flight."""
     player = KodiPlayerBridge(session=LoungeSession("s1", "t1", "d1"))
@@ -1754,6 +1895,7 @@ def test_music_window_hold_idle_and_handoff_arm():
 
 
 if __name__ == "__main__":
+    test_session_state_module()
     test_frame_parsing()
     test_frame_parsing_chunked()
     test_frame_parsing_incomplete_tail()
@@ -1792,6 +1934,8 @@ if __name__ == "__main__":
     test_sync_current_from_kodi_refresh_dispatches_duration()
     test_track_change_watchdog_adopts_on_kodi_native_advance()
     test_pause_and_resume_reporting()
+    test_cold_cast_never_reports_the_previous_items_clock()
+    test_a_loading_item_cannot_be_inferred_as_a_pause()
     test_audio_normalization_ebur128_parsing()
     test_audio_normalization_gain_math()
     test_audio_normalization_artifact_paths()
