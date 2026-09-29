@@ -209,6 +209,11 @@ class KodiPlayerBridge:
         self._last_poll_time: Optional[int] = None
         self._stall_polls = 0
         self._last_stall_time: Optional[int] = None
+        self._last_change_at: float = time.monotonic()
+        # Reconcile clock. 1 s keeps the reported position within one interval of
+        # the real playback clock: at 2 s the phone's progress bar visibly lagged
+        # behind (the phone only ever sees what we report).
+        self._tick_interval: float = 1.0
         # Playback-transition quiet window (monotonic deadline): while a play is
         # being handed to Kodi — the outgoing item's post-stop STAT, the video
         # window teardown, the new player opening — this process must keep the
@@ -647,8 +652,8 @@ class KodiPlayerBridge:
     def _position_loop(self) -> None:
         last_wake = time.monotonic()
         while not self._monitor_stop.is_set():
-            time.sleep(2.0)
-            drift = time.monotonic() - last_wake - 2.0
+            time.sleep(self._tick_interval)
+            drift = time.monotonic() - last_wake - self._tick_interval
             last_wake = time.monotonic()
             if drift > 5.0:
                 self._dump_thread_stacks(drift)
@@ -736,6 +741,12 @@ class KodiPlayerBridge:
                     "reconcile: snapshot=playing(no item) player=alive/unidentified"
                     " -> event=signalUnknown")
                 self.owner.apply(SignalUnknownEvent(source="player-clock"))
+            # The clock is still readable even though the label carries no id:
+            # emit the position tick before returning, or the manifest lane
+            # never advances the snapshot position at all (device: a cast stuck
+            # at t=2 for minutes -> the phone's progress bar frozen, the overlay
+            # starved of nowPlaying info).
+            self._emit_position_tick()
             return
 
         # 2. Item differs -> adopt the player's item through the reducer, but
@@ -761,28 +772,36 @@ class KodiPlayerBridge:
 
         # 3. Play state: broken signals (getCondVisibility returns False while
         #    paused) mean we cannot assert PLAYING from the live player alone.
-        #    If we believe PAUSED and the clock has advanced, that is a resume.
-        #    If we believe an unpaused state and the player is alive, nothing
-        #    to correct. The stall detector owns the pause direction.
+        #    The stall detector owns the pause direction.
+        # 4. Position/duration: one event carrying the observed clock (R6:
+        #    source=player-clock), only when it actually differs.
+        self._emit_position_tick()
+
+        # 5. GUI drift is log-only (R4: ticks perform zero mutations).
+        self._report_drift_log_only()
+
+    def _emit_position_tick(self) -> None:
+        """Publish the player's clock as a position tick, when it differs.
+
+        Called from the reconciler for every lane whose player we own: the
+        reduced position is what the phone's progress bar tracks and what the
+        nowPlaying overlay renders, so a lane that skips this freezes at
+        whatever the phone last asserted.
+        """
+        if self.state == PlayerState.PAUSED:
+            return
         try:
             cur_time = float(self.get_time())
             cur_duration = float(self.current_duration)
         except Exception:
             return
-
-        # 4. Position/duration: one event carrying the observed clock (R6:
-        #    source=player-clock), only when it actually differs.
-        if (self.state != PlayerState.PAUSED
-                and (cur_time != self.owner.position or cur_duration != self.owner.duration)):
+        if cur_time != self.owner.position or cur_duration != self.owner.duration:
             self.owner.apply(PositionTickEvent(
                 position=cur_time,
                 duration=cur_duration,
                 play_state=self.state,
                 source="player-clock",
             ))
-
-        # 5. GUI drift is log-only (R4: ticks perform zero mutations).
-        self._report_drift_log_only()
 
     def _poll_pause_state(self) -> None:
         """Detect pause via time-stall: a live Kodi player whose getTime()
@@ -797,6 +816,7 @@ class KodiPlayerBridge:
         if not (KODI_AVAILABLE and self._kodi_player) or not self.current_video_id:
             self._last_poll_time = None
             self._stall_polls = 0
+            self._last_change_at = time.monotonic()
             return
         if not self._owns_player():
             # Never infer pause/resume from media we did not start: a stale
@@ -806,6 +826,7 @@ class KodiPlayerBridge:
             # version, which is what drove the window projection over the film.
             self._last_poll_time = None
             self._stall_polls = 0
+            self._last_change_at = time.monotonic()
             return
         try:
             if not self._kodi_player.isPlaying():
@@ -820,14 +841,21 @@ class KodiPlayerBridge:
             # No trustworthy clock yet, or track finished.
             self._last_poll_time = None
             self._stall_polls = 0
+            self._last_change_at = time.monotonic()
             return
         if self._last_poll_time is not None and cur == self._last_poll_time:
             self._stall_polls += 1
         else:
             self._stall_polls = 0
             self._last_stall_time = None
+            self._last_change_at = time.monotonic()
         self._last_poll_time = cur
-        if self._stall_polls >= 2:
+        # With a 1 s tick, int(getTime()) reading the same value twice is normal
+        # jitter (the clock is integer seconds), not a stall. Require the clock to
+        # be static for >= 2.5 s of wall time — the tolerance the 2 s tick gave —
+        # before calling it a pause.
+        stalled_long_enough = time.monotonic() - self._last_change_at >= 2.5
+        if self._stall_polls >= 2 and stalled_long_enough:
             self._last_stall_time = cur
             if self.state != PlayerState.PAUSED:
                 # R6: the clock stopped while the player claims to be playing and

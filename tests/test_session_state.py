@@ -235,6 +235,31 @@ class TestReducerPurityAndIdempotence(unittest.TestCase):
             version=1,
         )
 
+    def test_play_event_identity_change_resets_the_clock(self):
+        """A PlayEvent naming a DIFFERENT video starts at 0, never the old clock.
+
+        Reported symptom (device, 2026-09-28): "when changing songs it shows the
+        next song with the previous progress until the song actually starts
+        playing and then updates the progress to be 0". PlayEvent kept
+        ``state.position`` whenever it carried no seek_time, so an identity change
+        published the new item with the outgoing item's progress.
+        """
+        owner = StateOwner(self.base_state)          # v1 playing at 10.0s
+        owner.apply(PlayEvent(video_id="v2", source="phone"))
+        snap = owner.snapshot()
+        self.assertEqual(snap.current_video_id, "v2")
+        self.assertEqual(snap.position, 0.0,
+                         "the next item must not inherit the previous clock")
+        self.assertEqual(snap.duration, 0.0)
+
+        # An explicit position still wins (resume-at-position keeps working).
+        owner.apply(PlayEvent(video_id="v3", seek_time=42.0, source="phone"))
+        self.assertEqual(owner.snapshot().position, 42.0)
+
+        # Same item re-asserted without a seek must not move the clock.
+        owner.apply(PlayEvent(video_id="v3", source="phone"))
+        self.assertEqual(owner.snapshot().position, 42.0)
+
     def _get_vocabulary_events(self):
         """Return a mapping of vocabulary name to an event instance that alters base_state."""
         return {

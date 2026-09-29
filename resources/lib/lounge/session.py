@@ -120,7 +120,7 @@ class LoungeSession:
         self._last_published: Optional[SessionState] = None
         self._wake_event = threading.Event()
         self._stopped = threading.Event()
-        self._heartbeat_interval = 2.0  # <= 1 Hz
+        self._heartbeat_interval = 1.0  # 1 Hz: the phone's clock lags by at most one interval
 
         self._publisher_thread = threading.Thread(
             target=self._publisher_loop, daemon=True, name=f"LoungePublisher-{theme}"

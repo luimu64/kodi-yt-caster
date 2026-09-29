@@ -53,10 +53,21 @@ def test_tv_side_resume_detected_by_time_advance():
             engine.clock.pause()
             r = s.lounge.wait_for_report("onStateChange", lambda r: r.get("state") == "2", timeout=15)
             assert r, "pause must be detected despite broken signals"
+            frozen = int(float(r.get("currentTime", 0)))
             # Resume the engine directly (TV-side), phone never said play.
             engine.clock.resume()
-            r2 = s.lounge.wait_for_report("onStateChange", lambda r2: r2.get("state") == "1" and int(float(r2.get("currentTime", 0))) >= 2, timeout=15)
-            assert r2, "resume must be detected via time advance and reported as state=1 past the frozen position"
+            # "Past the frozen position" is the real requirement, and it must be
+            # cadence-independent: with a 1 s reconcile clock the first advanced
+            # sample is +1 s, so a hard-coded >= 2 only ever proved the old 2 s
+            # tick. Comparing against the position the pause actually reported is
+            # strictly stronger (a mid-song pause freezes at a high clock).
+            r2 = s.lounge.wait_for_report(
+                "onStateChange",
+                lambda r2: (r2.get("state") == "1"
+                            and int(float(r2.get("currentTime", 0))) > frozen),
+                timeout=15)
+            assert r2, ("resume must be detected via time advance and reported as "
+                        f"state=1 past the frozen position ({frozen})")
         finally:
             xbmc.getCondVisibility = orig_cgv
 

@@ -455,8 +455,17 @@ def reduce(state: SessionState, event: Event) -> SessionState:
         new_playlist = state.playlist if state.playlist else ((new_vid,) if new_vid else ())
         new_idx = _derive_index(new_playlist, new_vid, state.current_index)
         new_theme = event.theme if event.theme is not None else state.lane
-        new_pos = max(0.0, float(event.seek_time)) if event.seek_time is not None else state.position
-        new_dur = 0.0 if (event.video_id and event.video_id != state.current_video_id) else state.duration
+        # A different item starts at the beginning. Carrying the previous item's
+        # clock across an identity change is what made the phone show the NEXT
+        # song with the PREVIOUS song's progress until playback really started
+        # (and only then jump to 0). Only an explicit seek_time may set a
+        # non-zero start, and it applies to the item it names.
+        identity_changed = bool(new_vid and new_vid != state.current_video_id)
+        if event.seek_time is not None:
+            new_pos = max(0.0, float(event.seek_time))
+        else:
+            new_pos = 0.0 if identity_changed else state.position
+        new_dur = 0.0 if identity_changed else state.duration
 
         # Idempotence: already playing this video at this position
         if (
