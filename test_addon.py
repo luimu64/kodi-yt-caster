@@ -564,11 +564,13 @@ def test_r7_publish_one_batch_per_changed_field_group():
     assert posted == ["onVolumeChanged"], posted
     posted.clear()
 
-    # playback-only change (same play_state) -> nowPlaying, no onStateChange;
-    # R10 adds the ad-state family to a playback change.
+    # playback-only change (same play_state) -> nowPlaying alone. A position
+    # tick is not a state change, so neither onStateChange nor the ad-state
+    # family belongs to it: on device the same rule fired onAdStateChange at
+    # the tick rate for a value that never changed.
     tick = vol.__class__(**{**vol.__dict__, "position": 5.0, "version": 3})
     assert session.publish_snapshot(tick) is True
-    assert sorted(posted) == sorted(["nowPlaying", "onAdStateChange"]), posted
+    assert sorted(posted) == sorted(["nowPlaying"]), posted
     posted.clear()
 
     # play_state change -> nowPlaying + onStateChange (+ ad state)

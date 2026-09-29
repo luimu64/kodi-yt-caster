@@ -294,6 +294,16 @@ class LoungeSession:
 
             actions_to_emit: List[Tuple[str, Dict[str, Any]]] = []
 
+            # A playback *state* change (play/pause/stop, or a duration arriving
+            # for a zero-length item). A position tick is not one: it must not
+            # re-send channels that only describe a state.
+            should_emit_state_change = (
+                self._last_published is None
+                or self._last_published.play_state != snapshot.play_state
+                or (self._last_published.duration == 0 and snapshot.duration > 0)
+                or (snapshot.play_state == PlayState.PAUSED and self._last_published.position != snapshot.position)
+            )
+
             # 1. Identity group
             if "identity" in changed_groups:
                 actions_to_emit.append(("nowPlaying", self._build_now_playing(snapshot)))
@@ -309,20 +319,16 @@ class LoungeSession:
             if "playback" in changed_groups:
                 if "identity" not in changed_groups:
                     actions_to_emit.append(("nowPlaying", self._build_now_playing(snapshot)))
-                should_emit_state_change = (
-                    self._last_published is None
-                    or self._last_published.play_state != snapshot.play_state
-                    or (self._last_published.duration == 0 and snapshot.duration > 0)
-                    or (snapshot.play_state == PlayState.PAUSED and self._last_published.position != snapshot.position)
-                )
                 if should_emit_state_change:
                     actions_to_emit.append(("onStateChange", self._build_state_change(snapshot)))
 
             # R10: the receiver resolves locally (yt-dlp) and never injects ads,
-            # so "no ad" is a known fact, not a guess. Reassert it whenever the
-            # item or the playback changes, so a skip control is backed by a
-            # real family rather than a phone-side default.
-            if "identity" in changed_groups or "playback" in changed_groups:
+            # so "no ad" is a known fact, not a guess. Reassert it when the item
+            # changes or the playback state changes — a skip control is then
+            # backed by a real family rather than a phone-side default. NOT on
+            # every position tick: that spammed onAdStateChange at the tick rate
+            # (~1.5/s on device) for a value that never changed.
+            if "identity" in changed_groups or should_emit_state_change:
                 actions_to_emit.append(("onAdStateChange", self._build_ad_state()))
                 if "identity" in changed_groups:
                     actions_to_emit.append(("onAdPlaying", self._build_ad_state()))
