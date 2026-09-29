@@ -491,7 +491,6 @@ def run_service() -> None:
                         sess.lounge_token = new_tok
                         sess.sid = None
                         sess.gsessionid = None
-                        sess.last_code = -1
                         if refreshed:
                             log_kodi(f"Token refreshed in place for theme={sess.theme} "
                                      f"(screen {new_sid} kept — pairing preserved)", 1)

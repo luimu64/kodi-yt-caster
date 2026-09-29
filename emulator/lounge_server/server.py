@@ -92,6 +92,21 @@ class MockLoungeServer:
     def url(self):
         return self.base_url
 
+    def _take_code(self, sess) -> int:
+        """Assign the next relay frame code for a session (atomically).
+
+        The relay stamps a code at DELIVERY, so one may never be handed out twice
+        or arrive out of order. Both the long-poll's noop-after-command and a
+        sender's queue_command draw from the same counter: without the lock, a
+        command queued in the window between the poll's increment and its write
+        got a LOWER code than a noop already on the wire, and the receiver's
+        dedup (correctly) dropped it — an emulator-only race that masked the
+        behaviour under test.
+        """
+        with self._lock:
+            sess.next_code += 1
+            return sess.next_code
+
     def queue_command(self, item, sids=None, broadcast=False):
         """Queue ONE command pair (cmd, data) to bound sessions.
 
@@ -114,11 +129,10 @@ class MockLoungeServer:
                 # command (cl + m listeners) and races the bridge dedup.
                 polled = [sid for sid, sess in self.sessions.items() if sess.polled]
                 targets = polled[:1]
-            for sid in targets:
-                sess = self.sessions.get(sid)
-                if sess:
-                    sess.next_code += 1
-                    sess.commands.put([sess.next_code, item])
+        for sid in targets:
+            sess = self.sessions.get(sid)
+            if sess:
+                sess.commands.put([self._take_code(sess), item])
 
     def expire_token(self, screen_id):
         """Make binds for this screen fail with 400 'token' AND break any
@@ -333,24 +347,25 @@ def _make_handler(server: MockLoungeServer):
                 beat = time.monotonic() - last_frame >= server.IDLE_NOOP_INTERVAL
                 try:
                     items = sess.commands.get(timeout=0.25)
-                    idle = False
                 except queue.Empty:
-                    if not beat:
-                        continue
-                    idle = True
+                    items = None
                 try:
-                    if idle:
-                        # Real relay noop keepalives every ~30s (archived
-                        # stream dump: codes 8,9,10 ... at 20-30s cadence).
-                        sess.next_code += 1
-                        chunk(encode_frame([[sess.next_code, ["noop"]]]))
+                    if items is None:
+                        if not beat:
+                            continue
+                        # Real relay noop keepalive every ~30s (archived stream
+                        # dump: codes 8,9,10 ... at 20-30s cadence).
+                        chunk(encode_frame([[server._take_code(sess), ["noop"]]]))
                         last_frame = time.monotonic()
                         continue
                     chunk(encode_frame([items]))
-                    # noop after each command, mirroring the real relay
-                    sess.next_code += 1
-                    chunk(encode_frame([[sess.next_code, ["noop"]]]))
-                    last_frame = time.monotonic()
+                    # Noop after each command, mirroring the real relay — but
+                    # only once the queue is drained: a keepalive code stamped
+                    # while a command is still queued overtakes it, and the
+                    # receiver's dedup then drops the late, lower-coded command.
+                    if sess.commands.empty():
+                        chunk(encode_frame([[server._take_code(sess), ["noop"]]]))
+                        last_frame = time.monotonic()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     return
             try:

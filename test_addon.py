@@ -989,6 +989,49 @@ def test_token_expiry_401_is_classified_as_expiry():
         client_mod.urllib.request.urlopen = orig_req
 
 
+def test_handshake_restarts_the_relay_frame_code_space():
+    """A handshake opens a NEW relay session; its frames number from scratch.
+
+    Device 2026-09-29 (kodi.log): the relay recycled both binds
+    (`gracefulReconnect` -> IncompleteRead -> 410 Gone). The listener re-handshook
+    fine — and never dispatched another command on either lounge, while the phone
+    still showed the TV as connected and casting silently did nothing. Cause: the
+    OLD session's code high-water mark was kept (1283 frames on one bind, 1708 on
+    the other), while the relay numbers a new session from ~4
+    (getDiscoveryDeviceId) and ~8 (noop) — so `code > last_code` swallowed every
+    command of the new session, forever.
+    """
+    import resources.lib.lounge.session as sess_mod
+
+    payload = '[[0,["c","NEW_SID","",8]],[1,["S","NEW_GSESSIONID"]]]'
+    body = f"{len(payload)}\n{payload}\n".encode("utf-8")
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return body
+
+    session = LoungeSession("s1", "t1", "d1")
+    orig = sess_mod.urllib.request.urlopen
+    session.last_code = 1708  # what the recycled session left behind
+    try:
+        sess_mod.urllib.request.urlopen = lambda *a, **k: _Resp()
+        session.handshake()
+    finally:
+        sess_mod.urllib.request.urlopen = orig
+        session.close()
+
+    assert session.sid == "NEW_SID", session.sid
+    assert session.last_code == -1, (
+        "a rebound relay session must not inherit the dead session's frame-code "
+        f"high-water mark (commands would be dropped forever): {session.last_code}")
+
+
 def test_r6_unknown_published_when_item_fact_has_no_source():
     """R6: with an alive player but no item at all, the item fact is genuinely
     unknown and UNKNOWN is publishable (state=-1), never a guess."""
@@ -1742,6 +1785,7 @@ if __name__ == "__main__":
     test_r8_vanished_player_is_a_corrective_stop()
     test_r6_unknown_published_when_item_fact_has_no_source()
     test_token_expiry_401_is_classified_as_expiry()
+    test_handshake_restarts_the_relay_frame_code_space()
     test_r10_vocabulary_declared_and_coverage_logged()
     test_r10_up_next_emitted_when_known_omitted_when_not()
     test_duration_reporting_and_fallback()

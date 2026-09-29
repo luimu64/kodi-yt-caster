@@ -44,6 +44,9 @@ class LoungeListener(threading.Thread):
         self.dispatcher = dispatcher
         self.on_token_expired = on_token_expired
         self._stop_event = threading.Event()
+        # Set when the relay tells us it is recycling this bind stream: the
+        # stream must be dropped and a fresh handshake performed NOW.
+        self._reconnect_requested = threading.Event()
         self.consecutive_failures = 0
 
     def stop(self) -> None:
@@ -74,7 +77,6 @@ class LoungeListener(threading.Thread):
                 # dying: the handler resets session.sid/gsessionid.
                 self.session.sid = None
                 self.session.gsessionid = None
-                self.session.last_code = -1
                 self.consecutive_failures = 0
                 backoff = 2.0
                 for _ in range(50):
@@ -127,28 +129,36 @@ class LoungeListener(threading.Thread):
         req = urllib.request.Request(url, headers=DEFAULT_HEADERS)
 
         # 120-second timeout for streaming long-poll
-        with urllib.request.urlopen(req, timeout=120.0) as resp:
-            buf = ""
-            while not self.is_stopped():
-                # read1(): returns as soon as ANY bytes are buffered. resp.read(n)
-                # blocks until all n bytes arrive — and Lounge command frames are
-                # ~100-300 bytes followed by silence, so each command sat in the
-                # socket buffer until the NEXT command supplied the remaining
-                # bytes (every command relayed one late).
-                chunk = resp.read1(4096)
-                if not chunk:
-                    break
-                buf += chunk.decode("utf-8", errors="replace")
-                commands, consumed = parse_frames(buf)
-                if consumed:
-                    # Keep any partial trailing frame buffered; its remainder
-                    # arrives in a later chunk.
-                    buf = buf[consumed:]
-                if commands:
-                    for code, name, data in commands:
-                        if code > self.session.last_code:
-                            self.session.last_code = code
-                            self._handle_command(name, data)
+        try:
+            with urllib.request.urlopen(req, timeout=120.0) as resp:
+                buf = ""
+                while not self.is_stopped():
+                    if self._reconnect_requested.is_set():
+                        # The relay asked for a reconnect: this stream's frame
+                        # codes are finished, so hand back to run() and let it
+                        # handshake instead of reading a dead session.
+                        break
+                    # read1(): returns as soon as ANY bytes are buffered. resp.read(n)
+                    # blocks until all n bytes arrive — and Lounge command frames are
+                    # ~100-300 bytes followed by silence, so each command sat in the
+                    # socket buffer until the NEXT command supplied the remaining
+                    # bytes (every command relayed one late).
+                    chunk = resp.read1(4096)
+                    if not chunk:
+                        break
+                    buf += chunk.decode("utf-8", errors="replace")
+                    commands, consumed = parse_frames(buf)
+                    if consumed:
+                        # Keep any partial trailing frame buffered; its remainder
+                        # arrives in a later chunk.
+                        buf = buf[consumed:]
+                    if commands:
+                        for code, name, data in commands:
+                            if code > self.session.last_code:
+                                self.session.last_code = code
+                                self._handle_command(name, data)
+        finally:
+            self._reconnect_requested.clear()
 
     def _handle_command(self, name: str, data: Any) -> None:
         logger.info("Lounge command: %s (data: %s)", name, data)
@@ -157,6 +167,19 @@ class LoungeListener(threading.Thread):
         # auto mode (static-art detection is unreliable for 1080p art videos).
         if isinstance(data, dict):
             data.setdefault("_theme", self.session.theme)
+        if name == "gracefulReconnect":
+            # The relay announces the recycle of a bind stream before it closes
+            # it (device: 'Lounge command: gracefulReconnect' at 02:24:02 /
+            # 05:31:40, then IncompleteRead and 410 Gone on every bind of the old
+            # SID). Everything already read is the LAST frame of that session's
+            # code space, so drop the SID and rebind with a real handshake.
+            # Riding the dead SID instead burned 8 failed binds and ~3 minutes of
+            # deafness per recycle.
+            logger.info("Relay asked for a reconnect — rebinding with a fresh handshake")
+            self.session.sid = None
+            self.session.gsessionid = None
+            self._reconnect_requested.set()
+            return
         try:
             if name == "remoteConnected":
                 if self.dispatcher.on_remote_connected and isinstance(data, dict):

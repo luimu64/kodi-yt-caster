@@ -40,6 +40,12 @@ class Phone:
     def disconnect(self):
         self._send("remoteDisconnected", {"id": 1, "name": self.name, "type": "phone"})
 
+    def graceful_reconnect(self):
+        """Relay announcing a bind recycle (captured on-device: the relay sends
+        `gracefulReconnect` and then closes the stream / 410s every bind of the
+        old SID)."""
+        self._send("gracefulReconnect")
+
     def set_playlist(self, video_id, video_ids, current_time=0, context="playlist", list_id=None):
         # Real traffic ALWAYS carries listId: the phone keys its whole player
         # model on it, and rejects any nowPlaying report whose videoId is not

@@ -189,6 +189,17 @@ class LoungeSession:
         if not self.sid or not self.gsessionid:
             raise LoungeError("Failed to extract SID/gsessionid from handshake")
 
+        # A handshake opens a NEW relay session, and the relay numbers that
+        # session's frames FROM SCRATCH (it pushes getDiscoveryDeviceId at code
+        # ~4 on session start, noops from ~8). The dedup high-water mark belongs
+        # to the session that just died: keep it and every command of the new
+        # session is <= it, so the listener goes permanently deaf while the
+        # stream itself looks perfectly healthy (device 2026-09-29: both lounges
+        # were silent for hours after the relay recycled their binds — 1283 and
+        # 1708 frames before the recycle, zero after — while the phone still
+        # showed the TV as connected and casting silently did nothing).
+        self.last_code = -1
+
         self._wake_event.set()
         return self.sid, self.gsessionid
 
