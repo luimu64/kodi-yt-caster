@@ -48,6 +48,32 @@ class SSDPResponder(threading.Thread):
             except Exception:
                 pass
 
+    def _join_group(self, iface_ip: Optional[str]) -> None:
+        """Join 239.255.255.250 on `iface_ip` (None = kernel-chosen interface).
+
+        Joining with INADDR_ANY while the LAN interface is not up yet leaves the
+        membership bound to whatever interface the multicast route pointed at
+        during boot (loopback/tailscale). M-SEARCHes from the phone then never
+        reach this socket, so the device never appears in the cast list even
+        though unicast probes still get answered. Always name the interface.
+        """
+        addr = iface_ip if (iface_ip and not iface_ip.startswith("127.")) else "0.0.0.0"
+        mreq = struct.pack("4s4s", socket.inet_aton(SSDP_ADDR), socket.inet_aton(addr))
+        sock = self._sock
+        if sock is None:
+            raise OSError("SSDP socket not bound")
+        prev = getattr(self, "_joined_ip", None)
+        if prev and prev != addr:
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP,
+                                struct.pack("4s4s", socket.inet_aton(SSDP_ADDR),
+                                            socket.inet_aton(prev)))
+            except OSError:
+                pass
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        self._joined_ip = addr
+        logger.info("SSDP joined %s on %s", SSDP_ADDR, addr)
+
     def run(self) -> None:
         logger.info("Starting SSDP responder on %s:%s (local IP: %s)", SSDP_ADDR, SSDP_PORT, self.local_ip)
 
@@ -66,8 +92,7 @@ class SSDPResponder(threading.Thread):
                     pass
 
                 self._sock.bind(("", SSDP_PORT))
-                mreq = struct.pack("4sl", socket.inet_aton(SSDP_ADDR), socket.INADDR_ANY)
-                self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                self._join_group(getattr(self, "_joined_ip", None))
                 self._sock.settimeout(1.0)
                 break
             except OSError as e:
@@ -92,6 +117,11 @@ class SSDPResponder(threading.Thread):
         current_ip = get_local_ip()
         if current_ip and not current_ip.startswith("127."):
             self.local_ip = current_ip
+            if getattr(self, "_joined_ip", "") != current_ip:
+                try:
+                    self._join_group(current_ip)
+                except OSError as e:
+                    logger.warning("SSDP re-join on %s failed: %s", current_ip, e)
 
         last_ip_check = time.monotonic()
 
@@ -104,6 +134,7 @@ class SSDPResponder(threading.Thread):
                 msg = data.decode("utf-8", errors="replace")
                 if "M-SEARCH" not in msg.upper():
                     continue
+                logger.info("SSDP M-SEARCH from %s", addr)
 
                 # SSDP requires MAN: "ssdp:discover" (case-insensitive)
                 if not re.search(r'MAN:\s*"?ssdp:discover"?', msg, re.MULTILINE | re.IGNORECASE):
@@ -154,15 +185,17 @@ class SSDPResponder(threading.Thread):
                     f"USN: uuid:{self.device_uuid}::{target_st}\r\n\r\n"
                 ).encode("utf-8")
                 logger.debug("Sending SSDP response to %s", addr)
-                self._sock.sendto(response, addr)
-                logger.debug("Sending SSDP response to %s", addr)
-                self._sock.sendto(response, addr)
+                try:
+                    self._sock.sendto(response, addr)
+                    logger.info("SSDP replied to %s via %s", addr, self.local_ip)
+                except OSError as e:
+                    logger.warning("SSDP reply to %s failed: %s", addr, e)
             except socket.timeout:
                 continue
             except Exception as e:
                 if self._stop_event.is_set():
                     break
-                logger.debug("SSDP receive exception: %s", e)
+                logger.warning("SSDP receive exception: %r", e)
                 time.sleep(0.5)
 
         logger.info("SSDP responder stopped")
