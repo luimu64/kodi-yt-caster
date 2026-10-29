@@ -119,6 +119,27 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_app_status(self) -> None:
         host = self.headers.get("Host", f"127.0.0.1:{self.server.port}")
+        extra = {}
+        provider = getattr(self.server, "extra_data_provider", None)
+        if provider:
+            try:
+                extra = provider() or {}
+            except Exception as exc:  # never let a status poll 500
+                logger.warning("additionalData provider failed: %s", exc)
+                extra = {}
+        fields = (
+            ("brand", extra.get("brand") or "Kodi"),
+            ("model", extra.get("model") or "Kodi YouTube Receiver"),
+            ("screenId", self.server.screen_id),
+            ("theme", extra.get("theme") or "cl"),
+            ("deviceId", extra.get("deviceId") or self.server.device_uuid),
+            # The sender joins the Lounge session directly when the description
+            # carries a loungeToken; without it the app launches, polls status
+            # and waits forever (observed live 2026-10-29).
+            ("loungeToken", extra.get("loungeToken") or ""),
+            ("loungeTokenRefreshIntervalMs", str(extra.get("loungeTokenRefreshIntervalMs") or 1500000)),
+        )
+        body = "".join("    <%s>%s</%s>\r\n" % (k, v, k) for k, v in fields if v)
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>\r\n'
             '<service xmlns="urn:dial-multiscreen-org:schemas:dial" dialVer="2.1">\r\n'
@@ -126,9 +147,7 @@ class DIALRequestHandler(http.server.BaseHTTPRequestHandler):
             '  <options allowStop="true"/>\r\n'
             "  <state>running</state>\r\n"
             '  <link rel="run" href="run"/>\r\n'
-            "  <additionalData>\r\n"
-            f"    <screenId>{self.server.screen_id}</screenId>\r\n"
-            "  </additionalData>\r\n"
+            "  <additionalData>\r\n" + body + "  </additionalData>\r\n"
             "</service>\r\n"
         ).encode("utf-8")
 
@@ -147,6 +166,7 @@ class DIALServer(http.server.ThreadingHTTPServer):
         friendly_name: str,
         screen_id: str,
         on_pairing_code: Optional[Callable[[str, str], None]] = None,
+        extra_data_provider: Optional[Callable[[], dict]] = None,
     ):
         super().__init__(("0.0.0.0", port), DIALRequestHandler)
         self.port = self.server_address[1]
@@ -154,6 +174,7 @@ class DIALServer(http.server.ThreadingHTTPServer):
         self.friendly_name = friendly_name
         self.screen_id = screen_id
         self.on_pairing_code = on_pairing_code
+        self.extra_data_provider = extra_data_provider
         self.daemon_threads = True
 
 
@@ -165,6 +186,7 @@ class DIALService(threading.Thread):
         friendly_name: str,
         screen_id: str,
         on_pairing_code: Optional[Callable[[str, str], None]] = None,
+        extra_data_provider: Optional[Callable[[], dict]] = None,
     ):
         super().__init__(name="DIALService", daemon=True)
         self.port = port
@@ -172,6 +194,7 @@ class DIALService(threading.Thread):
         self.friendly_name = friendly_name
         self.screen_id = screen_id
         self.on_pairing_code = on_pairing_code
+        self.extra_data_provider = extra_data_provider
         self.server: Optional[DIALServer] = None
 
     def run(self) -> None:
@@ -182,6 +205,7 @@ class DIALService(threading.Thread):
                 friendly_name=self.friendly_name,
                 screen_id=self.screen_id,
                 on_pairing_code=self.on_pairing_code,
+                extra_data_provider=self.extra_data_provider,
             )
             logger.info("DIAL HTTP server running on 0.0.0.0:%s", self.port)
             self.server.serve_forever()

@@ -570,6 +570,17 @@ def run_service() -> None:
                     friendly_name=screen_name,
                     screen_id=screen_id,
                     on_pairing_code=on_dial_pairing,
+                    # The YouTube sender joins the Lounge session directly when
+                    # the app status carries a loungeToken; a description with
+                    # additionalData but no token launches and then polls
+                    # forever (live 2026-10-29).
+                    extra_data_provider=lambda: {
+                        "brand": "Kodi",
+                        "model": "Kodi YouTube Receiver",
+                        "theme": "cl",
+                        "deviceId": device_id,
+                        "loungeToken": getattr(session_cl, "lounge_token", "") or lounge_token,
+                    },
                 )
                 dial_service.start()
 

@@ -135,6 +135,21 @@ class LoungeSession:
         return "".join(random.choices(string.ascii_letters + string.digits, k=12))
 
     def _base_params(self) -> Dict[str, str]:
+        # deviceInfo is what the sender uses to identify this receiver against the
+        # DIAL advertisement. Omitting it left the phone reporting
+        # receiverIdentityMatchStatus=DOES_NOT_MATCH_RECEIVER and dropping the
+        # session right after loungeStatus (device 2026-10-29).
+        device_info = {
+            "brand": "Kodi",
+            "model": "Kodi YouTube Receiver",
+            "year": 0,
+            "os": "Linux",
+            "osVersion": "21",
+            "chipset": "",
+            "clientName": "TVHTML5",
+            "dialAdditionalDataSupportLevel": "supported",
+            "mdxDialServerType": "MDX_DIAL_SERVER_TYPE_UNKNOWN",
+        }
         return {
             "device": "LOUNGE_SCREEN",
             "id": self.device_id,
@@ -144,6 +159,9 @@ class LoungeSession:
             "capabilities": "dsp,mic,dpa,ntb,que,mus",
             "mdx-version": "2",
             "loungeIdToken": self.lounge_token,
+            "obfuscatedGaiaId": "",
+            "cst": "m",
+            "deviceInfo": json.dumps(device_info, separators=(",", ":")),
             "VER": "8",
             "v": "2",
             "t": "1",
@@ -157,7 +175,7 @@ class LoungeSession:
         params = self._base_params()
         params.update({
             "RID": "1337",
-            "AID": "42",
+            "AID": "3",
             "zx": self._random_zx(),
             "CVER": "1",
         })
@@ -514,7 +532,7 @@ class LoungeSession:
         params = self._base_params()
         params.update({
             "RID": "1337",
-            "AID": "42",
+            "AID": "3",
             "SID": self.sid,
             "zx": self._random_zx(),
         })
